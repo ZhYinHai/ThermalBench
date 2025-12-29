@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+runs/
+*.png
+*.csv
+settings.json
+sensor_map.json
+temptesting_abort.flag
