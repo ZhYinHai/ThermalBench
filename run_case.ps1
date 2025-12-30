@@ -4,15 +4,16 @@ param(
   [int]$WarmupSec    = 1200,
   [int]$LogSec       = 900,
 
+  # IMPORTANT: make these switches (present = ON, absent = OFF)
+  [switch]$StressCPU,
+  [switch]$StressGPU,
+
   # HWiNFO continuous log (must already be running)
   [string]$HwinfoCsv = "C:\TempTesting\hwinfo.csv",
 
-  # tools (GUI does not choose these; change defaults here if needed)
-  # [string]$FurMarkExe = "C:\Program Files\Geeks3D\FurMark2_x64\furmark.exe",
-  # [string]$PrimeExe   = "C:\Users\Intel Testbench\Downloads\Prime_95_v30.3build6\prime95.exe",
-  [string]$FurMarkExe = "C:\Users\Dennis\Downloads\FurMark_2.10.2_win64\FurMark_win64\furmark.exe",
-  [string]$PrimeExe   = "C:\Users\Dennis\Downloads\p95v3019b20.win64\prime95.exe",
-  
+  # tools
+  [string]$FurMarkExe = "C:\Program Files\Geeks3D\FurMark2_x64\furmark.exe",
+  [string]$PrimeExe   = "C:\Users\Intel Testbench\Downloads\Prime_95_v30.3build6\prime95.exe",
 
   # FurMark settings
   [string]$FurDemo = "furmark-knot-gl",
@@ -30,7 +31,7 @@ param(
   # after run: try to clear master log (may fail if file locked - ok)
   [switch]$ClearHwinfoAfter = $true,
 
-  # STOP command (useful from another terminal / GUI)
+  # STOP command
   [switch]$StopNow
 )
 
@@ -91,30 +92,46 @@ function Countdown-OrAbort($seconds, $label) {
 }
 
 function Start-StressTools {
-  Assert-File $FurMarkExe "FurMarkExe"
-  Assert-File $PrimeExe   "PrimeExe"
+  # return pids even if one tool is not started
+  $furPid = 0
+  $prPid  = 0
 
-  $furDir   = Split-Path -Parent $FurMarkExe
-  $primeDir = Split-Path -Parent $PrimeExe
+  if ($StressGPU.IsPresent) {
+    Assert-File $FurMarkExe "FurMarkExe"
+    $furDir = Split-Path -Parent $FurMarkExe
+    $furArgs = @("--demo",$FurDemo,"--width",$FurWidth,"--height",$FurHeight,"--vsync","0")
+    Write-Host "Start FurMark2: $FurMarkExe $($furArgs -join ' ')"
+    $fur = Start-Process -FilePath $FurMarkExe -ArgumentList $furArgs -WorkingDirectory $furDir -PassThru -WindowStyle Normal
 
-  $furArgs = @("--demo",$FurDemo,"--width",$FurWidth,"--height",$FurHeight,"--vsync","0")
-  Write-Host "Start FurMark2: $FurMarkExe $($furArgs -join ' ')"
-  $fur = Start-Process -FilePath $FurMarkExe -ArgumentList $furArgs -WorkingDirectory $furDir -PassThru -WindowStyle Normal
-
-  Start-Sleep -Seconds 2
-  if (-not (Get-Process -Id $fur.Id -ErrorAction SilentlyContinue)) {
-    throw "FurMark2 exited immediately."
+    Start-Sleep -Seconds 2
+    if (-not (Get-Process -Id $fur.Id -ErrorAction SilentlyContinue)) {
+      throw "FurMark2 exited immediately."
+    }
+    $furPid = [int]$fur.Id
+  } else {
+    Write-Host "GPU stress disabled."
   }
 
-  Write-Host "Start Prime95: $PrimeExe -t"
-  $pr = Start-Process -FilePath $PrimeExe -ArgumentList "-t" -WorkingDirectory $primeDir -PassThru -WindowStyle Normal
+  if ($StressCPU.IsPresent) {
+    Assert-File $PrimeExe "PrimeExe"
+    $primeDir = Split-Path -Parent $PrimeExe
+    Write-Host "Start Prime95: $PrimeExe -t"
+    $pr = Start-Process -FilePath $PrimeExe -ArgumentList "-t" -WorkingDirectory $primeDir -PassThru -WindowStyle Normal
 
-  Start-Sleep -Seconds 2
-  if (-not (Get-Process -Id $pr.Id -ErrorAction SilentlyContinue)) {
-    throw "Prime95 exited immediately (possible first-run prompt)."
+    Start-Sleep -Seconds 2
+    if (-not (Get-Process -Id $pr.Id -ErrorAction SilentlyContinue)) {
+      throw "Prime95 exited immediately (possible first-run prompt)."
+    }
+    $prPid = [int]$pr.Id
+  } else {
+    Write-Host "CPU stress disabled."
   }
 
-  return @{ FurPid=$fur.Id; PrimePid=$pr.Id }
+  if (-not $StressCPU.IsPresent -and -not $StressGPU.IsPresent) {
+    throw "Both CPU and GPU stress were disabled (should never happen from GUI)."
+  }
+
+  return @{ FurPid=$furPid; PrimePid=$prPid }
 }
 
 function Stop-StressTools([int]$FurPid, [int]$PrimePid) {
@@ -138,7 +155,7 @@ function Stop-StressTools([int]$FurPid, [int]$PrimePid) {
   Stop-StressToolsByName
 }
 
-# ---- STOPNOW: kill tools + signal abort for any running run_case.ps1 ----
+# ---- STOPNOW ----
 if ($StopNow) {
   Write-Host "StopNow: killing FurMark + Prime95 and signaling abort..."
   Set-AbortFlag
@@ -154,7 +171,6 @@ if (-not (Test-Path $HwinfoCsv)) {
   exit 1
 }
 
-# Clear stale abort before a normal run
 Clear-AbortFlag
 
 $furPid = 0
@@ -171,14 +187,13 @@ try {
 
   Write-Host ""
   Write-Host "RUNNING:"
-  Write-Host "  FurMark PID: $furPid"
-  Write-Host "  Prime95  PID: $prPid"
+  if ($furPid -ne 0) { Write-Host "  FurMark PID: $furPid" }
+  if ($prPid  -ne 0) { Write-Host "  Prime95  PID: $prPid" }
   Write-Host ""
 
   Write-Host "GUI_TIMER:WARMUP_START"
   Countdown-OrAbort -seconds $WarmupSec -label "Warm-up (stress ON, logging IGNORE)"
 
-  # create run folder only after warmup
   $runId  = Get-Date -Format "yyyyMMdd_HHmmss"
   $outDir = Join-Path $PSScriptRoot ("runs\{0}\{1}" -f $CaseName, $runId)
   New-Item -ItemType Directory -Force $outDir | Out-Null
@@ -208,10 +223,8 @@ try {
   if ($furPid -ne 0 -or $prPid -ne 0) {
     Stop-StressTools -FurPid $furPid -PrimePid $prPid
   }
-
   Clear-AbortFlag
 
-  # remove run folder if aborted (only exists if warmup completed)
   if ($aborted -and $outDir -and (Test-Path $outDir)) {
     try {
       Remove-Item -Recurse -Force $outDir
@@ -227,7 +240,6 @@ if ($aborted -or -not $windowStart -or -not $windowEnd -or -not $outDir) {
   exit 0
 }
 
-# Give HWiNFO a moment to flush the last samples to disk
 Start-Sleep -Seconds 6
 
 $ws = $windowStart.ToString("yyyy-MM-dd HH:mm:ss.fff")
@@ -242,11 +254,7 @@ Write-Host ""
 if ($pyExit -ne 0) {
   Write-Host "Plotting FAILED (exit code $pyExit). See window_check.txt for details." -ForegroundColor Red
 } else {
-  Write-Host "DONE. In $outDir you should now have:"
-  if (Test-Path (Join-Path $outDir "run_window.csv")) { Write-Host "  - run_window.csv (your run only)" }
-  if (Test-Path (Join-Path $outDir "window_check.txt")) { Write-Host "  - window_check.txt (slice proof)" }
-  if (Test-Path (Join-Path $outDir "summary.csv")) { Write-Host "  - summary.csv" }
-  if (Test-Path (Join-Path $outDir "ALL_SELECTED.png")) { Write-Host "  - ALL_SELECTED.png + per-sensor PNGs" }
+  Write-Host "DONE. In $outDir you should now have outputs."
 }
 
 if ($ClearHwinfoAfter) {

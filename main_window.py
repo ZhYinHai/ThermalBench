@@ -1,3 +1,4 @@
+
 # main_window.py
 import os
 import re
@@ -60,16 +61,13 @@ def _try_open_hwinfo_sm2() -> tuple[bool | None, str]:
         "HWiNFO_SENS_SM2",
     ]
 
-
     last_err = None
     for name in names:
         try:
-            # Open existing mapping (Windows named shared memory)
             mm = mmap.mmap(-1, 1, tagname=name, access=mmap.ACCESS_READ)
             mm.close()
             return True, f"opened mapping: {name}"
         except PermissionError as e:
-            # Mapping may exist but is not accessible from this process/session
             return None, f"permission denied opening {name}: {e}"
         except OSError as e:
             last_err = f"{name}: {e}"
@@ -81,10 +79,8 @@ def _try_open_hwinfo_sm2() -> tuple[bool | None, str]:
     return False, f"not found (tried Global/Local): {last_err or 'no details'}"
 
 
-
 class KeyboardOnlySpinBox(QSpinBox):
     """Numbers only. No arrows, no mouse wheel changes, no up/down stepping."""
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setButtonSymbols(QSpinBox.NoButtons)
@@ -107,7 +103,6 @@ class SelectedSensorsDialog(QDialog):
     Read-only dialog that lists ONLY the currently selected sensors,
     grouped by their HWiNFO group name.
     """
-
     def __init__(
         self,
         parent: QWidget,
@@ -216,6 +211,10 @@ class MainWindow(QWidget):
         self.settings_path = Path(__file__).with_name("settings.json")
         self.selected_tokens: list[str] = [SPD_MAX_TOKEN]
 
+        # Stress defaults
+        self.stress_cpu = True
+        self.stress_gpu = True
+
         # Inputs
         self.case_edit = QLineEdit("TEST")
 
@@ -226,7 +225,7 @@ class MainWindow(QWidget):
 
         self.hwinfo_edit = QLineEdit(r"C:\TempTesting\hwinfo.csv")
 
-        # --- Status dots (CREATE THESE BEFORE BUILDING THE CSV ROW) ---
+        # --- Status dots ---
         self.csv_dot = QLabel("●")
         self.csv_dot.setObjectName("StatusDot")
         self.csv_dot.setProperty("state", "bad")
@@ -275,6 +274,22 @@ class MainWindow(QWidget):
 
         self.pick_sensors_btn = QPushButton("Select sensors…")
         self.pick_sensors_btn.clicked.connect(self.open_sensor_picker)
+
+        # Stress toggle buttons
+        self.cpu_btn = QPushButton("CPU")
+        self.gpu_btn = QPushButton("GPU")
+        for b in (self.cpu_btn, self.gpu_btn):
+            b.setCheckable(True)
+            # Make checked visible even if theme is subtle
+            b.setStyleSheet("QPushButton:checked { border: 1px solid #4A90E2; }")
+
+        # default ON (before loading settings)
+        self.cpu_btn.setChecked(True)
+        self.gpu_btn.setChecked(True)
+
+        # use toggled
+        self.cpu_btn.toggled.connect(self._on_cpu_toggled)
+        self.gpu_btn.toggled.connect(self._on_gpu_toggled)
 
         # Buttons
         self.run_btn = QPushButton("Run")
@@ -361,6 +376,15 @@ class MainWindow(QWidget):
         row.addWidget(self.sm2_dot)
         root.addLayout(row)
 
+        # Stress selection row
+        stress_row = QHBoxLayout()
+        stress_row.setSpacing(10)
+        stress_row.addWidget(self._bold_label("Stress test"))
+        stress_row.addWidget(self.cpu_btn)
+        stress_row.addWidget(self.gpu_btn)
+        stress_row.addStretch(1)
+        root.addLayout(stress_row)
+
         fur_row = QHBoxLayout()
         fur_row.setSpacing(18)
 
@@ -399,6 +423,13 @@ class MainWindow(QWidget):
         self.load_settings()
         self._refresh_sensors_summary()
 
+        # Status timer
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(2000)
+        self._status_timer.timeout.connect(self._refresh_hwinfo_status)
+        self._status_timer.start()
+        self._refresh_hwinfo_status()
+
         self.case_edit.textChanged.connect(self.save_settings)
         self.hwinfo_edit.textChanged.connect(self.save_settings)
         self.warmup_min.valueChanged.connect(lambda *_: self.save_settings())
@@ -408,12 +439,28 @@ class MainWindow(QWidget):
         self.fur_demo_combo.currentIndexChanged.connect(lambda *_: self.save_settings())
         self.fur_res_combo.currentIndexChanged.connect(lambda *_: self.save_settings())
 
-        # Status timer (very cheap)
-        self._status_timer = QTimer(self)
-        self._status_timer.setInterval(2000)
-        self._status_timer.timeout.connect(self._refresh_hwinfo_status)
-        self._status_timer.start()
-        self._refresh_hwinfo_status()
+    # ---------- stress toggles ----------
+    def _on_cpu_toggled(self, checked: bool) -> None:
+        # can't turn off the last enabled option
+        if (not checked) and (not self.gpu_btn.isChecked()):
+            self.cpu_btn.blockSignals(True)
+            self.cpu_btn.setChecked(True)
+            self.cpu_btn.blockSignals(False)
+            return
+
+        self.stress_cpu = checked
+        self.save_settings()
+
+    def _on_gpu_toggled(self, checked: bool) -> None:
+        # can't turn off the last enabled option
+        if (not checked) and (not self.cpu_btn.isChecked()):
+            self.gpu_btn.blockSignals(True)
+            self.gpu_btn.setChecked(True)
+            self.gpu_btn.blockSignals(False)
+            return
+
+        self.stress_gpu = checked
+        self.save_settings()
 
     # ---------- settings ----------
     def load_settings(self):
@@ -444,6 +491,21 @@ class MainWindow(QWidget):
         if isinstance(tokens, list) and tokens:
             self.selected_tokens = [str(t) for t in tokens]
 
+        # stress toggles
+        self.stress_cpu = bool(data.get("stress_cpu", True))
+        self.stress_gpu = bool(data.get("stress_gpu", True))
+        if (not self.stress_cpu) and (not self.stress_gpu):
+            # enforce at least one
+            self.stress_cpu = True
+            self.stress_gpu = True
+
+        self.cpu_btn.blockSignals(True)
+        self.gpu_btn.blockSignals(True)
+        self.cpu_btn.setChecked(self.stress_cpu)
+        self.gpu_btn.setChecked(self.stress_gpu)
+        self.cpu_btn.blockSignals(False)
+        self.gpu_btn.blockSignals(False)
+
     def save_settings(self):
         payload = {
             "case_name": self.case_edit.text().strip(),
@@ -455,6 +517,8 @@ class MainWindow(QWidget):
             "fur_demo_display": self.fur_demo_combo.currentText(),
             "fur_res_display": self.fur_res_combo.currentText(),
             "selected_tokens": list(self.selected_tokens),
+            "stress_cpu": bool(self.stress_cpu),
+            "stress_gpu": bool(self.stress_gpu),
         }
         try:
             self.settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -496,6 +560,7 @@ class MainWindow(QWidget):
         update_width()
         return sp
 
+    # ---------- dots ----------
     def _set_dot_state(self, dot: QLabel, ok: bool) -> None:
         dot.setProperty("state", "ok" if ok else "bad")
         dot.style().unpolish(dot)
@@ -505,7 +570,6 @@ class MainWindow(QWidget):
     def _refresh_hwinfo_status(self) -> None:
         path = self.hwinfo_edit.text().strip()
 
-        # CSV: green if exists AND updated recently
         csv_exists = False
         csv_updating = False
         try:
@@ -532,26 +596,9 @@ class MainWindow(QWidget):
             csv_updating = False
 
         self._set_dot_state(self.csv_dot, ok=(csv_exists and csv_updating))
-        if csv_exists and csv_updating:
-            self.csv_dot.setToolTip("CSV: updating")
-        elif csv_exists:
-            self.csv_dot.setToolTip("CSV: found (not updating)")
-        else:
-            self.csv_dot.setToolTip("CSV: missing / unreadable")
 
         sm2_state, sm2_msg = _try_open_hwinfo_sm2()
-
-        if sm2_state is True:
-            self._set_dot_state(self.sm2_dot, ok=True)
-            self.sm2_dot.setToolTip("SM2: ON (" + sm2_msg + ")")
-        elif sm2_state is False:
-            self._set_dot_state(self.sm2_dot, ok=False)
-            self.sm2_dot.setToolTip("SM2: OFF (" + sm2_msg + ")")
-        else:
-            # Unknown: show red OR choose a neutral style if you want
-            self._set_dot_state(self.sm2_dot, ok=False)
-            self.sm2_dot.setToolTip("SM2: UNKNOWN (" + sm2_msg + ")")
-
+        self._set_dot_state(self.sm2_dot, ok=(sm2_state is True))
 
     # ---------- sensors summary ----------
     def _refresh_sensors_summary(self):
@@ -575,10 +622,8 @@ class MainWindow(QWidget):
         save_sensor_map(cache_path, csv_unique_leafs, mapping)
         return mapping
 
-    # ---------- click summary box: show ONLY selected sensors ----------
     def open_selected_sensors_view(self):
         hwinfo_path = self.hwinfo_edit.text().strip()
-
         try:
             header = read_hwinfo_headers(hwinfo_path)
             csv_leafs, has_spd = sensor_leafs_from_header(header)
@@ -600,7 +645,6 @@ class MainWindow(QWidget):
         )
         dlg.exec()
 
-    # ---------- sensor picker ----------
     def open_sensor_picker(self):
         hwinfo_path = self.hwinfo_edit.text().strip()
         try:
@@ -613,15 +657,8 @@ class MainWindow(QWidget):
 
         try:
             group_map = self._ensure_precise_map(csv_leafs, csv_unique_leafs)
-        except Exception as e:
+        except Exception:
             group_map = {}
-            QMessageBox.warning(
-                self,
-                "Precise groups unavailable",
-                "Couldn't read HWiNFO shared memory.\n\n"
-                "Make sure HWiNFO is running and Shared Memory Support is enabled.\n\n"
-                f"Details: {e}",
-            )
 
         pre = set(self.selected_tokens)
         dlg = SensorPickerDialog(
@@ -636,7 +673,6 @@ class MainWindow(QWidget):
             self._refresh_sensors_summary()
             self.save_settings()
 
-    # ---------- build exact columns for plotter ----------
     def build_selected_columns(self) -> list[str]:
         if not self.selected_tokens:
             return ["CPU Package [°C]", "GPU Temperature [°C]", "GPU VRM Temperature [°C]", "SPD Hub Max [°C]"]
@@ -748,6 +784,13 @@ class MainWindow(QWidget):
             f"-FurWidth {fur_w}",
             f"-FurHeight {fur_h}",
         ]
+
+        # IMPORTANT: pass as switches (no true/false strings)
+        if self.stress_cpu:
+            cmd_parts.append("-StressCPU")
+        if self.stress_gpu:
+            cmd_parts.append("-StressGPU")
+
         if columns:
             cmd_parts.append(f"-TempPatterns {','.join(ps_quote(c) for c in columns)}")
 

@@ -1,7 +1,6 @@
 # ui_theme.py
 from PySide6.QtWidgets import QApplication
 
-
 def apply_dark_theme(app: QApplication) -> None:
     app.setStyle("Fusion")
     app.setStyleSheet(
@@ -31,6 +30,16 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #777;
             background-color: #1A1A1A;
             border: 1px solid #222;
+        }
+
+        /* Toggle buttons (CPU/GPU) */
+        QPushButton[on="1"] {
+            border: 1px solid #4A90E2;
+            background-color: #2A2A2A;
+        }
+        QPushButton[on="0"] {
+            border: 1px solid #2F2F2F;
+            background-color: #242424;
         }
 
         QWidget#TitleBar {
@@ -65,13 +74,8 @@ def apply_dark_theme(app: QApplication) -> None:
             border-radius: 10px;
         }
 
-        /* Status indicator dots */
-        QLabel#StatusDot {
-            font-size: 14px;
-            min-width: 14px;
-            max-width: 14px;
-            padding: 0px;
-        }
+        /* Status dot support if you already use it */
+        QLabel#StatusDot { font-size: 14px; }
         QLabel#StatusDot[state="ok"] { color: #2ECC71; }
         QLabel#StatusDot[state="bad"] { color: #E74C3C; }
         """
