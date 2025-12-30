@@ -1,3 +1,4 @@
+# run_case.ps1
 param(
   [string]$CaseName  = "caseA",
   [int]$WarmupSec    = 1200,
@@ -7,8 +8,11 @@ param(
   [string]$HwinfoCsv = "C:\TempTesting\hwinfo.csv",
 
   # tools (GUI does not choose these; change defaults here if needed)
-  [string]$FurMarkExe = "C:\Program Files\Geeks3D\FurMark2_x64\furmark.exe",
-  [string]$PrimeExe   = "C:\Users\Intel Testbench\Downloads\Prime_95_v30.3build6\prime95.exe",
+  # [string]$FurMarkExe = "C:\Program Files\Geeks3D\FurMark2_x64\furmark.exe",
+  # [string]$PrimeExe   = "C:\Users\Intel Testbench\Downloads\Prime_95_v30.3build6\prime95.exe",
+  [string]$FurMarkExe = "C:\Users\Dennis\Downloads\FurMark_2.10.2_win64\FurMark_win64\furmark.exe",
+  [string]$PrimeExe   = "C:\Users\Dennis\Downloads\p95v3019b20.win64\prime95.exe",
+  
 
   # FurMark settings
   [string]$FurDemo = "furmark-knot-gl",
@@ -171,6 +175,7 @@ try {
   Write-Host "  Prime95  PID: $prPid"
   Write-Host ""
 
+  Write-Host "GUI_TIMER:WARMUP_START"
   Countdown-OrAbort -seconds $WarmupSec -label "Warm-up (stress ON, logging IGNORE)"
 
   # create run folder only after warmup
@@ -183,6 +188,7 @@ try {
   $windowStart = Get-Date
   Write-Host ("WindowStart: {0}" -f $windowStart.ToString("yyyy-MM-dd HH:mm:ss.fff"))
 
+  Write-Host "GUI_TIMER:LOG_START"
   Countdown-OrAbort -seconds $LogSec -label "Logging window (stress ON, data USED)"
 
   $windowEnd = Get-Date

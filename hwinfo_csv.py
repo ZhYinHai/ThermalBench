@@ -1,5 +1,23 @@
+# hwinfo_csv.py
 import csv
 from pathlib import Path
+import re
+import unicodedata
+
+def _norm_hwinfo_text(s: str) -> str:
+    s = str(s)
+
+    # Fix broken degree symbol export: �C -> °C
+    s = s.replace("[�C]", "[°C]").replace("�C", "°C")
+
+    # Normalize unicode + whitespace
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # Remove wrapping quotes already handled elsewhere, but keep safe
+    s = s.strip().strip('"')
+    return s
 
 
 def read_hwinfo_headers(csv_path: str) -> list[str]:
@@ -16,6 +34,7 @@ def read_hwinfo_headers(csv_path: str) -> list[str]:
                 if not header:
                     raise ValueError("CSV header is empty.")
                 header = [str(h).strip().strip('"') for h in header if h is not None]
+                header = [_norm_hwinfo_text(h) for h in header if h is not None]
                 while header and header[-1] == "":
                     header.pop()
                 return header

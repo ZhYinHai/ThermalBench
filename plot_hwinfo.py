@@ -1,3 +1,4 @@
+# plot_hwinfo.py
 #!/usr/bin/env python3
 """
 plot_hwinfo.py
@@ -132,10 +133,18 @@ def select_series(df: pd.DataFrame, patterns: List[str]) -> List[str]:
         p = str(p)
         key = p.lower()
 
+        # if it looks like an exact CSV column, require exact match
+        looks_exact = ("[" in p) or (" #" in p)
+
         if key in exact_map:
             selected.append(exact_map[key])
             continue
 
+        if looks_exact:
+            # don't regex-match "almost the same" and pick the wrong duplicate
+            continue
+
+        # only for non-exact patterns allow regex fallback
         try:
             rx = re.compile(p, re.I)
         except re.error:
@@ -144,6 +153,14 @@ def select_series(df: pd.DataFrame, patterns: List[str]) -> List[str]:
         for c in cols:
             if rx.search(str(c)):
                 selected.append(c)
+
+    missing_exact = [
+        p for p in patterns
+        if (("[" in str(p)) or (" #" in str(p))) and (str(p).lower() not in exact_map)
+    ]
+    if missing_exact:
+        raise SystemExit("Exact columns not found in CSV:\n- " + "\n- ".join(missing_exact))
+
 
     # dedupe preserving order
     seen = set()

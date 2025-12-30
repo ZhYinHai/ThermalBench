@@ -1,3 +1,4 @@
+# ui_theme.py
 from PySide6.QtWidgets import QApplication
 
 
@@ -46,7 +47,7 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton#WinBtn:hover { background-color: #2A2A2A; }
         QToolButton#WinClose:hover { background-color: #C42B1C; }
 
-        QLabel#UnitLabel { color: #BDBDBD; padding-left: 2px; padding-right: 10px; }
+        QLabel#UnitLabel { color: #BDBDBD; padding-left: 1px; padding-right: 8px; }
 
         QLabel#LiveTimer {
             font-size: 14px;
@@ -63,5 +64,15 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid #2A2A2A;
             border-radius: 10px;
         }
+
+        /* Status indicator dots */
+        QLabel#StatusDot {
+            font-size: 14px;
+            min-width: 14px;
+            max-width: 14px;
+            padding: 0px;
+        }
+        QLabel#StatusDot[state="ok"] { color: #2ECC71; }
+        QLabel#StatusDot[state="bad"] { color: #E74C3C; }
         """
     )

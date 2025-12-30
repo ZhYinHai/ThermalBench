@@ -1,3 +1,6 @@
+# ui_sensor_picker.py
+from __future__ import annotations
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
@@ -11,6 +14,8 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
 )
 
+from ui_titlebar import TitleBar
+from ui_rounding import apply_rounded_corners
 
 SPD_MAX_TOKEN = "__SPD_MAX__"
 
@@ -25,13 +30,32 @@ class SensorPickerDialog(QDialog):
         preselected: set[str],
     ):
         super().__init__(parent)
+
+        self.corner_radius = 12  # <-- adjust for this window
+        apply_rounded_corners(self, self.corner_radius)
+
+        # Frameless window (we draw our own title bar area)
         self.setWindowTitle("Select sensors to monitor")
         self.setModal(True)
+        self.setWindowFlag(Qt.FramelessWindowHint, True)
+        self.setWindowFlag(Qt.Window, True)
 
-        root = QVBoxLayout(self)
+        # ---------- Layout: outer (titlebar) + inner (content) ----------
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Drag-only title bar: no text, no buttons
+        self.titlebar = TitleBar(self, "", show_title=False, show_buttons=False, draggable=True)
+        self.titlebar.setFixedHeight(28)  # optional: slimmer bar for this dialog
+        outer.addWidget(self.titlebar)
+
+        root = QVBoxLayout()
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
+        outer.addLayout(root)
 
+        # ---------- Top controls ----------
         top = QHBoxLayout()
         top.setSpacing(10)
 
@@ -49,6 +73,7 @@ class SensorPickerDialog(QDialog):
         top.addWidget(self.btn_none)
         root.addLayout(top)
 
+        # ---------- Tree ----------
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.setUniformRowHeights(True)
@@ -61,6 +86,7 @@ class SensorPickerDialog(QDialog):
         def ensure_group(gname: str) -> QTreeWidgetItem:
             if gname in self.group_items:
                 return self.group_items[gname]
+
             gi = QTreeWidgetItem([gname])
             gi.setFirstColumnSpanned(True)
             gi.setFlags(
@@ -69,11 +95,17 @@ class SensorPickerDialog(QDialog):
                 | Qt.ItemFlag.ItemIsUserCheckable
             )
             gi.setCheckState(0, Qt.Unchecked)
+
+            # Bold group names (leaves remain normal)
+            f = gi.font(0)
+            f.setBold(True)
+            gi.setFont(0, f)
+
             self.tree.addTopLevelItem(gi)
             self.group_items[gname] = gi
             return gi
 
-        # Optional SPD Max helper
+        # ---------- Optional SPD Max helper ----------
         if has_spd:
             g = ensure_group("Memory / SPD")
             checked = (SPD_MAX_TOKEN in preselected)
@@ -83,19 +115,23 @@ class SensorPickerDialog(QDialog):
             it.setData(0, Qt.UserRole, SPD_MAX_TOKEN)
             self.leaf_items.append(it)
 
-        # Insert sensors
+        # ---------- Insert sensors ----------
         for uniq_leaf in csv_unique_leafs:
             grp = group_map.get(uniq_leaf, "Other")
             g = ensure_group(grp)
 
-            it = QTreeWidgetItem(g, [uniq_leaf.replace(" #", "  (#") + (")" if " #" in uniq_leaf else "")])
+            # Display formatting: "X #1" -> "X  (#1)"
+            display = uniq_leaf.replace(" #", "  (#") + (")" if " #" in uniq_leaf else "")
+            it = QTreeWidgetItem(g, [display])
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             it.setCheckState(0, Qt.Checked if (uniq_leaf in preselected) else Qt.Unchecked)
-            it.setData(0, Qt.UserRole, uniq_leaf)  # store the REAL token (unique column)
+            it.setData(0, Qt.UserRole, uniq_leaf)  # store exact unique CSV token
             self.leaf_items.append(it)
 
-        self.tree.expandAll()
+        # Start collapsed for readability
+        self.tree.collapseAll()
 
+        # ---------- OK / Cancel ----------
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
@@ -126,8 +162,10 @@ class SensorPickerDialog(QDialog):
 
     def _apply_filter(self):
         q = self.search.text().strip().lower()
+
         for g in self.group_items.values():
             any_visible = False
+
             for i in range(g.childCount()):
                 c = g.child(i)
                 txt = c.text(0).lower()
@@ -135,7 +173,14 @@ class SensorPickerDialog(QDialog):
                 c.setHidden(not match)
                 if match:
                     any_visible = True
+
             g.setHidden(not any_visible)
+
+            # Auto-expand visible groups when searching; collapse otherwise
+            if q and any_visible:
+                self.tree.expandItem(g)
+            else:
+                self.tree.collapseItem(g)
 
     def selected_tokens(self) -> list[str]:
         out: list[str] = []
