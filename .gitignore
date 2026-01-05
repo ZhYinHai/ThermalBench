@@ -7,3 +7,8 @@ runs/
 settings.json
 sensor_map.json
 temptesting_abort.flag
+
+# PyInstaller
+dist/
+build/
+*.spec.bak

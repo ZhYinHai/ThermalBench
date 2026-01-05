@@ -1,7 +1,23 @@
 # settings_store.py
 import json
+import os
 from pathlib import Path
 from typing import Any
+
+
+def get_settings_path(app_name: str = "ThermalBench") -> Path:
+    """
+    Store settings somewhere writable for BOTH:
+      - normal workspace runs
+      - PyInstaller dist runs (where _internal may not be writable)
+    """
+    base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
+    if base:
+        p = Path(base) / app_name
+    else:
+        p = Path.home() / f".{app_name.lower()}"
+    p.mkdir(parents=True, exist_ok=True)
+    return p / "settings.json"
 
 
 def load_json(path: Path) -> dict[str, Any]:

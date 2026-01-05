@@ -12,8 +12,11 @@ param(
   [string]$HwinfoCsv = "C:\TempTesting\hwinfo.csv",
 
   # tools
-  [string]$FurMarkExe = "C:\Program Files\Geeks3D\FurMark2_x64\furmark.exe",
-  [string]$PrimeExe   = "C:\Users\Intel Testbench\Downloads\Prime_95_v30.3build6\prime95.exe",
+  # [string]$FurMarkExe = "C:\Program Files\Geeks3D\FurMark2_x64\furmark.exe",
+  # [string]$PrimeExe   = "C:\Users\Intel Testbench\Downloads\Prime_95_v30.3build6\prime95.exe",
+  [string]$FurMarkExe = "C:\Users\Dennis\Downloads\FurMark_2.10.2_win64\FurMark_win64\furmark.exe",
+  [string]$PrimeExe   = "C:\Users\Dennis\Downloads\p95v3019b20.win64\prime95.exe",
+
 
   # FurMark settings
   [string]$FurDemo = "furmark-knot-gl",
@@ -195,7 +198,9 @@ try {
   Countdown-OrAbort -seconds $WarmupSec -label "Warm-up (stress ON, logging IGNORE)"
 
   $runId  = Get-Date -Format "yyyyMMdd_HHmmss"
-  $outDir = Join-Path $PSScriptRoot ("runs\{0}\{1}" -f $CaseName, $runId)
+  # Place run outputs at repository-level `runs/` (one level above this script's folder)
+  $repoRoot = Split-Path -Parent $PSScriptRoot
+  $outDir = Join-Path $repoRoot ("runs\{0}\{1}" -f $CaseName, $runId)
   New-Item -ItemType Directory -Force $outDir | Out-Null
   Write-Host ""
   Write-Host "RUN MAP: $outDir"
@@ -245,8 +250,33 @@ Start-Sleep -Seconds 6
 $ws = $windowStart.ToString("yyyy-MM-dd HH:mm:ss.fff")
 $we = $windowEnd.ToString("yyyy-MM-dd HH:mm:ss.fff")
 
-& $PythonExe $PlotScript --csv "$HwinfoCsv" --out "$outDir" --patterns $TempPatterns `
-  --window-start "$ws" --window-end "$we" --export-window-csv
+# Resolve Python runtime: prefer .venv, then python, then py
+$UsePyLauncher = $false
+if (-not (Test-Path $PythonExe)) {
+  $venv = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+  if (Test-Path $venv) {
+    $PythonExe = $venv
+  } elseif (Get-Command python -ErrorAction SilentlyContinue) {
+    $PythonExe = 'python'
+  } elseif (Get-Command py -ErrorAction SilentlyContinue) {
+    $PythonExe = 'py'
+    $UsePyLauncher = $true
+  } else {
+    Write-Host "Python executable not found. Create a virtualenv in $PSScriptRoot (python -m venv .venv) or ensure 'python' or 'py' is on PATH."
+    exit 1
+  }
+} else {
+  $UsePyLauncher = $false
+}
+
+# Invoke the plotter
+if ($UsePyLauncher) {
+  & $PythonExe -3 $PlotScript --csv "$HwinfoCsv" --out "$outDir" --patterns $TempPatterns `
+    --window-start "$ws" --window-end "$we" --export-window-csv
+} else {
+  & $PythonExe $PlotScript --csv "$HwinfoCsv" --out "$outDir" --patterns $TempPatterns `
+    --window-start "$ws" --window-end "$we" --export-window-csv
+}
 
 $pyExit = $LASTEXITCODE
 

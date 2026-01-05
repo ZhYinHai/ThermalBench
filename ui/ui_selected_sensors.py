@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
 )
 
-from ui_titlebar import TitleBar
-from ui_sensor_picker import SPD_MAX_TOKEN
+from .ui_titlebar import TitleBar
+from .ui_sensor_picker import SPD_MAX_TOKEN
 
 
 class SelectedSensorsDialog(QDialog):

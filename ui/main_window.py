@@ -1,15 +1,11 @@
-
-# main_window.py
 import os
-import re
 import json
 import time
 from pathlib import Path
 from datetime import datetime
-from collections import defaultdict
 
+from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QProcess, Qt, QTimer
-from PySide6.QtGui import QFontMetrics, QWheelEvent, QKeyEvent
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -24,170 +20,33 @@ from PySide6.QtWidgets import (
     QComboBox,
     QSizePolicy,
     QDialog,
-    QTreeWidget,
-    QTreeWidgetItem,
     QDialogButtonBox,
 )
 
-from ui_rounding import apply_rounded_corners
-from ui_titlebar import TitleBar
-from hwinfo_csv import read_hwinfo_headers, sensor_leafs_from_header, make_unique
-from hwinfo_metadata import build_precise_group_map, load_sensor_map, save_sensor_map
-from ui_sensor_picker import SensorPickerDialog, SPD_MAX_TOKEN
+from .ui_theme import apply_theme, style_combobox_popup
+from .ui_widgets import CustomComboBox
+from .ui_settings_dialog import SettingsDialog
+from .ui_rounding import apply_rounded_corners
+from .ui_titlebar import TitleBar
 
+from core.hwinfo_csv import read_hwinfo_headers, sensor_leafs_from_header, make_unique
+from core.hwinfo_metadata import build_precise_group_map, load_sensor_map, save_sensor_map
 
-RUNMAP_RE = re.compile(r"RUN MAP:\s*(.+)$")
+from .ui_sensor_picker import SensorPickerDialog, SPD_MAX_TOKEN
+from .ui_selected_sensors import SelectedSensorsDialog
 
-
-def ps_quote(s: str) -> str:
-    return "'" + s.replace("'", "''") + "'"
-
-
-def _try_open_hwinfo_sm2() -> tuple[bool | None, str]:
-    """
-    Returns:
-      (True,  msg)  -> definitely accessible (ON)
-      (False, msg)  -> definitely not found (OFF)
-      (None,  msg)  -> uncertain (e.g., access denied)
-    """
-    try:
-        import mmap
-    except Exception as e:
-        return None, f"mmap import failed: {e}"
-
-    names = [
-        "Local\\HWiNFO_SENS_SM2",
-        "Global\\HWiNFO_SENS_SM2",
-        "HWiNFO_SENS_SM2",
-    ]
-
-    last_err = None
-    for name in names:
-        try:
-            mm = mmap.mmap(-1, 1, tagname=name, access=mmap.ACCESS_READ)
-            mm.close()
-            return True, f"opened mapping: {name}"
-        except PermissionError as e:
-            return None, f"permission denied opening {name}: {e}"
-        except OSError as e:
-            last_err = f"{name}: {e}"
-            continue
-        except Exception as e:
-            last_err = f"{name}: {e}"
-            continue
-
-    return False, f"not found (tried Global/Local): {last_err or 'no details'}"
-
-
-class KeyboardOnlySpinBox(QSpinBox):
-    """Numbers only. No arrows, no mouse wheel changes, no up/down stepping."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setButtonSymbols(QSpinBox.NoButtons)
-
-    def stepBy(self, steps: int) -> None:
-        return
-
-    def wheelEvent(self, event: QWheelEvent) -> None:
-        event.ignore()
-
-    def keyPressEvent(self, event: QKeyEvent) -> None:
-        if event.key() in (Qt.Key_Up, Qt.Key_Down, Qt.Key_PageUp, Qt.Key_PageDown):
-            event.ignore()
-            return
-        super().keyPressEvent(event)
-
-
-class SelectedSensorsDialog(QDialog):
-    """
-    Read-only dialog that lists ONLY the currently selected sensors,
-    grouped by their HWiNFO group name.
-    """
-    def __init__(
-        self,
-        parent: QWidget,
-        *,
-        selected_tokens: list[str],
-        group_map: dict[str, str],
-        has_spd: bool,
-    ):
-        super().__init__(parent)
-
-        self.corner_radius = 12
-        apply_rounded_corners(self, self.corner_radius)
-
-        self.setModal(True)
-        self.setWindowTitle("Selected sensors")
-        self.setWindowFlag(Qt.FramelessWindowHint, True)
-        self.setWindowFlag(Qt.Window, True)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        tb = TitleBar(self, "", show_title=False, show_buttons=False, draggable=True)
-        tb.setFixedHeight(28)
-        outer.addWidget(tb)
-
-        root = QVBoxLayout()
-        root.setContentsMargins(14, 14, 14, 14)
-        root.setSpacing(10)
-        outer.addLayout(root)
-
-        self.tree = QTreeWidget()
-        self.tree.setHeaderHidden(True)
-        self.tree.setUniformRowHeights(True)
-        root.addWidget(self.tree, 1)
-
-        grouped: dict[str, list[str]] = defaultdict(list)
-
-        for tok in selected_tokens:
-            if tok == SPD_MAX_TOKEN:
-                if has_spd:
-                    grouped["Memory / SPD"].append("SPD Hub (Max of DIMMs)")
-                continue
-            grp = group_map.get(tok, "Other")
-            grouped[grp].append(tok)
-
-        if not grouped:
-            grouped["(none)"].append("No sensors selected.")
-
-        for grp in sorted(grouped.keys(), key=lambda s: s.lower()):
-            gi = QTreeWidgetItem([grp])
-            gi.setFirstColumnSpanned(True)
-            f = gi.font(0)
-            f.setBold(True)
-            gi.setFont(0, f)
-            self.tree.addTopLevelItem(gi)
-
-            for tok in grouped[grp]:
-                disp = tok
-                if tok != "SPD Hub (Max of DIMMs)":
-                    disp = tok.replace(" #", "  (#") + (")" if " #" in tok else "")
-                QTreeWidgetItem(gi, [disp])
-
-        self.tree.expandAll()
-
-        btns = QDialogButtonBox(QDialogButtonBox.Ok)
-        btns.accepted.connect(self.accept)
-        root.addWidget(btns)
-
-        self.resize(440, 300)
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        p = self.parentWidget()
-        if p:
-            pg = p.geometry()
-            sg = self.geometry()
-            self.move(pg.center().x() - sg.width() // 2, pg.center().y() - sg.height() // 2)
+from core.settings_store import get_settings_path, load_json, save_json
+from core.hwinfo_status import try_open_hwinfo_sm2
+from core.ps_helpers import RUNMAP_RE, ps_quote, build_ps_array_literal
+from .ui_time_spin import make_time_spin
+from core.resources import resource_path
 
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Temp Test Runner")
+        self.setWindowTitle("ThermalBench")
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.setWindowFlag(Qt.Window, True)
 
@@ -208,8 +67,11 @@ class MainWindow(QWidget):
         self._warmup_total = 0
         self._log_total = 0
 
-        self.settings_path = Path(__file__).with_name("settings.json")
+        self.settings_path = get_settings_path("ThermalBench")
         self.selected_tokens: list[str] = [SPD_MAX_TOKEN]
+        self.furmark_exe: str = ""
+        self.prime_exe: str = ""
+        self.theme_mode: str = "dark"
 
         # Stress defaults
         self.stress_cpu = True
@@ -218,10 +80,10 @@ class MainWindow(QWidget):
         # Inputs
         self.case_edit = QLineEdit("TEST")
 
-        self.warmup_min = self._make_time_spin(2, 24 * 60, 20)
-        self.warmup_sec = self._make_time_spin(2, 59, 0)
-        self.log_min = self._make_time_spin(2, 24 * 60, 15)
-        self.log_sec = self._make_time_spin(2, 59, 0)
+        self.warmup_min = make_time_spin(2, 24 * 60, 20)
+        self.warmup_sec = make_time_spin(2, 59, 0)
+        self.log_min = make_time_spin(2, 24 * 60, 15)
+        self.log_sec = make_time_spin(2, 59, 0)
 
         self.hwinfo_edit = QLineEdit(r"C:\TempTesting\hwinfo.csv")
 
@@ -241,7 +103,7 @@ class MainWindow(QWidget):
         self._csv_last_change_ts: float | None = None
 
         # FurMark dropdowns
-        self.fur_demo_combo = QComboBox()
+        self.fur_demo_combo = CustomComboBox(mode=self.theme_mode)
         self.fur_demo_map = {
             "FurMark Knot (OpenGL)": "furmark-knot-gl",
             "FurMark (OpenGL)": "furmark-gl",
@@ -252,7 +114,7 @@ class MainWindow(QWidget):
             self.fur_demo_combo.addItem(k)
         self.fur_demo_combo.setCurrentText("FurMark Knot (OpenGL)")
 
-        self.fur_res_combo = QComboBox()
+        self.fur_res_combo = CustomComboBox(mode=self.theme_mode)
         self.res_order = ["3840 x 2160", "3840 x 1600", "3440 x 1440", "2560 x 1440", "1920 x 1080"]
         self.res_map = {
             "3840 x 2160": (3840, 2160),
@@ -280,14 +142,10 @@ class MainWindow(QWidget):
         self.gpu_btn = QPushButton("GPU")
         for b in (self.cpu_btn, self.gpu_btn):
             b.setCheckable(True)
-            # Make checked visible even if theme is subtle
             b.setStyleSheet("QPushButton:checked { border: 1px solid #4A90E2; }")
 
-        # default ON (before loading settings)
         self.cpu_btn.setChecked(True)
         self.gpu_btn.setChecked(True)
-
-        # use toggled
         self.cpu_btn.toggled.connect(self._on_cpu_toggled)
         self.gpu_btn.toggled.connect(self._on_gpu_toggled)
 
@@ -319,7 +177,7 @@ class MainWindow(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self.titlebar = TitleBar(self, "Temp Test Runner")
+        self.titlebar = TitleBar(self, "ThermalBench")
         outer.addWidget(self.titlebar)
 
         root = QVBoxLayout()
@@ -330,6 +188,12 @@ class MainWindow(QWidget):
         top_row = QHBoxLayout()
         top_row.addWidget(self._bold_label("Name"))
         top_row.addStretch(1)
+
+        self.settings_btn = QPushButton("Settings…")
+        self.settings_btn.clicked.connect(self.open_settings)
+
+        top_row.addWidget(self.settings_btn)
+        top_row.addSpacing(10)
         top_row.addWidget(self.live_timer)
         root.addLayout(top_row)
         root.addWidget(self.case_edit)
@@ -430,6 +294,7 @@ class MainWindow(QWidget):
         self._status_timer.start()
         self._refresh_hwinfo_status()
 
+        # Save triggers
         self.case_edit.textChanged.connect(self.save_settings)
         self.hwinfo_edit.textChanged.connect(self.save_settings)
         self.warmup_min.valueChanged.connect(lambda *_: self.save_settings())
@@ -441,34 +306,27 @@ class MainWindow(QWidget):
 
     # ---------- stress toggles ----------
     def _on_cpu_toggled(self, checked: bool) -> None:
-        # can't turn off the last enabled option
         if (not checked) and (not self.gpu_btn.isChecked()):
             self.cpu_btn.blockSignals(True)
             self.cpu_btn.setChecked(True)
             self.cpu_btn.blockSignals(False)
             return
-
         self.stress_cpu = checked
         self.save_settings()
 
     def _on_gpu_toggled(self, checked: bool) -> None:
-        # can't turn off the last enabled option
         if (not checked) and (not self.cpu_btn.isChecked()):
             self.gpu_btn.blockSignals(True)
             self.gpu_btn.setChecked(True)
             self.gpu_btn.blockSignals(False)
             return
-
         self.stress_gpu = checked
         self.save_settings()
 
     # ---------- settings ----------
     def load_settings(self):
-        if not self.settings_path.exists():
-            return
-        try:
-            data = json.loads(self.settings_path.read_text(encoding="utf-8"))
-        except Exception:
+        data = load_json(self.settings_path)
+        if not data:
             return
 
         self.case_edit.setText(str(data.get("case_name", self.case_edit.text())))
@@ -478,6 +336,17 @@ class MainWindow(QWidget):
         self.warmup_sec.setValue(int(data.get("warmup_sec", self.warmup_sec.value())))
         self.log_min.setValue(int(data.get("log_min", self.log_min.value())))
         self.log_sec.setValue(int(data.get("log_sec", self.log_sec.value())))
+
+        self.furmark_exe = str(data.get("furmark_exe", self.furmark_exe or "")).strip()
+        self.prime_exe = str(data.get("prime_exe", self.prime_exe or "")).strip()
+        self.theme_mode = str(data.get("theme", self.theme_mode or "dark")).strip().lower() or "dark"
+
+        # Ensure combobox popup styling matches loaded theme
+        try:
+            style_combobox_popup(self.fur_demo_combo, self.theme_mode)
+            style_combobox_popup(self.fur_res_combo, self.theme_mode)
+        except Exception:
+            pass
 
         demo_display = data.get("fur_demo_display")
         if demo_display in self.fur_demo_map:
@@ -491,11 +360,9 @@ class MainWindow(QWidget):
         if isinstance(tokens, list) and tokens:
             self.selected_tokens = [str(t) for t in tokens]
 
-        # stress toggles
         self.stress_cpu = bool(data.get("stress_cpu", True))
         self.stress_gpu = bool(data.get("stress_gpu", True))
         if (not self.stress_cpu) and (not self.stress_gpu):
-            # enforce at least one
             self.stress_cpu = True
             self.stress_gpu = True
 
@@ -519,11 +386,35 @@ class MainWindow(QWidget):
             "selected_tokens": list(self.selected_tokens),
             "stress_cpu": bool(self.stress_cpu),
             "stress_gpu": bool(self.stress_gpu),
+            "furmark_exe": self.furmark_exe,
+            "prime_exe": self.prime_exe,
+            "theme": self.theme_mode,
         }
-        try:
-            self.settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        save_json(self.settings_path, payload)
+
+    def open_settings(self) -> None:
+        dlg = SettingsDialog(
+            self,
+            furmark_exe=self.furmark_exe,
+            prime_exe=self.prime_exe,
+            theme=self.theme_mode,
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        self.furmark_exe = dlg.furmark_exe()
+        self.prime_exe = dlg.prime_exe()
+        self.theme_mode = dlg.theme()
+
+        # Apply theme immediately
+        app = QApplication.instance()
+        if app is not None:
+            apply_theme(app, self.theme_mode)
+            # Re-apply combo popup styling so dropdowns respect the new mode
+            style_combobox_popup(self.fur_demo_combo, self.theme_mode)
+            style_combobox_popup(self.fur_res_combo, self.theme_mode)
+
+        self.save_settings()
 
     def closeEvent(self, event):
         self.save_settings()
@@ -541,24 +432,6 @@ class MainWindow(QWidget):
         lab = QLabel(text)
         lab.setObjectName("UnitLabel")
         return lab
-
-    def _make_time_spin(self, min_chars: int, max_value: int, initial: int) -> QSpinBox:
-        sp = KeyboardOnlySpinBox()
-        sp.setRange(0, max_value)
-        sp.setValue(initial)
-        sp.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        sp.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
-
-        def update_width():
-            txt = str(sp.value())
-            shown_len = max(min_chars, len(txt))
-            fm = QFontMetrics(sp.font())
-            w = fm.horizontalAdvance("0" * shown_len) + 30
-            sp.setFixedWidth(w)
-
-        sp.valueChanged.connect(lambda *_: update_width())
-        update_width()
-        return sp
 
     # ---------- dots ----------
     def _set_dot_state(self, dot: QLabel, ok: bool) -> None:
@@ -597,7 +470,7 @@ class MainWindow(QWidget):
 
         self._set_dot_state(self.csv_dot, ok=(csv_exists and csv_updating))
 
-        sm2_state, sm2_msg = _try_open_hwinfo_sm2()
+        sm2_state, _sm2_msg = try_open_hwinfo_sm2()
         self._set_dot_state(self.sm2_dot, ok=(sm2_state is True))
 
     # ---------- sensors summary ----------
@@ -606,6 +479,7 @@ class MainWindow(QWidget):
             self.sensors_summary.setText("")
             self.sensors_summary.setPlaceholderText("No sensors selected (will use defaults).")
             return
+
         display = [("SPD Hub (Max)" if t == SPD_MAX_TOKEN else t) for t in self.selected_tokens]
         self.sensors_summary.setText(
             "; ".join(display[:4]) + (f"; … (+{len(display)-4})" if len(display) > 4 else "")
@@ -613,7 +487,7 @@ class MainWindow(QWidget):
 
     # ---------- precise mapping cache ----------
     def _ensure_precise_map(self, csv_leafs: list[str], csv_unique_leafs: list[str]) -> dict[str, str]:
-        cache_path = Path(__file__).with_name("sensor_map.json")
+        cache_path = resource_path("resources", "sensor_map.json")
         payload = load_sensor_map(cache_path)
         if payload and payload.get("schema") == 1 and payload.get("header_unique") == csv_unique_leafs:
             return dict(payload.get("mapping", {}))
@@ -747,7 +621,7 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Running", "A test is already running.")
             return
 
-        script = Path(__file__).with_name("run_case.ps1")
+        script = resource_path("cli", "run_case.ps1")
         if not script.exists():
             QMessageBox.critical(self, "Missing", f"run_case.ps1 not found: {script}")
             return
@@ -785,14 +659,17 @@ class MainWindow(QWidget):
             f"-FurHeight {fur_h}",
         ]
 
-        # IMPORTANT: pass as switches (no true/false strings)
         if self.stress_cpu:
             cmd_parts.append("-StressCPU")
         if self.stress_gpu:
             cmd_parts.append("-StressGPU")
+        if self.furmark_exe:
+            cmd_parts.append(f"-FurMarkExe {ps_quote(self.furmark_exe)}")
+        if self.prime_exe:
+            cmd_parts.append(f"-PrimeExe {ps_quote(self.prime_exe)}")
 
         if columns:
-            cmd_parts.append(f"-TempPatterns {','.join(ps_quote(c) for c in columns)}")
+            cmd_parts.append(f"-TempPatterns {build_ps_array_literal(columns)}")
 
         cmd = " ".join(cmd_parts)
 
@@ -818,7 +695,7 @@ class MainWindow(QWidget):
         self.append("ABORT requested: StopNow")
         self.abort_btn.setEnabled(False)
 
-        script = Path(__file__).with_name("run_case.ps1")
+        script = resource_path("cli", "run_case.ps1")
         p = QProcess(self)
         p.start("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-StopNow"])
 
