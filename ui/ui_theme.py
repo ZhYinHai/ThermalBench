@@ -85,6 +85,15 @@ def apply_theme(app: QApplication, mode: str) -> None:
             QLabel#StatusDot[state="ok"] { color: #2ECC71; }
             QLabel#StatusDot[state="bad"] { color: #E74C3C; }
 
+            /* Tooltips */
+            QToolTip {
+                background-color: #222222;
+                color: #EAEAEA;
+                border: 1px solid #2A2A2A;
+                padding: 3px;
+                border-radius: 6px;
+            }
+
             /* ---------- ComboBox popup (dropdown list) ---------- */
             QComboBox QAbstractItemView {
                 border: 0px;
@@ -183,6 +192,15 @@ def apply_theme(app: QApplication, mode: str) -> None:
             QLabel#StatusDot { font-size: 14px; }
             QLabel#StatusDot[state="ok"] { color: #178A43; }
             QLabel#StatusDot[state="bad"] { color: #C7342A; }
+
+            /* Tooltips */
+            QToolTip {
+                background-color: #FFFFFF;
+                color: #1A1A1A;
+                border: 1px solid #D0D0D0;
+                padding: 6px;
+                border-radius: 6px;
+            }
 
             /* ---------- ComboBox popup (dropdown list) ---------- */
             QComboBox QAbstractItemView {

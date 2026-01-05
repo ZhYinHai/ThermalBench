@@ -101,6 +101,11 @@ class MainWindow(QWidget):
         self._csv_last_mtime: float | None = None
         self._csv_last_size: int | None = None
         self._csv_last_change_ts: float | None = None
+        # tracked CSV status for run-enable logic
+        self._csv_exists: bool = False
+        self._csv_updating: bool = False
+        # how long (seconds) we consider the CSV "recently updated" after last change
+        self._csv_update_window: float = 2.0
 
         # FurMark dropdowns
         self.fur_demo_combo = CustomComboBox(mode=self.theme_mode)
@@ -287,12 +292,25 @@ class MainWindow(QWidget):
         self.load_settings()
         self._refresh_sensors_summary()
 
-        # Status timer
-        self._status_timer = QTimer(self)
-        self._status_timer.setInterval(2000)
-        self._status_timer.timeout.connect(self._refresh_hwinfo_status)
-        self._status_timer.start()
-        self._refresh_hwinfo_status()
+        # ensure Run button reflects current settings / CSV status
+        self._update_run_button_state()
+
+        # Status timers
+        # - CSV check: responsive (short interval) so UI reacts quickly to logging start/stop
+        self._csv_timer = QTimer(self)
+        self._csv_timer.setInterval(700)  # milliseconds
+        self._csv_timer.timeout.connect(self._refresh_csv_status)
+        self._csv_timer.start()
+
+        # - SM2 check: less frequent (keeps heavier checks lower frequency)
+        self._sm2_timer = QTimer(self)
+        self._sm2_timer.setInterval(2000)
+        self._sm2_timer.timeout.connect(self._refresh_sm2_status)
+        self._sm2_timer.start()
+
+        # initial checks
+        self._refresh_csv_status()
+        self._refresh_sm2_status()
 
         # Save triggers
         self.case_edit.textChanged.connect(self.save_settings)
@@ -303,6 +321,8 @@ class MainWindow(QWidget):
         self.log_sec.valueChanged.connect(lambda *_: self.save_settings())
         self.fur_demo_combo.currentIndexChanged.connect(lambda *_: self.save_settings())
         self.fur_res_combo.currentIndexChanged.connect(lambda *_: self.save_settings())
+        # also update run button when hwinfo path changes
+        self.hwinfo_edit.textChanged.connect(lambda *_: self._update_run_button_state())
 
     # ---------- stress toggles ----------
     def _on_cpu_toggled(self, checked: bool) -> None:
@@ -313,6 +333,76 @@ class MainWindow(QWidget):
             return
         self.stress_cpu = checked
         self.save_settings()
+        # reflect potential new exe paths immediately
+        self._update_run_button_state()
+
+    def _can_run(self) -> bool:
+        """Return True if prerequisites are met to enable Run."""
+        # must have an actively updating hwinfo CSV
+        if not (self._csv_exists and self._csv_updating):
+            return False
+
+        # require executables for enabled stress tests
+        if self.stress_cpu:
+            if not self.prime_exe or not os.path.exists(self.prime_exe):
+                return False
+        if self.stress_gpu:
+            if not self.furmark_exe or not os.path.exists(self.furmark_exe):
+                return False
+
+        return True
+
+    def _missing_reasons(self) -> list[str]:
+        """Return a list of human-readable reasons why Run is disabled."""
+        reasons: list[str] = []
+        if not self._csv_exists:
+            reasons.append("HWiNFO CSV file not found (check path).")
+        elif not self._csv_updating:
+            reasons.append("HWiNFO CSV not being updated (HWiNFO not logging).")
+
+        if self.stress_cpu:
+            if not self.prime_exe:
+                reasons.append("Prime95 path not set in Settings.")
+            elif not os.path.exists(self.prime_exe):
+                reasons.append(f"Prime95 not found at: {self.prime_exe}")
+
+        if self.stress_gpu:
+            if not self.furmark_exe:
+                reasons.append("FurMark path not set in Settings.")
+            elif not os.path.exists(self.furmark_exe):
+                reasons.append(f"FurMark not found at: {self.furmark_exe}")
+
+        if not reasons:
+            reasons.append("Unknown: prerequisites not met.")
+        return reasons
+
+    def _update_run_button_state(self) -> None:
+        """Enable or disable the Run button based on current app state.
+
+        Keeps Run disabled while a test is running.
+        """
+        # If a test is running, leave button disabled (run() will re-enable on finish)
+        if self.proc.state() != QProcess.NotRunning:
+            self.run_btn.setEnabled(False)
+            return
+
+        try:
+            ok = self._can_run()
+        except Exception:
+            ok = False
+        self.run_btn.setEnabled(ok)
+
+        # update tooltip to show missing requirements when disabled
+        if not ok:
+            # if a test is running show that as reason
+            if self.proc.state() != QProcess.NotRunning:
+                self.run_btn.setToolTip("Test running — abort to enable new runs.")
+            else:
+                reasons = self._missing_reasons()
+                # join reasons with newlines so tooltip displays them clearly
+                self.run_btn.setToolTip("\n".join(reasons))
+        else:
+            self.run_btn.setToolTip("Start the test")
 
     def _on_gpu_toggled(self, checked: bool) -> None:
         if (not checked) and (not self.cpu_btn.isChecked()):
@@ -391,6 +481,8 @@ class MainWindow(QWidget):
             "theme": self.theme_mode,
         }
         save_json(self.settings_path, payload)
+        # reflect any changes to exe paths or mode
+        self._update_run_button_state()
 
     def open_settings(self) -> None:
         dlg = SettingsDialog(
@@ -440,7 +532,7 @@ class MainWindow(QWidget):
         dot.style().polish(dot)
         dot.update()
 
-    def _refresh_hwinfo_status(self) -> None:
+    def _refresh_csv_status(self) -> None:
         path = self.hwinfo_edit.text().strip()
 
         csv_exists = False
@@ -453,9 +545,11 @@ class MainWindow(QWidget):
                 now = time.time()
 
                 if self._csv_last_mtime is None:
+                    # First observation: record values but do NOT assume ongoing updates.
+                    # Only set _csv_last_change_ts when we detect an actual change.
                     self._csv_last_mtime = mtime
                     self._csv_last_size = size
-                    self._csv_last_change_ts = now
+                    # leave _csv_last_change_ts as None until a change is observed
                 else:
                     if (mtime != self._csv_last_mtime) or (size != self._csv_last_size):
                         self._csv_last_mtime = mtime
@@ -463,13 +557,19 @@ class MainWindow(QWidget):
                         self._csv_last_change_ts = now
 
                 csv_exists = True
-                csv_updating = bool(self._csv_last_change_ts and (now - self._csv_last_change_ts) <= 6.0)
+                csv_updating = bool(self._csv_last_change_ts and (now - self._csv_last_change_ts) <= self._csv_update_window)
         except Exception:
             csv_exists = False
             csv_updating = False
 
         self._set_dot_state(self.csv_dot, ok=(csv_exists and csv_updating))
 
+        # expose CSV status for run-button logic and update UI accordingly
+        self._csv_exists = csv_exists
+        self._csv_updating = csv_updating
+        self._update_run_button_state()
+
+    def _refresh_sm2_status(self) -> None:
         sm2_state, _sm2_msg = try_open_hwinfo_sm2()
         self._set_dot_state(self.sm2_dot, ok=(sm2_state is True))
 
@@ -613,7 +713,8 @@ class MainWindow(QWidget):
         if path:
             self.hwinfo_edit.setText(path)
             self.save_settings()
-            self._refresh_hwinfo_status()
+            # refresh CSV status immediately when user selects a file
+            self._refresh_csv_status()
 
     # ---------- run / abort ----------
     def run(self):
