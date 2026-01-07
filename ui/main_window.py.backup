@@ -1,0 +1,1899 @@
+# main_window.py
+from pathlib import Path
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QTextEdit,
+    QFileDialog,
+    QDialog,
+    QSizePolicy,
+    QTabWidget,
+    QTreeView,
+    QFileSystemModel,
+    QSplitter,
+)
+
+from .ui_theme import apply_theme, style_combobox_popup
+from .ui_widgets import CustomComboBox
+from .ui_settings_dialog import SettingsDialog
+from .ui_titlebar import TitleBar
+from .ui_time_spin import make_time_spin
+
+from .graph_preview import GraphPreview
+from .sensor_manager import SensorManager
+from .benchmark_controller import BenchmarkController
+
+from core.settings_store import get_settings_path, load_json, save_json
+
+from .ui_sensor_picker import SPD_MAX_TOKEN
+
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        # Enable custom titlebar by making window frameless
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+
+        # process used to run external PowerShell test script
+        try:
+            self.proc = QProcess(self)
+        except Exception:
+            try:
+                self.proc = QProcess()
+            except Exception:
+                self.proc = None
+
+        # stdout is required for on_stdout() to fire
+        try:
+            self.proc.readyReadStandardOutput.connect(self.on_stdout)
+        except Exception:
+            pass
+        try:
+            self.proc.readyReadStandardError.connect(self.on_stderr)
+        except Exception:
+            pass
+        try:
+            self.proc.finished.connect(self.on_finished)
+        except Exception:
+            pass
+
+        self.last_run_dir: str | None = None
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(250)
+        self._timer.timeout.connect(self._tick_timer)
+        self._run_started_at: datetime | None = None
+        self._warmup_total = 0
+        self._log_total = 0
+
+        self.settings_path = get_settings_path("ThermalBench")
+        self.selected_tokens: list[str] = [SPD_MAX_TOKEN]
+        self.furmark_exe: str = ""
+        self.prime_exe: str = ""
+        self.theme_mode: str = "dark"
+
+        # Stress defaults
+        self.stress_cpu = True
+        self.stress_gpu = True
+
+        # Inputs
+        self.case_edit = QLineEdit("TEST")
+
+        self.warmup_min = make_time_spin(2, 24 * 60, 20)
+        self.warmup_sec = make_time_spin(2, 59, 0)
+        self.log_min = make_time_spin(2, 24 * 60, 15)
+        self.log_sec = make_time_spin(2, 59, 0)
+
+        self.hwinfo_edit = QLineEdit(r"C:\TempTesting\hwinfo.csv")
+
+        # --- Status dots ---
+        self.csv_dot = QLabel("●")
+        self.csv_dot.setObjectName("StatusDot")
+        self.csv_dot.setProperty("state", "bad")
+        self.csv_dot.setToolTip("CSV: unknown")
+
+        self.sm2_dot = QLabel("●")
+        self.sm2_dot.setObjectName("StatusDot")
+        self.sm2_dot.setProperty("state", "bad")
+        self.sm2_dot.setToolTip("SM2: unknown")
+
+        self._csv_last_mtime: float | None = None
+        self._csv_last_size: int | None = None
+        self._csv_last_change_ts: float | None = None
+        self._csv_exists: bool = False
+        self._csv_updating: bool = False
+        self._csv_update_window: float = 2.0
+
+        # FurMark dropdowns
+        self.fur_demo_combo = CustomComboBox(mode=self.theme_mode)
+        self.fur_demo_map = {
+            "FurMark Knot (OpenGL)": "furmark-knot-gl",
+            "FurMark (OpenGL)": "furmark-gl",
+            "FurMark Knot (Vulkan)": "furmark-knot-vk",
+            "FurMark (Vulkan)": "furmark-vk",
+        }
+        for k in self.fur_demo_map.keys():
+            self.fur_demo_combo.addItem(k)
+        self.fur_demo_combo.setCurrentText("FurMark Knot (OpenGL)")
+
+        self.fur_res_combo = CustomComboBox(mode=self.theme_mode)
+        self.res_order = ["3840 x 2160", "3840 x 1600", "3440 x 1440", "2560 x 1440", "1920 x 1080"]
+        self.res_map = {
+            "3840 x 2160": (3840, 2160),
+            "3840 x 1600": (3840, 1600),
+            "3440 x 1440": (3440, 1440),
+            "2560 x 1440": (2560, 1440),
+            "1920 x 1080": (1920, 1080),
+        }
+        for k in self.res_order:
+            self.fur_res_combo.addItem(k)
+        self.fur_res_combo.setCurrentText("3840 x 1600")
+
+        # Sensors summary (clickable)
+        self.sensors_summary = QLineEdit()
+        self.sensors_summary.setReadOnly(True)
+        self.sensors_summary.setPlaceholderText("No sensors selected (will use defaults).")
+        self.sensors_summary.setCursor(Qt.PointingHandCursor)
+        self.sensors_summary.mousePressEvent = lambda e: self.open_selected_sensors_view()
+
+        self.pick_sensors_btn = QPushButton("Select sensors…")
+        self.pick_sensors_btn.clicked.connect(self.open_sensor_picker)
+
+        # Stress toggle buttons
+        self.cpu_btn = QPushButton("CPU")
+        self.gpu_btn = QPushButton("GPU")
+        for b in (self.cpu_btn, self.gpu_btn):
+            b.setCheckable(True)
+            b.setStyleSheet("QPushButton:checked { border: 1px solid #4A90E2; }")
+
+        self.cpu_btn.setChecked(True)
+        self.gpu_btn.setChecked(True)
+        self.cpu_btn.toggled.connect(self._on_cpu_toggled)
+        self.gpu_btn.toggled.connect(self._on_gpu_toggled)
+
+        # Buttons
+        self.run_btn = QPushButton("Run")
+        self.run_btn.clicked.connect(self.run)
+
+        self.abort_btn = QPushButton("Abort")
+        self.abort_btn.setEnabled(False)
+        self.abort_btn.clicked.connect(self.abort)
+
+        self.open_btn = QPushButton("Open Run Folder")
+        self.open_btn.setEnabled(False)
+        self.open_btn.clicked.connect(self.open_run_folder)
+
+        self.pick_hwinfo_btn = QPushButton("Pick HWiNFO CSV…")
+        self.pick_hwinfo_btn.clicked.connect(self.pick_hwinfo)
+
+        # Log box
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+
+        self.live_timer = QLabel("Idle")
+        self.live_timer.setObjectName("LiveTimer")
+
+        # Layout
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self.titlebar = TitleBar(self, "ThermalBench")
+        outer.addWidget(self.titlebar)
+
+        # Tabs: Run Benchmark and Results
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs)
+
+        # Run tab container
+        run_container = QWidget()
+        root = QVBoxLayout(run_container)
+        root.setContentsMargins(16, 12, 16, 16)
+        root.setSpacing(10)
+        self.tabs.addTab(run_container, "Run Benchmark")
+
+        # Results tab
+        results_container = QWidget()
+        results_layout = QHBoxLayout(results_container)
+        results_layout.setContentsMargins(8, 8, 8, 8)
+        results_layout.setSpacing(8)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        runs_root = Path(__file__).parent.parent / "runs"
+        self._runs_model = QFileSystemModel()
+        try:
+            self._runs_root = runs_root
+            self._runs_model.setRootPath(str(self._runs_root))
+        except Exception:
+            self._runs_model.setRootPath("")
+
+        self._runs_tree = QTreeView()
+        self._runs_tree.setModel(self._runs_model)
+        try:
+            self._runs_tree.setRootIndex(self._runs_model.index(str(self._runs_root)))
+        except Exception:
+            pass
+        for c in range(1, 4):
+            try:
+                self._runs_tree.hideColumn(c)
+            except Exception:
+                pass
+
+        splitter.addWidget(self._runs_tree)
+
+        preview_widget = QWidget()
+        preview_layout = QVBoxLayout(preview_widget)
+        preview_layout.setContentsMargins(6, 6, 6, 6)
+        preview_layout.setSpacing(6)
+
+        self._preview_label = QLabel()
+        self._preview_label.setAlignment(Qt.AlignCenter)
+        self._preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        preview_layout.addWidget(self._preview_label)
+
+        # interactive matplotlib canvas for CSV previews
+        try:
+            self._preview_fig = Figure(figsize=(5, 3))
+            self._preview_canvas = FigureCanvas(self._preview_fig)
+            self._preview_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            try:
+                self._preview_canvas.setMouseTracking(True)
+            except Exception:
+                pass
+
+            self._preview_ax = self._preview_fig.add_subplot(111)
+
+            # Cache background for blitting on every draw/resize
+            try:
+                self._preview_canvas.mpl_connect("draw_event", self._on_preview_draw)
+            except Exception:
+                pass
+
+            # Qt mouse move -> data coords
+            try:
+                def _qc(ev):
+                    try:
+                        x = ev.pos().x()
+                        y = ev.pos().y()
+                        h = self._preview_canvas.height()
+                        display_x = x
+                        display_y = h - y
+
+                        try:
+                            data_xy = self._preview_ax.transData.inverted().transform((display_x, display_y))
+                            xdata, ydata = data_xy[0], data_xy[1]
+                            self._on_preview_hover_xy(xdata, ydata)
+                        except Exception:
+                            try:
+                                me = MPLMouseEvent("motion_notify_event", self._preview_canvas, x, display_y)
+                                self._on_preview_hover(me)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                self._preview_canvas.mouseMoveEvent = _qc
+            except Exception:
+                pass
+
+            self._preview_canvas.hide()
+            preview_layout.addWidget(self._preview_canvas)
+
+            # legacy annot (kept safe)
+            self._preview_annot = self._preview_ax.annotate(
+                "", xy=(0, 0), xytext=(10, 10), textcoords="offset points",
+                bbox=dict(boxstyle="round", fc="white", ec="black", alpha=0.9),
+                color="black", fontsize=8, visible=False
+            )
+
+            self._preview_mpl_cid = None
+            self._preview_x = None
+            self._preview_df = None
+
+            # tooltip state
+            self._preview_collective_box = None
+            self._preview_collective_time = None
+            self._preview_name_areas = None
+            self._preview_value_areas = None
+            self._preview_colors = []
+            self._preview_last_idx = None
+
+            # tooltip placement config (points)
+            self._preview_tt_default_xybox = (10, 10)       # above-right
+            self._preview_tt_flipped_xybox = (10, -10)      # below-right
+            self._preview_tt_left_xybox = (-10, 10)         # above-left
+            self._preview_tt_left_down_xybox = (-10, -10)   # below-left
+            self._preview_tt_margin_px = 4                  # margin from axes in pixels
+
+            # hover performance
+            self._hover_last_ts = 0.0
+            self._hover_min_interval = 1.0 / 120.0  # up to ~120fps (feels smoother)
+
+            # --- tooltip movement animation (smooth glide) ---
+            self._tt_anim_timer = QTimer(self)
+            self._tt_anim_timer.setInterval(16)  # ~60fps
+            self._tt_anim_timer.timeout.connect(self._tt_anim_tick)
+
+            self._tt_anim_duration = 0.10  # seconds (tweak 0.08–0.14)
+            self._tt_anim_t0 = 0.0
+            self._tt_anim_start_xy = None  # (x,y) data coords
+            self._tt_anim_target_xy = None # (x,y) data coords
+
+            # blit cache
+            self._preview_bg = None
+            self._preview_ax_bbox = None
+
+            # cached tooltip metrics
+            self._preview_tt_w_px = None
+            self._preview_tt_h_px = None
+            self._preview_tt_mode = "UR"  # UR, DR, UL, DL
+
+            # disable markers (requested)
+            self._preview_markers = None
+
+            # hover vline
+            self._preview_vline = None
+
+            # grid style shared
+            self._preview_grid_color = "#3A3A3A"
+            self._preview_dot_dashes = (0, (1.2, 3.2))
+
+        except Exception:
+            self._preview_fig = None
+            self._preview_canvas = None
+            self._preview_ax = None
+            self._preview_annot = None
+            self._preview_mpl_cid = None
+            self._preview_x = None
+            self._preview_df = None
+            self._preview_collective_box = None
+            self._preview_collective_time = None
+            self._preview_name_areas = None
+            self._preview_value_areas = None
+            self._preview_colors = []
+            self._preview_last_idx = None
+            self._preview_tt_default_xybox = (10, 10)
+            self._preview_tt_flipped_xybox = (10, -10)
+            self._preview_tt_left_xybox = (-10, 10)
+            self._preview_tt_left_down_xybox = (-10, -10)
+            self._preview_tt_margin_px = 4
+            self._hover_last_ts = 0.0
+            self._hover_min_interval = 1.0 / 60.0
+            self._preview_bg = None
+            self._preview_ax_bbox = None
+            self._preview_tt_w_px = None
+            self._preview_tt_h_px = None
+            self._preview_tt_mode = "UR"
+            self._preview_markers = None
+            self._preview_vline = None
+
+        splitter.addWidget(preview_widget)
+
+        try:
+            splitter.setStretchFactor(0, 1)
+            splitter.setStretchFactor(1, 3)
+            splitter.setCollapsible(0, False)
+            splitter.setCollapsible(1, False)
+            try:
+                total = self.width() or 1200
+                left = max(120, int(total * 0.10))
+                right = max(400, total - left)
+                splitter.setSizes([left, right])
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        results_layout.addWidget(splitter)
+        self._results_tab_index = self.tabs.addTab(results_container, "Results")
+
+        try:
+            self.tabs.currentChanged.connect(self._on_tab_changed)
+        except Exception:
+            pass
+
+        try:
+            self._runs_tree.selectionModel().selectionChanged.connect(self._on_runs_selection_changed)
+        except Exception:
+            pass
+
+        # --- Run tab UI ---
+        top_row = QHBoxLayout()
+        top_row.addWidget(self._bold_label("Name"))
+        top_row.addStretch(1)
+
+        self.settings_btn = QPushButton("Settings…")
+        self.settings_btn.clicked.connect(self.open_settings)
+
+        top_row.addWidget(self.settings_btn)
+        top_row.addSpacing(10)
+        top_row.addWidget(self.live_timer)
+        root.addLayout(top_row)
+        root.addWidget(self.case_edit)
+
+        time_row = QHBoxLayout()
+        time_row.setSpacing(18)
+
+        warm_col = QVBoxLayout()
+        warm_col.setSpacing(4)
+        warm_col.addWidget(self._bold_label("Warmup"))
+        warm_row = QHBoxLayout()
+        warm_row.setSpacing(1)
+        warm_row.addWidget(self.warmup_min)
+        warm_row.addWidget(self._unit_label("min"))
+        warm_row.addWidget(self.warmup_sec)
+        warm_row.addWidget(self._unit_label("sec"))
+        warm_row.addStretch(1)
+        warm_col.addLayout(warm_row)
+
+        log_col = QVBoxLayout()
+        log_col.setSpacing(4)
+        log_col.addWidget(self._bold_label("Log"))
+        log_row = QHBoxLayout()
+        log_row.setSpacing(1)
+        log_row.addWidget(self.log_min)
+        log_row.addWidget(self._unit_label("min"))
+        log_row.addWidget(self.log_sec)
+        log_row.addWidget(self._unit_label("sec"))
+        log_row.addStretch(1)
+        log_col.addLayout(log_row)
+
+        time_row.addLayout(warm_col)
+        time_row.addLayout(log_col)
+        root.addLayout(time_row)
+
+        row = QHBoxLayout()
+        row.addWidget(self._bold_label("HWiNFO CSV (continuous)"))
+        row.addWidget(self.hwinfo_edit, 1)
+        row.addWidget(self.pick_hwinfo_btn)
+        row.addSpacing(8)
+        row.addWidget(self.csv_dot)
+        row.addSpacing(6)
+        row.addWidget(self.sm2_dot)
+        root.addLayout(row)
+
+        stress_row = QHBoxLayout()
+        stress_row.setSpacing(10)
+        stress_row.addWidget(self._bold_label("Stress test"))
+        stress_row.addWidget(self.cpu_btn)
+        stress_row.addWidget(self.gpu_btn)
+        stress_row.addStretch(1)
+        root.addLayout(stress_row)
+
+        fur_row = QHBoxLayout()
+        fur_row.setSpacing(18)
+
+        demo_col = QVBoxLayout()
+        demo_col.setSpacing(6)
+        demo_col.addWidget(self._bold_label("FurMark Demo"))
+        demo_col.addWidget(self.fur_demo_combo)
+
+        res_col = QVBoxLayout()
+        res_col.setSpacing(6)
+        res_col.addWidget(self._bold_label("FurMark Resolution"))
+        res_col.addWidget(self.fur_res_combo)
+
+        fur_row.addLayout(demo_col)
+        fur_row.addLayout(res_col)
+        root.addLayout(fur_row)
+
+        root.addWidget(self._bold_label("Sensors to monitor"))
+        sensors_row = QHBoxLayout()
+        sensors_row.setSpacing(10)
+        sensors_row.addWidget(self.sensors_summary, 1)
+        sensors_row.addWidget(self.pick_sensors_btn)
+        root.addLayout(sensors_row)
+
+        btns = QHBoxLayout()
+        btns.addWidget(self.run_btn)
+        btns.addWidget(self.abort_btn)
+        btns.addWidget(self.open_btn)
+        root.addLayout(btns)
+
+        root.addWidget(self._bold_label("Output"))
+        root.addWidget(self.log)
+
+        self.resize(1200, 800)
+
+        self.load_settings()
+        self._refresh_sensors_summary()
+        self._update_run_button_state()
+
+        self._csv_timer = QTimer(self)
+        self._csv_timer.setInterval(700)
+        self._csv_timer.timeout.connect(self._refresh_csv_status)
+        self._csv_timer.start()
+
+        self._sm2_timer = QTimer(self)
+        self._sm2_timer.setInterval(2000)
+        self._sm2_timer.timeout.connect(self._refresh_sm2_status)
+        self._sm2_timer.start()
+
+        self._refresh_csv_status()
+        self._refresh_sm2_status()
+
+        self.case_edit.textChanged.connect(self.save_settings)
+        self.hwinfo_edit.textChanged.connect(self.save_settings)
+        self.warmup_min.valueChanged.connect(lambda *_: self.save_settings())
+        self.warmup_sec.valueChanged.connect(lambda *_: self.save_settings())
+        self.log_min.valueChanged.connect(lambda *_: self.save_settings())
+        self.log_sec.valueChanged.connect(lambda *_: self.save_settings())
+        self.fur_demo_combo.currentIndexChanged.connect(lambda *_: self.save_settings())
+        self.fur_res_combo.currentIndexChanged.connect(lambda *_: self.save_settings())
+        self.hwinfo_edit.textChanged.connect(lambda *_: self._update_run_button_state())
+
+    # ---------------------------------------------------------------------
+    # Blit / draw helpers for smooth interaction
+    # ---------------------------------------------------------------------
+    def _on_preview_draw(self, event=None) -> None:
+        """Cache axes background for blitting (re-runs on resize/redraw)."""
+        try:
+            if self._preview_canvas is None or self._preview_ax is None:
+                return
+            self._preview_bg = self._preview_canvas.copy_from_bbox(self._preview_ax.bbox)
+            renderer = self._preview_canvas.get_renderer()
+            self._preview_ax_bbox = self._preview_ax.get_window_extent(renderer)
+        except Exception:
+            pass
+
+    def _preview_blit(self) -> None:
+        """Fast redraw using blitting (only dynamic artists)."""
+        try:
+            if self._preview_canvas is None or self._preview_ax is None:
+                return
+            if self._preview_bg is None:
+                self._preview_canvas.draw_idle()
+                return
+
+            c = self._preview_canvas
+            ax = self._preview_ax
+            c.restore_region(self._preview_bg)
+
+            # vertical dotted line
+            if getattr(self, "_preview_vline", None) is not None and self._preview_vline.get_visible():
+                ax.draw_artist(self._preview_vline)
+
+            # tooltip
+            ab = getattr(self, "_preview_collective_box", None)
+            if ab is not None and ab.get_visible():
+                ax.draw_artist(ab)
+
+            c.blit(ax.bbox)
+        except Exception:
+            try:
+                if self._preview_canvas is not None:
+                    self._preview_canvas.draw_idle()
+            except Exception:
+                pass
+
+    def _preview_update_tooltip_metrics(self) -> None:
+        """Cache tooltip width/height in pixels (used for edge flipping)."""
+        try:
+            ab = getattr(self, "_preview_collective_box", None)
+            if ab is None or self._preview_canvas is None or self._preview_ax is None:
+                return
+            renderer = self._preview_canvas.get_renderer()
+            bbox = ab.get_window_extent(renderer)
+            self._preview_tt_w_px = float(bbox.width)
+            self._preview_tt_h_px = float(bbox.height)
+            self._preview_ax_bbox = self._preview_ax.get_window_extent(renderer)
+        except Exception:
+            pass
+
+    def _preview_update_tooltip_mode_for(self, xdata: float, ydata: float) -> None:
+        """
+        Update tooltip flip mode (UR/DR/UL/DL) for a given target point,
+        WITHOUT moving the tooltip. This keeps animation intact.
+        """
+        ab = getattr(self, "_preview_collective_box", None)
+        ax = getattr(self, "_preview_ax", None)
+        canvas = getattr(self, "_preview_canvas", None)
+        fig = getattr(self, "_preview_fig", None)
+
+        if ab is None or ax is None or canvas is None or fig is None:
+            return
+        if xdata is None or ydata is None:
+            return
+
+        if self._preview_tt_w_px is None or self._preview_tt_h_px is None or self._preview_ax_bbox is None:
+            self._preview_update_tooltip_metrics()
+            if self._preview_tt_w_px is None or self._preview_tt_h_px is None or self._preview_ax_bbox is None:
+                return
+
+        try:
+            dpi = float(getattr(fig, "dpi", 100) or 100)
+            margin = float(getattr(self, "_preview_tt_margin_px", 4))
+            cx, cy = ax.transData.transform((xdata, ydata))
+
+            def pts_to_px(v):
+                return float(v) * dpi / 72.0
+
+            ur = getattr(self, "_preview_tt_default_xybox", (10, 10))
+            dr = getattr(self, "_preview_tt_flipped_xybox", (10, -10))
+            ul = getattr(self, "_preview_tt_left_xybox", (-10, 10))
+            dl = getattr(self, "_preview_tt_left_down_xybox", (-10, -10))
+
+            urx, ury = pts_to_px(ur[0]), pts_to_px(ur[1])
+
+            w = float(self._preview_tt_w_px)
+            h = float(self._preview_tt_h_px)
+
+            ax_right = float(self._preview_ax_bbox.x1) - margin
+            ax_top = float(self._preview_ax_bbox.y1) - margin
+
+            # overflow test assumes UR
+            ur_right = (cx + urx) + w
+            ur_top = (cy + ury) + h
+
+            overflow_top = ur_top > ax_top
+            overflow_right = ur_right > ax_right
+
+            if overflow_top and overflow_right:
+                mode = "DL"
+            elif overflow_top:
+                mode = "DR"
+            elif overflow_right:
+                mode = "UL"
+            else:
+                mode = "UR"
+
+            if mode != getattr(self, "_preview_tt_mode", "UR"):
+                self._preview_tt_mode = mode
+                if mode == "UR":
+                    ab._box_alignment = (0, 0)
+                    ab.xybox = ur
+                elif mode == "DR":
+                    ab._box_alignment = (0, 1)
+                    ab.xybox = dr
+                elif mode == "UL":
+                    ab._box_alignment = (1, 0)
+                    ab.xybox = ul
+                else:  # DL
+                    ab._box_alignment = (1, 1)
+                    ab.xybox = dl
+        except Exception:
+            pass
+
+    def _tt_anim_tick(self) -> None:
+        """Animate tooltip anchor from start -> target with easing, then blit."""
+        ab = getattr(self, "_preview_collective_box", None)
+        if ab is None or not ab.get_visible():
+            try:
+                self._tt_anim_timer.stop()
+            except Exception:
+                pass
+            return
+
+        try:
+            if self._tt_anim_start_xy is None or self._tt_anim_target_xy is None:
+                self._tt_anim_timer.stop()
+                return
+
+            now = time.time()
+            dur = float(getattr(self, "_tt_anim_duration", 0.10) or 0.10)
+            t = (now - float(self._tt_anim_t0)) / dur if dur > 0 else 1.0
+
+            if t >= 1.0:
+                ab.xy = self._tt_anim_target_xy
+                self._tt_anim_timer.stop()
+                self._preview_blit()
+                return
+
+            # ease-out cubic
+            ease = 1.0 - (1.0 - t) ** 3
+
+            sx, sy = self._tt_anim_start_xy
+            tx, ty = self._tt_anim_target_xy
+
+            cx = sx + (tx - sx) * ease
+            cy = sy + (ty - sy) * ease
+
+            ab.xy = (cx, cy)
+            self._preview_blit()
+        except Exception:
+            try:
+                self._tt_anim_timer.stop()
+            except Exception:
+                pass
+
+    # ---------- stress toggles ----------
+    def _on_cpu_toggled(self, checked: bool) -> None:
+        if (not checked) and (not self.gpu_btn.isChecked()):
+            self.cpu_btn.blockSignals(True)
+            self.cpu_btn.setChecked(True)
+            self.cpu_btn.blockSignals(False)
+            return
+        self.stress_cpu = checked
+        self.save_settings()
+        self._update_run_button_state()
+
+    def _on_gpu_toggled(self, checked: bool) -> None:
+        if (not checked) and (not self.cpu_btn.isChecked()):
+            self.gpu_btn.blockSignals(True)
+            self.gpu_btn.setChecked(True)
+            self.gpu_btn.blockSignals(False)
+            return
+        self.stress_gpu = checked
+        self.save_settings()
+
+    def _can_run(self) -> bool:
+        if not (self._csv_exists and self._csv_updating):
+            return False
+        if self.stress_cpu:
+            if not self.prime_exe or not os.path.exists(self.prime_exe):
+                return False
+        if self.stress_gpu:
+            if not self.furmark_exe or not os.path.exists(self.furmark_exe):
+                return False
+        return True
+
+    def _missing_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        if not self._csv_exists:
+            reasons.append("HWiNFO CSV file not found (check path).")
+        elif not self._csv_updating:
+            reasons.append("HWiNFO CSV not being updated (HWiNFO not logging).")
+
+        if self.stress_cpu:
+            if not self.prime_exe:
+                reasons.append("Prime95 path not set in Settings.")
+            elif not os.path.exists(self.prime_exe):
+                reasons.append(f"Prime95 not found at: {self.prime_exe}")
+
+        if self.stress_gpu:
+            if not self.furmark_exe:
+                reasons.append("FurMark path not set in Settings.")
+            elif not os.path.exists(self.furmark_exe):
+                reasons.append(f"FurMark not found at: {self.furmark_exe}")
+
+        if not reasons:
+            reasons.append("Unknown: prerequisites not met.")
+        return reasons
+
+    def _update_run_button_state(self) -> None:
+        try:
+            if self.proc is not None and self.proc.state() != QProcess.NotRunning:
+                self.run_btn.setEnabled(False)
+                return
+        except Exception:
+            pass
+
+        try:
+            ok = self._can_run()
+        except Exception:
+            ok = False
+        self.run_btn.setEnabled(ok)
+
+        if not ok:
+            try:
+                if self.proc is not None and self.proc.state() != QProcess.NotRunning:
+                    self.run_btn.setToolTip("Test running — abort to enable new runs.")
+                else:
+                    reasons = self._missing_reasons()
+                    self.run_btn.setToolTip("\n".join(reasons))
+            except Exception:
+                pass
+        else:
+            self.run_btn.setToolTip("Start the test")
+
+    # ---------- settings ----------
+    def load_settings(self):
+        data = load_json(self.settings_path)
+        if not data:
+            return
+
+        self.case_edit.setText(str(data.get("case_name", self.case_edit.text())))
+        self.hwinfo_edit.setText(str(data.get("hwinfo_csv", self.hwinfo_edit.text())))
+
+        self.warmup_min.setValue(int(data.get("warmup_min", self.warmup_min.value())))
+        self.warmup_sec.setValue(int(data.get("warmup_sec", self.warmup_sec.value())))
+        self.log_min.setValue(int(data.get("log_min", self.log_min.value())))
+        self.log_sec.setValue(int(data.get("log_sec", self.log_sec.value())))
+
+        self.furmark_exe = str(data.get("furmark_exe", self.furmark_exe or "")).strip()
+        self.prime_exe = str(data.get("prime_exe", self.prime_exe or "")).strip()
+        self.theme_mode = str(data.get("theme", self.theme_mode or "dark")).strip().lower() or "dark"
+
+        try:
+            style_combobox_popup(self.fur_demo_combo, self.theme_mode)
+            style_combobox_popup(self.fur_res_combo, self.theme_mode)
+        except Exception:
+            pass
+
+        demo_display = data.get("fur_demo_display")
+        if demo_display in self.fur_demo_map:
+            self.fur_demo_combo.setCurrentText(demo_display)
+
+        res_display = data.get("fur_res_display")
+        if res_display in self.res_map:
+            self.fur_res_combo.setCurrentText(res_display)
+
+        tokens = data.get("selected_tokens")
+        if isinstance(tokens, list) and tokens:
+            self.selected_tokens = [str(t) for t in tokens]
+
+        self.stress_cpu = bool(data.get("stress_cpu", True))
+        self.stress_gpu = bool(data.get("stress_gpu", True))
+        if (not self.stress_cpu) and (not self.stress_gpu):
+            self.stress_cpu = True
+            self.stress_gpu = True
+
+        self.cpu_btn.blockSignals(True)
+        self.gpu_btn.blockSignals(True)
+        self.cpu_btn.setChecked(self.stress_cpu)
+        self.gpu_btn.setChecked(self.stress_gpu)
+        self.cpu_btn.blockSignals(False)
+        self.gpu_btn.blockSignals(False)
+
+    def save_settings(self):
+        payload = {
+            "case_name": self.case_edit.text().strip(),
+            "hwinfo_csv": self.hwinfo_edit.text().strip(),
+            "warmup_min": int(self.warmup_min.value()),
+            "warmup_sec": int(self.warmup_sec.value()),
+            "log_min": int(self.log_min.value()),
+            "log_sec": int(self.log_sec.value()),
+            "fur_demo_display": self.fur_demo_combo.currentText(),
+            "fur_res_display": self.fur_res_combo.currentText(),
+            "selected_tokens": list(self.selected_tokens),
+            "stress_cpu": bool(self.stress_cpu),
+            "stress_gpu": bool(self.stress_gpu),
+            "furmark_exe": self.furmark_exe,
+            "prime_exe": self.prime_exe,
+            "theme": self.theme_mode,
+        }
+        save_json(self.settings_path, payload)
+        self._update_run_button_state()
+
+    def open_settings(self) -> None:
+        dlg = SettingsDialog(
+            self,
+            furmark_exe=self.furmark_exe,
+            prime_exe=self.prime_exe,
+            theme=self.theme_mode,
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        self.furmark_exe = dlg.furmark_exe()
+        self.prime_exe = dlg.prime_exe()
+        self.theme_mode = dlg.theme()
+
+        app = QApplication.instance()
+        if app is not None:
+            apply_theme(app, self.theme_mode)
+            style_combobox_popup(self.fur_demo_combo, self.theme_mode)
+            style_combobox_popup(self.fur_res_combo, self.theme_mode)
+
+        self.save_settings()
+
+    def closeEvent(self, event):
+        self.save_settings()
+        super().closeEvent(event)
+
+    # ---------- helpers ----------
+    def _bold_label(self, text: str) -> QLabel:
+        lab = QLabel(text)
+        f = lab.font()
+        f.setBold(True)
+        lab.setFont(f)
+        return lab
+
+    def _unit_label(self, text: str) -> QLabel:
+        lab = QLabel(text)
+        lab.setObjectName("UnitLabel")
+        return lab
+
+    # ---------- dots ----------
+    def _set_dot_state(self, dot: QLabel, ok: bool) -> None:
+        dot.setProperty("state", "ok" if ok else "bad")
+        dot.style().unpolish(dot)
+        dot.style().polish(dot)
+        dot.update()
+
+    def _refresh_csv_status(self) -> None:
+        path = self.hwinfo_edit.text().strip()
+
+        csv_exists = False
+        csv_updating = False
+        try:
+            if path and os.path.exists(path):
+                st = os.stat(path)
+                mtime = st.st_mtime
+                size = st.st_size
+                now = time.time()
+
+                if self._csv_last_mtime is None:
+                    self._csv_last_mtime = mtime
+                    self._csv_last_size = size
+                else:
+                    if (mtime != self._csv_last_mtime) or (size != self._csv_last_size):
+                        self._csv_last_mtime = mtime
+                        self._csv_last_size = size
+                        self._csv_last_change_ts = now
+
+                csv_exists = True
+                csv_updating = bool(
+                    self._csv_last_change_ts and (now - self._csv_last_change_ts) <= self._csv_update_window
+                )
+        except Exception:
+            csv_exists = False
+            csv_updating = False
+
+        self._set_dot_state(self.csv_dot, ok=(csv_exists and csv_updating))
+
+        self._csv_exists = csv_exists
+        self._csv_updating = csv_updating
+        self._update_run_button_state()
+
+    def _refresh_sm2_status(self) -> None:
+        sm2_state, _sm2_msg = try_open_hwinfo_sm2()
+        self._set_dot_state(self.sm2_dot, ok=(sm2_state is True))
+
+    # ---------- sensors summary ----------
+    def _refresh_sensors_summary(self):
+        if not self.selected_tokens:
+            self.sensors_summary.setText("")
+            self.sensors_summary.setPlaceholderText("No sensors selected (will use defaults).")
+            return
+
+        display = [("SPD Hub (Max)" if t == SPD_MAX_TOKEN else t) for t in self.selected_tokens]
+        self.sensors_summary.setText(
+            "; ".join(display[:4]) + (f"; … (+{len(display)-4})" if len(display) > 4 else "")
+        )
+
+    # ---------- precise mapping cache ----------
+    def _ensure_precise_map(self, csv_leafs: list[str], csv_unique_leafs: list[str]) -> dict[str, str]:
+        cache_path = resource_path("resources", "sensor_map.json")
+        payload = load_sensor_map(cache_path)
+        if payload and payload.get("schema") == 1 and payload.get("header_unique") == csv_unique_leafs:
+            return dict(payload.get("mapping", {}))
+
+        mapping = build_precise_group_map(csv_leafs, csv_unique_leafs)
+        save_sensor_map(cache_path, csv_unique_leafs, mapping)
+        return mapping
+
+    def open_selected_sensors_view(self):
+        hwinfo_path = self.hwinfo_edit.text().strip()
+        try:
+            header = read_hwinfo_headers(hwinfo_path)
+            csv_leafs, has_spd = sensor_leafs_from_header(header)
+            csv_unique_leafs = make_unique(csv_leafs)
+        except Exception as e:
+            QMessageBox.critical(self, "Cannot read HWiNFO CSV", str(e))
+            return
+
+        try:
+            group_map = self._ensure_precise_map(csv_leafs, csv_unique_leafs)
+        except Exception:
+            group_map = {}
+
+        dlg = SelectedSensorsDialog(
+            self,
+            selected_tokens=list(self.selected_tokens),
+            group_map=group_map,
+            has_spd=has_spd,
+        )
+        dlg.exec()
+
+    def open_sensor_picker(self):
+        hwinfo_path = self.hwinfo_edit.text().strip()
+        try:
+            header = read_hwinfo_headers(hwinfo_path)
+            csv_leafs, has_spd = sensor_leafs_from_header(header)
+            csv_unique_leafs = make_unique(csv_leafs)
+        except Exception as e:
+            QMessageBox.critical(self, "Cannot read HWiNFO CSV", str(e))
+            return
+
+        try:
+            group_map = self._ensure_precise_map(csv_leafs, csv_unique_leafs)
+        except Exception:
+            group_map = {}
+
+        pre = set(self.selected_tokens)
+        dlg = SensorPickerDialog(
+            self,
+            csv_unique_leafs=csv_unique_leafs,
+            has_spd=has_spd,
+            group_map=group_map,
+            preselected=pre,
+        )
+        if dlg.exec() == QDialog.Accepted:
+            self.selected_tokens = dlg.selected_tokens()
+            self._refresh_sensors_summary()
+            self.save_settings()
+
+    def build_selected_columns(self) -> list[str]:
+        if not self.selected_tokens:
+            return ["CPU Package [°C]", "GPU Temperature [°C]", "GPU VRM Temperature [°C]", "SPD Hub Max [°C]"]
+
+        cols: list[str] = []
+        spd_selected = False
+
+        for t in self.selected_tokens:
+            if t == SPD_MAX_TOKEN:
+                spd_selected = True
+                continue
+            if "SPD Hub Temperature" in t:
+                spd_selected = True
+            cols.append(t)
+
+        if spd_selected:
+            cols.append("SPD Hub Max [°C]")
+
+        seen = set()
+        out = []
+        for c in cols:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
+
+    # ---------- live timer ----------
+    @staticmethod
+    def _fmt_mmss(total_seconds: int) -> str:
+        total_seconds = max(0, total_seconds)
+        return f"{total_seconds//60:02d}:{total_seconds%60:02d}"
+
+    def _start_live_timer(self, warmup_sec: int, log_sec: int):
+        self._warmup_total = warmup_sec
+        self._log_total = log_sec
+        self._run_started_at = datetime.now()
+        self._tick_timer()
+        self._timer.start()
+
+    def _stop_live_timer(self, final_text: str = "Idle"):
+        self._timer.stop()
+        self._run_started_at = None
+        self.live_timer.setText(final_text)
+
+    def _tick_timer(self):
+        if not self._run_started_at:
+            return
+        elapsed = int((datetime.now() - self._run_started_at).total_seconds())
+        if elapsed < self._warmup_total:
+            self.live_timer.setText(f"Warmup  {self._fmt_mmss(self._warmup_total - elapsed)}")
+            return
+        log_elapsed = elapsed - self._warmup_total
+        if log_elapsed < self._log_total:
+            self.live_timer.setText(f"Log  {self._fmt_mmss(self._log_total - log_elapsed)}")
+            return
+        self.live_timer.setText("Done  00:00")
+
+    # ---------- misc ----------
+    def append(self, text: str) -> None:
+        self.log.append(text.rstrip())
+
+    def pick_hwinfo(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select hwinfo.csv", str(Path.cwd()), "CSV Files (*.csv)")
+        if path:
+            self.hwinfo_edit.setText(path)
+            self.save_settings()
+            self._refresh_csv_status()
+
+    def _on_runs_selection_changed(self, selected, deselected):
+        try:
+            indexes = selected.indexes()
+            if not indexes:
+                self._preview_label.clear()
+                return
+            idx = indexes[0]
+            fpath = self._runs_model.filePath(idx)
+            if not fpath:
+                self._preview_label.clear()
+                return
+
+            p = Path(fpath)
+            if p.is_dir():
+                try:
+                    self._preview_folder(str(p))
+                except Exception:
+                    self._preview_label.clear()
+                return
+
+            self._preview_path(fpath)
+        except Exception:
+            self._preview_label.clear()
+
+    def _preview_folder(self, folder: str) -> None:
+        try:
+            p = Path(folder)
+            if not p.exists() or not p.is_dir():
+                try:
+                    if self._preview_canvas is not None:
+                        self._preview_canvas.hide()
+                except Exception:
+                    pass
+                self._preview_label.clear()
+                return
+
+            csv_path = p / "run_window.csv"
+            if csv_path.exists() and csv_path.is_file():
+                try:
+                    self._preview_path(str(csv_path))
+                    return
+                except Exception:
+                    pass
+
+            png_path = p / "ALL_SELECTED.png"
+            if png_path.exists() and png_path.is_file():
+                try:
+                    self._preview_path(str(png_path))
+                    return
+                except Exception:
+                    pass
+
+            try:
+                if self._preview_canvas is not None:
+                    self._preview_canvas.hide()
+            except Exception:
+                pass
+            self._preview_label.clear()
+        except Exception:
+            self._preview_label.clear()
+
+    def _plot_run_csv(self, fpath: str) -> None:
+        if self._preview_canvas is None or self._preview_ax is None:
+            raise RuntimeError("Preview canvas unavailable")
+
+        df = pd.read_csv(fpath, header=0)
+        if df.shape[0] == 0:
+            raise RuntimeError("Empty CSV")
+
+        # datetime handling
+        if df.shape[1] >= 2:
+            c0 = str(df.columns[0]).strip().lower()
+            c1 = str(df.columns[1]).strip().lower()
+        else:
+            c0 = str(df.columns[0]).strip().lower()
+            c1 = ""
+
+        dt_index = None
+        if c0 == "date" and c1 == "time":
+            dt_index = pd.to_datetime(
+                df.iloc[:, 0].astype(str) + " " + df.iloc[:, 1].astype(str),
+                dayfirst=True,
+                errors="coerce",
+            )
+            df_data = df.iloc[:, 2:].copy()
+        else:
+            dt_try = pd.to_datetime(df.iloc[:, 0].astype(str), dayfirst=True, errors="coerce")
+            if dt_try.notna().any():
+                dt_index = dt_try
+                df_data = df.iloc[:, 1:].copy()
+            else:
+                df_data = df.select_dtypes(include=["number"]).copy()
+                dt_index = None
+
+        if dt_index is not None:
+            df_data.index = dt_index
+            df_data = df_data.loc[~df_data.index.isna()]
+        else:
+            df_data.index = pd.RangeIndex(start=0, stop=len(df_data))
+
+        if df_data.empty:
+            raise RuntimeError("No plottable columns found in CSV")
+
+        preferred = self.build_selected_columns()
+        cols = [c for c in preferred if c in df_data.columns]
+        if not cols:
+            cols = list(df_data.columns[: min(8, len(df_data.columns))])
+
+        is_dt = df_data.index.dtype.kind == "M"
+        if is_dt:
+            x_vals = mdates.date2num(df_data.index.to_pydatetime())
+        else:
+            x_vals = np.arange(len(df_data))
+
+        # reset any running tooltip animation
+        try:
+            self._tt_anim_timer.stop()
+        except Exception:
+            pass
+        self._tt_anim_start_xy = None
+        self._tt_anim_target_xy = None
+
+        self._preview_ax.clear()
+
+        # shared grid style
+        self._preview_grid_color = "#3A3A3A"
+        self._preview_dot_dashes = (0, (1.2, 3.2))
+
+        # -------------------- theme --------------------
+        try:
+            self._preview_fig.set_facecolor("#121212")
+        except Exception:
+            pass
+        try:
+            self._preview_ax.set_facecolor("#121212")
+
+            # Remove left/right borders, keep top/bottom as dotted borders
+            for side in ("left", "right"):
+                self._preview_ax.spines[side].set_visible(False)
+
+            for side in ("top", "bottom"):
+                sp = self._preview_ax.spines[side]
+                sp.set_visible(True)
+                sp.set_color(self._preview_grid_color)
+                sp.set_linewidth(0.9)
+                sp.set_linestyle(self._preview_dot_dashes)
+                sp.set_alpha(0.9)
+
+            # remove tick marks (keeps labels clean)
+            self._preview_ax.tick_params(axis="both", length=0)
+            self._preview_ax.tick_params(axis="x", colors="#BDBDBD")
+            self._preview_ax.tick_params(axis="y", colors="#BDBDBD")
+            self._preview_ax.xaxis.label.set_color("#EAEAEA")
+            self._preview_ax.yaxis.label.set_color("#EAEAEA")
+        except Exception:
+            pass
+
+        # -------------------- grid --------------------
+        try:
+            self._preview_ax.grid(
+                True,
+                which="major",
+                axis="y",
+                color=self._preview_grid_color,
+                linewidth=0.9,
+            )
+            for gl in self._preview_ax.get_ygridlines():
+                gl.set_linestyle(self._preview_dot_dashes)
+                gl.set_alpha(0.9)
+        except Exception:
+            pass
+
+        # -------------------- plot series --------------------
+        cmap = cm.get_cmap("tab20")
+
+        base_lw = 2.6
+        glow_lw = base_lw + 2.0
+        glow_alpha = 0.18
+
+        line_kwargs = dict(
+            linewidth=base_lw,
+            alpha=0.98,
+            solid_capstyle="round",
+            solid_joinstyle="round",
+            antialiased=True,
+            zorder=10,
+        )
+
+        self._preview_colors = []
+        for i, c in enumerate(cols):
+            y = pd.to_numeric(df_data[c], errors="coerce").to_numpy(dtype=float)
+
+            colc = cmap(i % 20)
+            try:
+                if isinstance(colc, tuple):
+                    import matplotlib.colors as mcolors
+                    colc = mcolors.to_hex(colc)
+            except Exception:
+                pass
+            self._preview_colors.append(colc)
+
+            if is_dt:
+                ln = self._preview_ax.plot_date(x_vals, y, "-", color=colc, **line_kwargs)[0]
+            else:
+                ln = self._preview_ax.plot(x_vals, y, "-", color=colc, **line_kwargs)[0]
+
+            try:
+                ln.set_path_effects([
+                    pe.Stroke(linewidth=glow_lw, foreground=colc, alpha=glow_alpha),
+                    pe.Normal()
+                ])
+            except Exception:
+                pass
+
+        # -------------------- legend --------------------
+        try:
+            leg = self._preview_ax.legend(loc="upper left", fontsize=8, frameon=True)
+            if leg:
+                leg.get_frame().set_facecolor("#171717")
+                leg.get_frame().set_edgecolor("#2A2A2A")
+                leg.get_frame().set_alpha(0.9)
+                for text in leg.get_texts():
+                    text.set_color("#FFFFFF")
+        except Exception:
+            pass
+
+        # -------------------- store for hover --------------------
+        self._preview_x = x_vals
+        self._preview_df = df_data[cols]
+
+        # xlim no padding
+        try:
+            if len(x_vals) > 0:
+                self._preview_ax.set_xlim(left=x_vals[0], right=x_vals[-1])
+        except Exception:
+            pass
+
+        # elapsed time x-axis labels (no x-axis label text)
+        if is_dt and len(x_vals) > 0:
+            try:
+                from matplotlib.ticker import FuncFormatter
+
+                def elapsed_time_formatter(x, pos):
+                    try:
+                        dt_current = mdates.num2date(x)
+                        dt_start = mdates.num2date(x_vals[0])
+                        elapsed = dt_current - dt_start
+                        total_seconds = int(elapsed.total_seconds())
+                        hours = total_seconds // 3600
+                        minutes = (total_seconds % 3600) // 60
+                        seconds = total_seconds % 60
+                        if hours > 0:
+                            return f"{hours}:{minutes:02d}:{seconds:02d}"
+                        return f"{minutes}:{seconds:02d}"
+                    except Exception:
+                        return ""
+
+                self._preview_ax.xaxis.set_major_formatter(FuncFormatter(elapsed_time_formatter))
+                self._preview_ax.set_xlabel("")
+            except Exception:
+                pass
+
+        # -------------------- vertical hover line --------------------
+        try:
+            self._preview_vline = self._preview_ax.axvline(
+                self._preview_x[0],
+                color=self._preview_grid_color,
+                linewidth=0.9,
+                alpha=0.9,
+                zorder=900,
+            )
+            self._preview_vline.set_linestyle(self._preview_dot_dashes)
+            self._preview_vline.set_clip_on(True)
+            self._preview_vline.set_visible(False)
+            self._preview_vline.set_animated(True)
+        except Exception:
+            self._preview_vline = None
+
+        # -------------------- tooltip (two-column, 5px gap, aligned values) --------------------
+        try:
+            # Convert 5px gap to points for offsetbox (approx)
+            dpi = float(getattr(self._preview_fig, "dpi", 100) or 100)
+            sep_pts = 5.0 * 72.0 / dpi
+
+            self._preview_collective_time = TextArea(
+                "",
+                textprops=dict(color="#FFFFFF", family="DejaVu Sans Mono", fontsize=10, weight="bold"),
+            )
+
+            # Create per-row name/value areas (same count as cols)
+            self._preview_name_areas = [
+                TextArea("", textprops=dict(color="#FFFFFF", family="DejaVu Sans Mono", fontsize=10))
+                for _ in cols
+            ]
+            self._preview_value_areas = [
+                TextArea("", textprops=dict(color="#FFFFFF", family="DejaVu Sans Mono", fontsize=10))
+                for _ in cols
+            ]
+
+            left_col = VPacker(children=self._preview_name_areas, align="left", pad=0, sep=3)
+            right_col = VPacker(children=self._preview_value_areas, align="right", pad=0, sep=3)
+            two_col = HPacker(children=[left_col, right_col], align="top", pad=0, sep=sep_pts)
+
+            vbox = VPacker(children=[self._preview_collective_time, two_col], align="left", pad=0, sep=4)
+
+            self._preview_collective_box = AnnotationBbox(
+                vbox,
+                (self._preview_x[0], 0),
+                xybox=self._preview_tt_default_xybox,
+                xycoords="data",
+                boxcoords="offset points",
+                frameon=True,
+                bboxprops=dict(
+                    boxstyle="round,pad=0.55",
+                    fc=(0, 0, 0, 0.28),   # translucent
+                    ec=(1, 1, 1, 0.06),
+                    linewidth=1.0,
+                ),
+                zorder=1003,
+            )
+
+            try:
+                self._preview_collective_box.patch.set_path_effects([
+                    pe.withSimplePatchShadow(offset=(1, -1), shadow_rgbFace=(0, 0, 0), alpha=0.35),
+                    pe.Normal(),
+                ])
+            except Exception:
+                pass
+
+            self._preview_collective_box._box_alignment = (0, 0)
+            self._preview_collective_box.set_visible(False)
+            self._preview_collective_box.set_clip_on(False)
+            self._preview_collective_box.set_animated(True)
+            self._preview_ax.add_artist(self._preview_collective_box)
+
+        except Exception:
+            self._preview_collective_box = None
+            self._preview_collective_time = None
+            self._preview_name_areas = None
+            self._preview_value_areas = None
+
+        # reset hover + cached tooltip metrics
+        self._preview_last_idx = None
+        self._preview_tt_w_px = None
+        self._preview_tt_h_px = None
+        self._preview_tt_mode = "UR"
+
+        # show canvas
+        try:
+            self._preview_label.clear()
+            self._preview_label.hide()
+        except Exception:
+            pass
+        try:
+            self._preview_canvas.show()
+        except Exception:
+            pass
+
+        # connect mpl hover handler
+        try:
+            if self._preview_mpl_cid is not None:
+                try:
+                    self._preview_canvas.mpl_disconnect(self._preview_mpl_cid)
+                except Exception:
+                    pass
+            self._preview_mpl_cid = self._preview_canvas.mpl_connect("motion_notify_event", self._on_preview_hover)
+        except Exception:
+            self._preview_mpl_cid = None
+
+        # prime renderer + background once
+        try:
+            self._preview_canvas.draw()
+            self._on_preview_draw()
+        except Exception:
+            self._preview_canvas.draw_idle()
+
+    def _on_preview_hover(self, event) -> None:
+        try:
+            xdata = getattr(event, "xdata", None)
+            ydata = getattr(event, "ydata", None)
+            if xdata is None and ydata is None:
+                return
+            self._on_preview_hover_xy(xdata, ydata)
+        except Exception:
+            pass
+
+    def _hide_preview_hover(self) -> None:
+        try:
+            if getattr(self, "_preview_vline", None) is not None:
+                self._preview_vline.set_visible(False)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_preview_collective_box", None) is not None:
+                self._preview_collective_box.set_visible(False)
+        except Exception:
+            pass
+        try:
+            self._tt_anim_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._preview_blit()
+        except Exception:
+            pass
+
+    def _on_preview_hover_xy(self, xdata: float, ydata: float) -> None:
+        try:
+            if self._preview_df is None or self._preview_x is None or self._preview_ax is None:
+                return
+            if xdata is None:
+                return
+
+            # throttle (smooth + low CPU)
+            try:
+                now = time.time()
+                if (now - getattr(self, "_hover_last_ts", 0.0)) < getattr(self, "_hover_min_interval", 0.0):
+                    return
+                self._hover_last_ts = now
+            except Exception:
+                pass
+
+            # if outside x-range -> hide
+            try:
+                x0, x1 = self._preview_ax.get_xlim()
+                if xdata < min(x0, x1) or xdata > max(x0, x1):
+                    self._hide_preview_hover()
+                    return
+            except Exception:
+                pass
+
+            # nearest x index for values (snap), tooltip follows mouse position
+            try:
+                idx = int(np.argmin(np.abs(self._preview_x - xdata)))
+            except Exception:
+                return
+            idx = max(0, min(idx, len(self._preview_x) - 1))
+            row = self._preview_df.iloc[idx]
+
+            # ---- vertical dotted cursor line (follows mouse x) ----
+            try:
+                vl = getattr(self, "_preview_vline", None)
+                if vl is not None:
+                    vl.set_xdata([xdata, xdata])
+                    vl.set_visible(True)
+            except Exception:
+                pass
+
+            # ---- time string ----
+            try:
+                dt_current = mdates.num2date(self._preview_x[idx])
+                dt_start = mdates.num2date(self._preview_x[0])
+                elapsed = dt_current - dt_start
+                total_seconds = int(elapsed.total_seconds())
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                seconds = total_seconds % 60
+                tstr = f"{hours}:{minutes:02d}:{seconds:02d}" if hours > 0 else f"{minutes}:{seconds:02d}"
+            except Exception:
+                tstr = f"{idx}"
+
+            # ---- build sensor list (sorted by value desc, NaNs last) ----
+            sensor_data = []
+            cols = list(self._preview_df.columns)
+            for i, col in enumerate(cols):
+                try:
+                    val = float(row.iloc[i])
+                except Exception:
+                    val = float("nan")
+                try:
+                    color = self._preview_colors[i] if i < len(self._preview_colors) else "#FFFFFF"
+                except Exception:
+                    color = "#FFFFFF"
+                sensor_data.append((str(col), val, color))
+
+            def _sort_key(t):
+                v = t[1]
+                return (v if v == v else -1e30)
+
+            sensor_data.sort(key=_sort_key, reverse=True)
+
+            # ---- update tooltip content (two column) ----
+            ab = getattr(self, "_preview_collective_box", None)
+            if ab is not None:
+                try:
+                    if getattr(self, "_preview_collective_time", None) is not None:
+                        self._preview_collective_time.set_text(tstr)
+                except Exception:
+                    pass
+
+                name_areas = getattr(self, "_preview_name_areas", None) or []
+                value_areas = getattr(self, "_preview_value_areas", None) or []
+
+                MAX_NAME_CHARS = 70
+
+                def _shorten(s: str, cap: int) -> str:
+                    s = str(s)
+                    return s if len(s) <= cap else (s[: cap - 1] + "…")
+
+                n = min(len(sensor_data), len(name_areas), len(value_areas))
+                for j in range(n):
+                    name, val, color = sensor_data[j]
+                    name = _shorten(name, MAX_NAME_CHARS)
+                    if val != val:
+                        vtxt = "-"
+                    else:
+                        vtxt = f"{val:.1f} °C"
+
+                    try:
+                        name_areas[j].set_text(name)
+                        name_areas[j]._text.set_color(color)
+                    except Exception:
+                        pass
+                    try:
+                        value_areas[j].set_text(vtxt)
+                        value_areas[j]._text.set_color(color)
+                    except Exception:
+                        pass
+
+                for j in range(n, len(name_areas)):
+                    try:
+                        name_areas[j].set_text("")
+                    except Exception:
+                        pass
+                for j in range(n, len(value_areas)):
+                    try:
+                        value_areas[j].set_text("")
+                    except Exception:
+                        pass
+
+                ab.set_visible(True)
+
+            # ensure background cache exists
+            try:
+                if getattr(self, "_preview_bg", None) is None and self._preview_canvas is not None:
+                    self._preview_canvas.draw()
+                    self._on_preview_draw()
+            except Exception:
+                pass
+
+            # ---- edge flip mode based on TARGET position (keeps animation intact) ----
+            try:
+                ty = ydata if ydata is not None else 0.0
+                self._preview_update_tooltip_mode_for(xdata, ty)
+            except Exception:
+                ty = ydata if ydata is not None else 0.0
+
+            # ---- smooth tooltip movement (animate anchor) ----
+            try:
+                ab = getattr(self, "_preview_collective_box", None)
+                if ab is not None:
+                    # pick a stable y if ydata missing
+                    if ydata is None:
+                        try:
+                            y0, y1 = self._preview_ax.get_ylim()
+                            ty = 0.5 * (y0 + y1)
+                        except Exception:
+                            ty = 0.0
+
+                    cur = getattr(ab, "xy", None)
+                    if not cur or len(cur) != 2:
+                        cur = (xdata, ty)
+
+                    # start from current animated position
+                    self._tt_anim_start_xy = (float(cur[0]), float(cur[1]))
+                    self._tt_anim_target_xy = (float(xdata), float(ty))
+                    self._tt_anim_t0 = time.time()
+
+                    if not self._tt_anim_timer.isActive():
+                        self._tt_anim_timer.start()
+            except Exception:
+                # fallback: immediate
+                try:
+                    if ab is not None:
+                        ab.xy = (xdata, ty)
+                        ab.set_visible(True)
+                except Exception:
+                    pass
+
+            # redraw fast
+            try:
+                self._preview_blit()
+            except Exception:
+                try:
+                    if self._preview_canvas is not None:
+                        self._preview_canvas.draw_idle()
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+    def _preview_path(self, fpath: str) -> None:
+        try:
+            p = Path(fpath)
+
+            if p.is_file() and p.suffix.lower() == ".csv" and self._preview_canvas is not None:
+                try:
+                    self._plot_run_csv(str(p))
+                    return
+                except Exception:
+                    pass
+
+            if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp"):
+                if self._preview_canvas is not None:
+                    try:
+                        self._preview_canvas.hide()
+                    except Exception:
+                        pass
+                pix = QPixmap(str(p))
+                if not pix.isNull():
+                    w = max(100, self._preview_label.width())
+                    h = max(100, self._preview_label.height())
+                    self._preview_label.setPixmap(pix.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    self._preview_label.show()
+                    return
+        except Exception:
+            pass
+
+        try:
+            if self._preview_canvas is not None:
+                self._preview_canvas.hide()
+        except Exception:
+            pass
+        self._preview_label.clear()
+        self._preview_label.show()
+
+    def _on_tab_changed(self, index: int) -> None:
+        try:
+            if index == getattr(self, "_results_tab_index", -1):
+                self._select_latest_result()
+        except Exception:
+            pass
+
+    def _select_latest_result(self) -> None:
+        try:
+            root = getattr(self, "_runs_root", None)
+            if not root or not root.exists():
+                return
+
+            target_folder = None
+            try:
+                if getattr(self, "last_run_dir", None):
+                    cand = Path(self.last_run_dir)
+                    if cand.exists() and cand.is_dir():
+                        target_folder = cand
+            except Exception:
+                target_folder = None
+
+            if target_folder is None:
+                csv_candidates = [p for p in root.rglob("run_window.csv") if p.is_file()]
+                if csv_candidates:
+                    latest_csv = max(csv_candidates, key=lambda p: p.stat().st_mtime)
+                    target_folder = latest_csv.parent
+                else:
+                    img_candidates = [p for p in root.rglob("*") if p.is_file() and p.name.lower() == "all_selected.png"]
+                    if img_candidates:
+                        latest_png = max(img_candidates, key=lambda p: p.stat().st_mtime)
+                        target_folder = latest_png.parent
+
+            if target_folder is None:
+                return
+
+            idx = self._runs_model.index(str(target_folder))
+            if not idx.isValid():
+                return
+
+            parent = idx.parent()
+            while parent.isValid():
+                try:
+                    self._runs_tree.expand(parent)
+                except Exception:
+                    pass
+                parent = parent.parent()
+
+            try:
+                self._runs_tree.setCurrentIndex(idx)
+                self._runs_tree.scrollTo(idx)
+                sm = self._runs_tree.selectionModel()
+                if sm is not None:
+                    sm.select(idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Select)
+                try:
+                    self._preview_folder(str(target_folder))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # ---------- run / abort ----------
+    def run(self):
+        try:
+            if self.proc is not None and self.proc.state() != QProcess.NotRunning:
+                QMessageBox.warning(self, "Running", "A test is already running.")
+                return
+        except Exception:
+            pass
+
+        script = resource_path("cli", "run_case.ps1")
+        if not script.exists():
+            QMessageBox.critical(self, "Missing", f"run_case.ps1 not found: {script}")
+            return
+
+        self.save_settings()
+
+        self.last_run_dir = None
+        self.open_btn.setEnabled(False)
+        self.log.clear()
+
+        case = self.case_edit.text().strip()
+        warm = int(self.warmup_min.value()) * 60 + int(self.warmup_sec.value())
+        logsec = int(self.log_min.value()) * 60 + int(self.log_sec.value())
+        if warm <= 0 or logsec <= 0:
+            QMessageBox.warning(self, "Invalid time", "Warmup and Log must be > 0 seconds.")
+            return
+
+        hwinfo = self.hwinfo_edit.text().strip()
+
+        demo_display = self.fur_demo_combo.currentText()
+        fur_demo = self.fur_demo_map[demo_display]
+        res_display = self.fur_res_combo.currentText()
+        fur_w, fur_h = self.res_map[res_display]
+
+        columns = self.build_selected_columns()
+
+        cmd_parts = [
+            f"& {ps_quote(str(script))}",
+            f"-CaseName {ps_quote(case)}",
+            f"-WarmupSec {warm}",
+            f"-LogSec {logsec}",
+            f"-HwinfoCsv {ps_quote(hwinfo)}",
+            f"-FurDemo {ps_quote(fur_demo)}",
+            f"-FurWidth {fur_w}",
+            f"-FurHeight {fur_h}",
+        ]
+
+        if self.stress_cpu:
+            cmd_parts.append("-StressCPU")
+        if self.stress_gpu:
+            cmd_parts.append("-StressGPU")
+        if self.furmark_exe:
+            cmd_parts.append(f"-FurMarkExe {ps_quote(self.furmark_exe)}")
+        if self.prime_exe:
+            cmd_parts.append(f"-PrimeExe {ps_quote(self.prime_exe)}")
+
+        if columns:
+            cmd_parts.append(f"-TempPatterns {build_ps_array_literal(columns)}")
+
+        cmd = " ".join(cmd_parts)
+
+        self.append("Starting PowerShell:")
+        self.append("powershell -NoProfile -ExecutionPolicy Bypass -Command " + cmd)
+        self.append("")
+
+        self.run_btn.setEnabled(False)
+        self.abort_btn.setEnabled(True)
+
+        if self.proc is None:
+            QMessageBox.critical(self, "Error", "Cannot start process (QProcess unavailable).")
+            return
+
+        self.proc.setProgram("powershell")
+        self.proc.setArguments(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd])
+
+        self._pending_warm = warm
+        self._pending_log = logsec
+        self._timer_started = False
+
+        self.proc.start()
+
+    def abort(self):
+        if self.proc is None:
+            return
+        if self.proc.state() == QProcess.NotRunning:
+            return
+        self.append("ABORT requested: StopNow")
+        self.abort_btn.setEnabled(False)
+
+        script = resource_path("cli", "run_case.ps1")
+        p = QProcess(self)
+        p.start("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-StopNow"])
+
+    def on_stdout(self):
+        if self.proc is None:
+            return
+        data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+        for line in data.splitlines():
+            self.append(line)
+
+            if (not getattr(self, "_timer_started", False)) and "GUI_TIMER:WARMUP_START" in line:
+                self._timer_started = True
+                self._start_live_timer(self._pending_warm, self._pending_log)
+
+            m = RUNMAP_RE.search(line)
+            if m:
+                self.last_run_dir = m.group(1).strip()
+
+    def on_stderr(self):
+        if self.proc is None:
+            return
+        data = bytes(self.proc.readAllStandardError()).decode("utf-8", errors="replace")
+        for line in data.splitlines():
+            self.append("[ERR] " + line)
+
+    def on_finished(self, code, status):
+        self.append(f"Finished (exit code {code})")
+        self.run_btn.setEnabled(True)
+        self.abort_btn.setEnabled(False)
+        self._stop_live_timer("Idle" if code == 0 else "Stopped")
+        self.open_btn.setEnabled(bool(self.last_run_dir and Path(self.last_run_dir).exists()))
+
+    def open_run_folder(self):
+        if self.last_run_dir and Path(self.last_run_dir).exists():
+            os.startfile(self.last_run_dir)

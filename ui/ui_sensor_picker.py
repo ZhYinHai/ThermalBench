@@ -78,6 +78,7 @@ class SensorPickerDialog(QDialog):
         self.tree.setHeaderHidden(True)
         self.tree.setUniformRowHeights(True)
         self.tree.itemDoubleClicked.connect(self._on_double_click)
+        self.tree.itemClicked.connect(self._toggle_tree_item)
         root.addWidget(self.tree, 1)
 
         self.group_items: dict[str, QTreeWidgetItem] = {}
@@ -159,6 +160,14 @@ class SensorPickerDialog(QDialog):
             return
         cs = item.checkState(0)
         item.setCheckState(0, Qt.Unchecked if cs == Qt.Checked else Qt.Checked)
+
+    def _toggle_tree_item(self, item: QTreeWidgetItem, column: int):
+        """Toggle expand/collapse state of tree item on single click."""
+        if item.childCount() > 0:
+            if item.isExpanded():
+                self.tree.collapseItem(item)
+            else:
+                self.tree.expandItem(item)
 
     def _apply_filter(self):
         q = self.search.text().strip().lower()

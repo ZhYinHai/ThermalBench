@@ -49,6 +49,7 @@ class SelectedSensorsDialog(QDialog):
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.setUniformRowHeights(True)
+        self.tree.itemClicked.connect(self._toggle_tree_item)
         root.addWidget(self.tree, 1)
 
         # Build grouped view
@@ -97,3 +98,11 @@ class SelectedSensorsDialog(QDialog):
             pg = p.geometry()
             sg = self.geometry()
             self.move(pg.center().x() - sg.width() // 2, pg.center().y() - sg.height() // 2)
+
+    def _toggle_tree_item(self, item: QTreeWidgetItem, column: int):
+        """Toggle expand/collapse state of tree item on single click."""
+        if item.childCount() > 0:
+            if item.isExpanded():
+                self.tree.collapseItem(item)
+            else:
+                self.tree.expandItem(item)

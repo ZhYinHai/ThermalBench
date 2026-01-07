@@ -57,8 +57,7 @@ def apply_theme(app: QApplication, mode: str) -> None:
             QToolButton#WinBtn {
                 background-color: transparent;
                 border: none;
-                border-radius: 8px;
-                padding: 6px 10px;
+                border-radius: 6px;
             }
             QToolButton#WinBtn:hover { background-color: #2A2A2A; }
             QToolButton#WinClose:hover { background-color: #C42B1C; }
@@ -79,6 +78,20 @@ def apply_theme(app: QApplication, mode: str) -> None:
                 background-color: #1A1A1A;
                 border: 1px solid #2A2A2A;
                 border-radius: 10px;
+            }
+
+            QTreeView::item:selected {
+                background-color: #2A2A2A;
+                color: #EAEAEA;
+                outline: none;
+                border: none;
+            }
+            QTreeView::item:hover {
+                background-color: #242424;
+            }
+            QTreeView::item:focus {
+                outline: none;
+                border: none;
             }
 
             QLabel#StatusDot { font-size: 14px; }
@@ -165,8 +178,7 @@ def apply_theme(app: QApplication, mode: str) -> None:
             QToolButton#WinBtn {
                 background-color: transparent;
                 border: none;
-                border-radius: 8px;
-                padding: 6px 10px;
+                border-radius: 6px;
             }
             QToolButton#WinBtn:hover { background-color: #EFEFEF; }
             QToolButton#WinClose:hover { background-color: #FFDFDF; }
@@ -187,6 +199,20 @@ def apply_theme(app: QApplication, mode: str) -> None:
                 background-color: #FFFFFF;
                 border: 1px solid #D0D0D0;
                 border-radius: 10px;
+            }
+
+            QTreeView::item:selected {
+                background-color: #CFE4FF;
+                color: #1A1A1A;
+                outline: none;
+                border: none;
+            }
+            QTreeView::item:hover {
+                background-color: #F0F0F0;
+            }
+            QTreeView::item:focus {
+                outline: none;
+                border: none;
             }
 
             QLabel#StatusDot { font-size: 14px; }

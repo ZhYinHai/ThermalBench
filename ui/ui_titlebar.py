@@ -15,15 +15,15 @@ class TitleBar(QWidget):
     ):
         super().__init__(parent)
         self.setObjectName("TitleBar")
-        self.setFixedHeight(42)
+        self.setFixedHeight(36)
 
         self._draggable = draggable
         self._drag_active = False
         self._drag_offset = QPoint()
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 6, 8, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(12, 2, 2, 2)
+        layout.setSpacing(2)
 
         self.title_label = QLabel(title)
         self.title_label.setObjectName("TitleText")
@@ -32,14 +32,17 @@ class TitleBar(QWidget):
         self.btn_min = QToolButton()
         self.btn_min.setObjectName("WinBtn")
         self.btn_min.setText("—")
+        self.btn_min.setFixedSize(32, 32)
 
         self.btn_max = QToolButton()
         self.btn_max.setObjectName("WinBtn")
         self.btn_max.setText("□")
+        self.btn_max.setFixedSize(32, 32)
 
         self.btn_close = QToolButton()
         self.btn_close.setObjectName("WinClose")
         self.btn_close.setText("✕")
+        self.btn_close.setFixedSize(32, 32)
 
         # Layout: title fills, buttons at right
         layout.addWidget(self.title_label, 1)
