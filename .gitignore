@@ -2,7 +2,6 @@
 __pycache__/
 *.pyc
 runs/
-*.png
 *.csv
 settings.json
 sensor_map.json
@@ -12,3 +11,6 @@ temptesting_abort.flag
 dist/
 build/
 *.spec.bak
+# Large files
+*.zip
+ThermalBench.zip

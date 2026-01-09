@@ -13,8 +13,7 @@ from core.hwinfo_metadata import build_precise_group_map, load_sensor_map, save_
 from core.hwinfo_status import try_open_hwinfo_sm2
 from core.resources import resource_path
 
-from .ui_sensor_picker import SensorPickerDialog, SPD_MAX_TOKEN
-from .ui_selected_sensors import SelectedSensorsDialog
+from .dialogs import SensorPickerDialog, SPD_MAX_TOKEN, SelectedSensorsDialog
 
 
 class SensorManager:

@@ -14,8 +14,8 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
 )
 
-from .ui_titlebar import TitleBar
-from .ui_rounding import apply_rounded_corners
+from ..widgets.ui_titlebar import TitleBar
+from ..widgets.ui_rounding import apply_rounded_corners
 
 SPD_MAX_TOKEN = "__SPD_MAX__"
 

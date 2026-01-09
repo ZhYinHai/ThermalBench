@@ -2,7 +2,10 @@
 """Benchmark execution and results browsing component."""
 
 import os
+import re
+import shutil
 import time
+import json
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -11,7 +14,14 @@ from PySide6.QtCore import QProcess, QTimer, QItemSelectionModel, Qt
 from PySide6.QtWidgets import QTreeView, QFileSystemModel, QMessageBox
 
 from core.ps_helpers import RUNMAP_RE, ps_quote, build_ps_array_literal
+
 from core.resources import resource_path
+from ui.graph_preview.graph_plot_helpers import load_run_csv_dataframe
+from ui.graph_preview.legend_popup_helpers import raise_center_and_focus
+from ui.graph_preview.ui_compare_popup import ComparePopup
+from ui.graph_preview.ui_dim_overlay import DimOverlay
+
+_RUN_FOLDER_RE = re.compile(r"^\d{8}_\d{6}$")
 
 
 class BenchmarkController:
@@ -25,6 +35,8 @@ class BenchmarkController:
         abort_btn,
         open_btn,
         live_timer,
+        remove_btn,
+        compare_btn,
         runs_tree: QTreeView,
         runs_model,
         runs_source_model: QFileSystemModel,
@@ -45,6 +57,8 @@ class BenchmarkController:
         self._abort_btn = abort_btn
         self._open_btn = open_btn
         self._live_timer = live_timer
+        self._remove_btn = remove_btn
+        self._compare_btn = compare_btn
         self._runs_tree = runs_tree
         self._runs_model = runs_model
         self._runs_source_model = runs_source_model
@@ -66,6 +80,12 @@ class BenchmarkController:
 
         # Remember last user-selected path (if user clicked something in the tree)
         self._last_selected_path: Optional[Path] = None
+
+        # Compare selection + popup
+        self._compare_selected_dirs: set[Path] = set()
+        self._compare_restoring = False
+        self._compare_popup: Optional[ComparePopup] = None
+        self._compare_dim_overlay: Optional[DimOverlay] = None
 
         # Process for running benchmarks
         try:
@@ -98,6 +118,303 @@ class BenchmarkController:
         except Exception:
             pass
 
+        try:
+            self._runs_tree.selectionModel().currentChanged.connect(self._on_runs_current_changed)
+        except Exception:
+            pass
+
+        self._update_remove_btn_state()
+        self._update_compare_btn_state()
+
+    # -------------------------------------------------------------------------
+    # compare + selection helpers
+    # -------------------------------------------------------------------------
+    def _run_folder_from_index(self, idx) -> Optional[Path]:
+        try:
+            if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
+                return None
+
+            fpath = self._idx_to_path(idx)
+            if not fpath:
+                return None
+
+            p = Path(fpath)
+            run_dir = p if p.is_dir() else p.parent
+            if not run_dir.exists() or not run_dir.is_dir():
+                return None
+
+            try:
+                root = self._runs_root.resolve()
+                run_dir.resolve().relative_to(root)
+            except Exception:
+                return None
+
+            if not _RUN_FOLDER_RE.match(run_dir.name):
+                return None
+
+            return run_dir
+        except Exception:
+            return None
+
+    def _selected_run_folders(self) -> set[Path]:
+        try:
+            sm = self._runs_tree.selectionModel()
+            if sm is None:
+                return set()
+
+            rows = []
+            try:
+                rows = sm.selectedRows(0)
+            except Exception:
+                rows = [i for i in sm.selectedIndexes() if getattr(i, "column", lambda: 0)() == 0]
+
+            out: set[Path] = set()
+            for idx in rows:
+                rd = self._run_folder_from_index(idx)
+                if rd is not None:
+                    out.add(rd)
+            return out
+        except Exception:
+            return set()
+
+    def _apply_compare_selection_to_view(self) -> None:
+        if self._compare_restoring:
+            return
+
+        sm = None
+        try:
+            sm = self._runs_tree.selectionModel()
+        except Exception:
+            sm = None
+        if sm is None:
+            return
+
+        self._compare_restoring = True
+        try:
+            try:
+                sm.clearSelection()
+            except Exception:
+                try:
+                    sm.clear()
+                except Exception:
+                    pass
+
+            for run_dir in sorted(self._compare_selected_dirs, key=lambda p: p.name):
+                idx = self._path_to_proxy_index(str(run_dir))
+                if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
+                    continue
+                try:
+                    sm.select(idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+                except Exception:
+                    pass
+        finally:
+            self._compare_restoring = False
+
+    def _update_compare_btn_state(self) -> None:
+        try:
+            if self._compare_btn is None:
+                return
+            self._compare_btn.setEnabled(len(self._compare_selected_dirs) >= 2)
+        except Exception:
+            pass
+
+    def toggle_compare_selection_for_index(self, idx) -> None:
+        """Double-click handler: toggles a run folder in the compare selection set."""
+        run_dir = self._run_folder_from_index(idx)
+        if run_dir is None:
+            return
+
+        try:
+            if run_dir in self._compare_selected_dirs:
+                self._compare_selected_dirs.remove(run_dir)
+            else:
+                self._compare_selected_dirs.add(run_dir)
+        except Exception:
+            pass
+
+        self._apply_compare_selection_to_view()
+        self._update_compare_btn_state()
+
+    def _ensure_compare_overlay(self, top) -> None:
+        try:
+            if top is None:
+                return
+            if self._compare_dim_overlay is None or self._compare_dim_overlay.parentWidget() is not top:
+                try:
+                    if self._compare_dim_overlay is not None:
+                        self._compare_dim_overlay.deleteLater()
+                except Exception:
+                    pass
+                self._compare_dim_overlay = DimOverlay(top, on_click=self._close_compare_popup)
+
+            try:
+                self._compare_dim_overlay.setGeometry(top.rect())
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _set_compare_dimmed(self, on: bool) -> None:
+        try:
+            if on:
+                top = self.parent.window() if hasattr(self.parent, "window") else self.parent
+                self._ensure_compare_overlay(top)
+                if self._compare_dim_overlay is not None:
+                    self._compare_dim_overlay.show()
+                    self._compare_dim_overlay.raise_()
+            else:
+                if self._compare_dim_overlay is not None:
+                    self._compare_dim_overlay.hide()
+        except Exception:
+            pass
+
+    def _close_compare_popup(self) -> None:
+        try:
+            if self._compare_popup is not None and self._compare_popup.isVisible():
+                self._compare_popup.close()
+        except Exception:
+            pass
+        self._set_compare_dimmed(False)
+        self._compare_popup = None
+
+    def compare_selected_results(self) -> None:
+        """Show sensors that exist in ALL compare-selected results."""
+        try:
+            if len(self._compare_selected_dirs) < 2:
+                return
+
+            run_dirs = list(sorted(self._compare_selected_dirs, key=lambda p: p.name))
+
+            sensor_sets: list[set[str]] = []
+            for rd in run_dirs:
+                csvp = rd / "run_window.csv"
+                if not csvp.exists():
+                    sensor_sets.append(set())
+                    continue
+                try:
+                    _df, cols = load_run_csv_dataframe(str(csvp))
+                    sensor_sets.append(set(cols or []))
+                except Exception:
+                    sensor_sets.append(set())
+
+            common: set[str] = set()
+            if sensor_sets:
+                common = set.intersection(*sensor_sets) if sensor_sets else set()
+
+            title = f"Compare ({len(run_dirs)} results)"
+
+            top = self.parent.window() if hasattr(self.parent, "window") else self.parent
+            self._set_compare_dimmed(True)
+
+            self._compare_popup = ComparePopup(
+                top,
+                title=title,
+                sensors=sorted(common),
+                on_close=self._close_compare_popup,
+                on_compare=self._create_compare_result_from_popup,
+            )
+
+            self._compare_popup.show()
+
+            def _after_show():
+                if self._compare_popup is None:
+                    return
+                try:
+                    self._compare_popup.adjustSize()
+                except Exception:
+                    pass
+                self._ensure_compare_overlay(top)
+                raise_center_and_focus(parent=top, dlg=self._compare_popup, dim_overlay=self._compare_dim_overlay)
+
+            QTimer.singleShot(0, _after_show)
+
+        except Exception:
+            self._close_compare_popup()
+
+    def _create_compare_result_from_popup(self, sensors: list[str]) -> None:
+        """Create a compare result folder and select it in the tree."""
+        try:
+            sensors = [str(s) for s in (sensors or []) if str(s).strip()]
+            if not sensors:
+                return
+
+            run_dirs = list(sorted(self._compare_selected_dirs, key=lambda p: p.name))
+            if len(run_dirs) < 2:
+                return
+
+            if len(run_dirs) == 2:
+                case_name = f"{run_dirs[0].name} vs {run_dirs[1].name}"
+            else:
+                case_name = f"{run_dirs[0].name} vs {run_dirs[1].name} +{len(run_dirs) - 2}"
+
+            out_case_dir = (self._runs_root / case_name)
+            out_case_dir.mkdir(parents=True, exist_ok=True)
+
+            new_run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_run_dir = out_case_dir / new_run_id
+            out_run_dir.mkdir(parents=True, exist_ok=True)
+
+            # Store run paths relative to runs root so previews are portable.
+            runs_rel: list[str] = []
+            for rd in run_dirs:
+                try:
+                    runs_rel.append(str(rd.resolve().relative_to(self._runs_root.resolve())).replace("\\", "/"))
+                except Exception:
+                    # fallback: best-effort, still normalized
+                    runs_rel.append(str(rd).replace("\\", "/"))
+
+            manifest = {
+                "type": "compare",
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "trim": "elapsed_duration_shortest",
+                "runs": runs_rel,
+                "sensors": sensors,
+            }
+
+            mpath = out_run_dir / "compare_manifest.json"
+            try:
+                mpath.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            except Exception:
+                # keep going; preview will fail gracefully
+                pass
+
+            # Close popup + undim
+            try:
+                if self._compare_popup is not None:
+                    self._compare_popup.close()
+            except Exception:
+                pass
+            self._close_compare_popup()
+
+            # Select and preview the new compare run
+            try:
+                idx = self._path_to_proxy_index(str(out_run_dir))
+                if idx is not None and (not hasattr(idx, "isValid") or idx.isValid()):
+                    sm = self._runs_tree.selectionModel()
+                    if sm is not None:
+                        self._suppress_selection_preview = True
+                        try:
+                            sm.setCurrentIndex(
+                                idx,
+                                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                            )
+                            try:
+                                self._runs_tree.scrollTo(idx)
+                            except Exception:
+                                pass
+                        finally:
+                            self._suppress_selection_preview = False
+            except Exception:
+                pass
+
+            try:
+                self._graph_preview.preview_folder(str(out_run_dir))
+            except Exception:
+                pass
+
+        except Exception:
+            self._close_compare_popup()
+
     # -------------------------------------------------------------------------
     # index -> filesystem path helpers (proxy-safe)
     # -------------------------------------------------------------------------
@@ -128,6 +445,42 @@ class BenchmarkController:
             return src_idx
         except Exception:
             return None
+
+    def _current_run_folder(self) -> Optional[Path]:
+        """Return the selected run folder (YYYYMMDD_HHMMSS) if valid, else None."""
+        try:
+            idx = self._runs_tree.currentIndex()
+            fpath = self._idx_to_path(idx)
+            if not fpath:
+                return None
+
+            p = Path(fpath)
+            run_dir = p if p.is_dir() else p.parent
+            if not run_dir.exists() or not run_dir.is_dir():
+                return None
+
+            # Ensure inside runs root and shaped like a run folder
+            try:
+                root = self._runs_root.resolve()
+                run_dir.resolve().relative_to(root)
+            except Exception:
+                return None
+
+            if not _RUN_FOLDER_RE.match(run_dir.name):
+                return None
+
+            return run_dir
+        except Exception:
+            return None
+
+    def _update_remove_btn_state(self) -> None:
+        try:
+            if self._remove_btn is None:
+                return
+            has_any = bool(self._selected_run_folders()) or (self._current_run_folder() is not None)
+            self._remove_btn.setEnabled(has_any)
+        except Exception:
+            pass
 
     # -------------------------------------------------------------------------
     # Latest-result discovery (FAST, cached)
@@ -245,20 +598,18 @@ class BenchmarkController:
     # -------------------------------------------------------------------------
     # Results Browser
     # -------------------------------------------------------------------------
-    def _on_runs_selection_changed(self, selected, deselected):
+    def _on_runs_current_changed(self, current, previous) -> None:
         try:
-            indexes = selected.indexes()
-            if not indexes:
+            if current is None or (hasattr(current, "isValid") and not current.isValid()):
                 return
-            idx = indexes[0]
-            fpath = self._idx_to_path(idx)
+
+            fpath = self._idx_to_path(current)
             if not fpath:
                 return
 
             p = Path(fpath)
             self._last_selected_path = p
 
-            # If we are programmatically selecting, don't immediately preview here.
             if self._suppress_selection_preview:
                 return
 
@@ -272,6 +623,95 @@ class BenchmarkController:
             self._graph_preview.preview_path(fpath)
         except Exception:
             pass
+
+    def _on_runs_selection_changed(self, selected, deselected):
+        try:
+            self._update_remove_btn_state()
+
+            # Keep compare-selection highlights stable even if a normal click clears selection.
+            if self._compare_selected_dirs and (not self._compare_restoring):
+                sel_dirs = self._selected_run_folders()
+                if sel_dirs != self._compare_selected_dirs:
+                    self._apply_compare_selection_to_view()
+
+            self._update_compare_btn_state()
+        except Exception:
+            pass
+
+    def remove_selected_result(self) -> None:
+        """Backward-compatible entrypoint: removes all selected results."""
+        self.remove_selected_results()
+
+    def remove_selected_results(self) -> None:
+        """Delete all selected result folders from disk (bulk)."""
+        # Prefer what the user actually selected in the tree.
+        run_dirs = list(sorted(self._selected_run_folders(), key=lambda p: p.name))
+
+        # If compare-selection is active (it owns selection), fall back to it.
+        if not run_dirs and self._compare_selected_dirs:
+            run_dirs = list(sorted(self._compare_selected_dirs, key=lambda p: p.name))
+
+        # Final fallback: current run folder.
+        if not run_dirs:
+            cur = self._current_run_folder()
+            if cur is not None:
+                run_dirs = [cur]
+
+        self._update_remove_btn_state()
+        if not run_dirs:
+            return
+
+        n = len(run_dirs)
+        preview_names = [p.name for p in run_dirs[:5]]
+        more = "" if n <= 5 else f"\n(+{n - 5} more)"
+        name_block = "\n".join(preview_names) + more
+
+        confirm = QMessageBox.question(
+            self.parent,
+            "Remove Results",
+            f"Delete {n} result folder(s)?\nThis action cannot be undone.\n\n{name_block}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        failed: list[tuple[Path, str]] = []
+        for rd in run_dirs:
+            try:
+                shutil.rmtree(rd)
+            except Exception as exc:
+                failed.append((rd, str(exc)))
+
+        # Prune compare selection and clear selection UI
+        try:
+            for rd in run_dirs:
+                self._compare_selected_dirs.discard(rd)
+        except Exception:
+            pass
+
+        self._last_selected_path = None
+
+        try:
+            sm = self._runs_tree.selectionModel()
+            if sm is not None:
+                sm.clearSelection()
+        except Exception:
+            pass
+
+        self._update_remove_btn_state()
+        self._update_compare_btn_state()
+
+        if failed:
+            msg_lines = [f"{p.name}: {err}" for p, err in failed[:5]]
+            more_err = "" if len(failed) <= 5 else f"\n(+{len(failed) - 5} more)"
+            QMessageBox.warning(
+                self.parent,
+                "Remove Partially Failed",
+                "Some folders could not be removed:\n\n" + "\n".join(msg_lines) + more_err,
+            )
+
+        QTimer.singleShot(150, self.select_latest_result)
 
     def select_latest_result(self) -> None:
         """

@@ -19,12 +19,12 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtWidgets import QComboBox
 from PySide6.QtGui import QPalette, QColor
-from .ui_widgets import CustomComboBox
+from ..widgets.ui_widgets import CustomComboBox
 from core.resources import resource_path
 
 
-from .ui_titlebar import TitleBar
-from .ui_rounding import apply_rounded_corners
+from ..widgets.ui_titlebar import TitleBar
+from ..widgets.ui_rounding import apply_rounded_corners
 
 
 class SettingsDialog(QDialog):

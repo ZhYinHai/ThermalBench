@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QApplication
-from ui.ui_widgets import CustomComboBox
+from ui.widgets.ui_widgets import CustomComboBox
 from ui.ui_settings_dialog import SettingsDialog
 
 app = QApplication([])

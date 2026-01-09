@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QDialog,
     QSizePolicy,
+    QAbstractItemView,
     QTreeView,
     QFileSystemModel,
     QSplitter,
@@ -23,11 +24,11 @@ from PySide6.QtWidgets import (
     QFrame,
 )
 
-from .ui_theme import apply_theme, style_combobox_popup
-from .ui_widgets import CustomComboBox
-from .ui_settings_dialog import SettingsDialog
-from .ui_titlebar import TitleBar
-from .ui_time_spin import make_time_spin
+from .widgets.ui_theme import apply_theme, style_combobox_popup
+from .widgets.ui_widgets import CustomComboBox
+from .dialogs import SettingsDialog
+from .widgets.ui_titlebar import TitleBar
+from .widgets.ui_time_spin import make_time_spin
 
 from .graph_preview import GraphPreview
 from .sensor_manager import SensorManager
@@ -172,6 +173,12 @@ class MainWindow(QWidget):
 
         self._runs_tree = QTreeView()
         self._runs_tree.setHeaderHidden(True)
+        try:
+            self._runs_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            self._runs_tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self._runs_tree.setExpandsOnDoubleClick(False)
+        except Exception:
+            pass
         self._runs_tree.setStyleSheet("""
             QTreeView {
                 border: none;
@@ -180,6 +187,14 @@ class MainWindow(QWidget):
                 color: #B0B0B0;
             }
         """)
+
+        self.compare_btn = QPushButton("Compare")
+        self.compare_btn.setEnabled(False)
+        self.compare_btn.setCursor(Qt.PointingHandCursor)
+
+        self.remove_result_btn = QPushButton("Remove Selected")
+        self.remove_result_btn.setEnabled(False)
+        self.remove_result_btn.setCursor(Qt.PointingHandCursor)
 
         # Use proxy model if present
         self._runs_proxy = None
@@ -216,6 +231,8 @@ class MainWindow(QWidget):
             abort_btn=self.abort_btn,
             open_btn=self.open_btn,
             live_timer=self.live_timer,
+            remove_btn=self.remove_result_btn,
+            compare_btn=self.compare_btn,
             runs_tree=self._runs_tree,
             runs_model=self._runs_tree.model(),        # proxy or source (whatever the tree uses)
             runs_source_model=self._runs_model,        # always the QFileSystemModel (source)
@@ -233,6 +250,13 @@ class MainWindow(QWidget):
         self.run_btn.clicked.connect(self.benchmark.run)
         self.abort_btn.clicked.connect(self.benchmark.abort)
         self.open_btn.clicked.connect(self.benchmark.open_run_folder)
+        self.compare_btn.clicked.connect(self.benchmark.compare_selected_results)
+        self.remove_result_btn.clicked.connect(self.benchmark.remove_selected_result)
+
+        try:
+            self._runs_tree.doubleClicked.connect(self.benchmark.toggle_compare_selection_for_index)
+        except Exception:
+            pass
 
         # ======================================================================
         # BUILD UI LAYOUT
@@ -428,11 +452,29 @@ class MainWindow(QWidget):
         # --------------------------
         results_container = QWidget()
         results_layout = QHBoxLayout(results_container)
-        results_layout.setContentsMargins(0, 0, 8, 8)
+        results_layout.setContentsMargins(0, 0, 8, 0)
         results_layout.setSpacing(8)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._runs_tree)
+        tree_panel = QWidget()
+        tree_panel.setStyleSheet("""
+            QWidget {
+                border-right: 1px solid rgba(128, 128, 128, 0.3);
+            }
+        """)
+        tree_panel_layout = QVBoxLayout(tree_panel)
+        tree_panel_layout.setContentsMargins(0, 0, 0, 0)
+        tree_panel_layout.setSpacing(0)
+        tree_panel_layout.addWidget(self._runs_tree, 1)
+
+        tree_footer = QVBoxLayout()
+        tree_footer.setContentsMargins(10, 0, 10, 5)
+        tree_footer.setSpacing(4)
+        tree_footer.addWidget(self.compare_btn)
+        tree_footer.addWidget(self.remove_result_btn)
+        tree_panel_layout.addLayout(tree_footer)
+
+        splitter.addWidget(tree_panel)
 
         preview_widget = QWidget()
         preview_layout = QVBoxLayout(preview_widget)
@@ -444,12 +486,12 @@ class MainWindow(QWidget):
         splitter.addWidget(preview_widget)
 
         try:
-            splitter.setStretchFactor(0, 1)
-            splitter.setStretchFactor(1, 5)
+            splitter.setStretchFactor(0, 0)
+            splitter.setStretchFactor(1, 1)
             splitter.setCollapsible(0, False)
             splitter.setCollapsible(1, False)
             total = self.width() or 1200
-            left = max(80, int(total * 0.15))
+            left = max(120, int(total * 0.25))
             right = max(400, total - left)
             splitter.setSizes([left, right])
         except Exception:

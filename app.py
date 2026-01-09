@@ -3,7 +3,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from core.settings_store import get_settings_path, load_json
-from ui.ui_theme import apply_theme
+from ui.widgets.ui_theme import apply_theme
 from ui.main_window import MainWindow
 
 
