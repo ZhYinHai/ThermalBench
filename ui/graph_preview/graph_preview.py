@@ -126,6 +126,20 @@ class GraphPreview(QObject):
         self._qt_tt_margin_px = 4
         self._qt_last_mouse_xy = None  # (qt_x, qt_y) used for smoother anchoring
 
+        # --- Qt tooltip movement animation (single + compare)
+        # IMPORTANT: compare mode has MULTIPLE tooltips, so animation must be per-widget.
+        self._qt_move_timer = QTimer(self.parent)
+        try:
+            self._qt_move_timer.setTimerType(Qt.PreciseTimer)
+        except Exception:
+            pass
+        self._qt_move_timer.setInterval(8)  # ~125 fps cap (cheap)
+        self._qt_move_timer.timeout.connect(self._qt_move_tick)
+
+        self._qt_move_duration = 0.09  # seconds; tune 0.07..0.12
+        # dict: QLabel -> {t0: float, sx: float, sy: float, tx: float, ty: float}
+        self._qt_move_map: dict[QLabel, dict] = {}
+
         # matplotlib
         try:
             self._preview_fig = Figure(figsize=(5, 3))
@@ -269,6 +283,123 @@ class GraphPreview(QObject):
         self._compare_last_idx = None
 
     # ---------------------------------------------------------------------
+    # Qt tooltip animation helpers (per-widget)
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def _ease_out_cubic(t: float) -> float:
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        return 1.0 - (1.0 - t) ** 3
+
+    def _qt_cancel_move(self, w: Optional[QLabel] = None) -> None:
+        try:
+            if w is None:
+                self._qt_move_map.clear()
+            else:
+                self._qt_move_map.pop(w, None)
+        except Exception:
+            pass
+        try:
+            if not self._qt_move_map and self._qt_move_timer.isActive():
+                self._qt_move_timer.stop()
+        except Exception:
+            pass
+
+    def _qt_move_to(self, w: QLabel, target_x: int, target_y: int) -> None:
+        """
+        Smoothly move QLabel `w` to (target_x, target_y).
+        If `w` is hidden (first show), snap to target to avoid flying in from (0,0).
+        """
+        try:
+            if w is None:
+                return
+
+            # If not visible yet, snap immediately (prevents top-left glitch)
+            if not w.isVisible():
+                try:
+                    w.move(int(target_x), int(target_y))
+                except Exception:
+                    pass
+                return
+
+            # Suppress tiny changes to avoid jitter
+            try:
+                cur = w.pos()
+                if abs(int(target_x) - int(cur.x())) <= 1 and abs(int(target_y) - int(cur.y())) <= 1:
+                    return
+            except Exception:
+                pass
+
+            cur = w.pos()
+            now = time.time()
+            self._qt_move_map[w] = {
+                "t0": float(now),
+                "sx": float(cur.x()),
+                "sy": float(cur.y()),
+                "tx": float(target_x),
+                "ty": float(target_y),
+            }
+            if not self._qt_move_timer.isActive():
+                self._qt_move_timer.start()
+        except Exception:
+            pass
+
+    def _qt_move_tick(self) -> None:
+        try:
+            if not self._qt_move_map:
+                if self._qt_move_timer.isActive():
+                    self._qt_move_timer.stop()
+                return
+
+            now = time.time()
+            dur = float(getattr(self, "_qt_move_duration", 0.09) or 0.09)
+            if dur <= 0:
+                dur = 0.001
+
+            done = []
+            for w, st in list(self._qt_move_map.items()):
+                try:
+                    if w is None or (hasattr(w, "isVisible") and not w.isVisible()):
+                        done.append(w)
+                        continue
+
+                    t0 = float(st.get("t0", now))
+                    t = (now - t0) / dur
+                    if t >= 1.0:
+                        w.move(int(round(st["tx"])), int(round(st["ty"])))
+                        done.append(w)
+                        continue
+
+                    e = self._ease_out_cubic(float(t))
+                    sx = float(st["sx"])
+                    sy = float(st["sy"])
+                    tx = float(st["tx"])
+                    ty = float(st["ty"])
+                    cx = sx + (tx - sx) * e
+                    cy = sy + (ty - sy) * e
+                    w.move(int(round(cx)), int(round(cy)))
+                except Exception:
+                    done.append(w)
+
+            for w in done:
+                try:
+                    self._qt_move_map.pop(w, None)
+                except Exception:
+                    pass
+
+            if not self._qt_move_map and self._qt_move_timer.isActive():
+                self._qt_move_timer.stop()
+        except Exception:
+            try:
+                self._qt_move_map.clear()
+            except Exception:
+                pass
+            try:
+                if self._qt_move_timer.isActive():
+                    self._qt_move_timer.stop()
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------------
     # Qt overlay tooltip helpers (single + compare)
     # ---------------------------------------------------------------------
     def _ensure_qt_tooltip(self) -> Optional[QLabel]:
@@ -295,8 +426,8 @@ class GraphPreview(QObject):
             # Match the existing tooltip style closely (semi-transparent dark background + subtle border)
             tt.setStyleSheet(
                 "QLabel#PreviewTooltipOverlay {"
-                " background-color: rgba(0,0,0,71);"
-                " border: 1px solid rgba(255,255,255,15);"
+                " background-color: rgba(24,24,24,160);"
+                " border: 1px solid rgba(255,255,255,18);"
                 " border-radius: 8px;"
                 " padding: 8px 10px;"
                 " color: #FFFFFF;"
@@ -311,6 +442,7 @@ class GraphPreview(QObject):
     def _hide_qt_tooltip(self) -> None:
         try:
             if self._qt_tt is not None:
+                self._qt_cancel_move(self._qt_tt)
                 self._qt_tt.hide()
         except Exception:
             pass
@@ -358,25 +490,20 @@ class GraphPreview(QObject):
             for n, v, col in zip(n2, v2, c2):
                 ne = self._html_escape(n)
                 ve = self._html_escape(v)
-                # pre spacing
                 pad_name = ne + (" " * max(0, name_w - len(n)))
                 pad_val = (" " * max(0, val_w - len(v))) + ve
-                # keep two columns; color both sides
+                row_style = "font-weight:600;"
+                row_style += "text-shadow: 0 0 0.5px rgba(0,0,0,0.35);"
+
                 lines.append(
-                    f"<span style='color:{col}'>{pad_name}</span>"
+                    f"<span style='color:{col};{row_style}'>{pad_name}</span>"
                     f"  "
-                    f"<span style='color:{col}'>{pad_val}</span>"
+                    f"<span style='color:{col};{row_style}'>{pad_val}</span>"
                 )
 
             body = "\n".join(lines)
-            # white-space:pre keeps alignment
-            return (
-                "<div style=\"white-space:pre;\">"
-                f"{body}"
-                "</div>"
-            )
+            return "<div style=\"white-space:pre;\">" + body + "</div>"
         except Exception:
-            # fallback minimal
             return f"<div style='white-space:pre;'><b>{self._html_escape(header)}</b></div>"
 
     @staticmethod
@@ -393,21 +520,25 @@ class GraphPreview(QObject):
         right = float(x_sorted[i])
         return (i - 1) if abs(x - left) <= abs(x - right) else i
 
-    def _qt_place_tooltip_in_ax(self, tt: QLabel, ax, *, xdata: float, ydata: float, prefer_mode: str = "UR") -> None:
+    def _qt_compute_tooltip_pos_in_ax(self, tt: QLabel, ax, *, xdata: float, ydata: float, prefer_mode: str = "UR"):
         """
-        Place + clamp the Qt tooltip inside the axis bbox, mimicking the Matplotlib corner-flip behavior.
+        Compute (x0, y0, mode) for the tooltip top-left in Qt coords (origin top-left),
+        clamped to the axis bbox. DOES NOT move the widget.
         """
         try:
             if self._preview_canvas is None or ax is None or tt is None:
-                return
+                return None
 
-            # Need tooltip size
-            tt.adjustSize()
+            # Ensure we have correct widget size
+            try:
+                tt.adjustSize()
+            except Exception:
+                pass
             w = int(tt.width())
             h = int(tt.height())
 
-            # Axis bbox in display coords (origin bottom-left), convert to Qt coords (origin top-left)
-            bb = ax.bbox  # display pixels
+            # Axis bbox in display coords (origin bottom-left). Convert to Qt coords.
+            bb = ax.bbox
             canvas_h = int(self._preview_canvas.height())
             ax_left = float(bb.x0)
             ax_right = float(bb.x1)
@@ -420,14 +551,13 @@ class GraphPreview(QObject):
             try:
                 cx, cy = ax.transData.transform((float(xdata), float(ydata)))
             except Exception:
-                # fallback to mouse position if available
+                # fallback to last mouse position if available
                 if self._qt_last_mouse_xy is not None:
                     cx = float(self._qt_last_mouse_xy[0])
                     cy = float(canvas_h - self._qt_last_mouse_xy[1])
                 else:
                     cx = 0.5 * (ax_left + ax_right)
-                    cy = 0.5 * (canvas_h - (ax_top + ax_bottom))  # unused
-
+                    cy = 0.5 * (bb.y0 + bb.y1)  # display
             qt_anchor_x = float(cx)
             qt_anchor_y = float(canvas_h - cy)
 
@@ -456,26 +586,24 @@ class GraphPreview(QObject):
                 else:
                     xy = dl
                     align = (1, 1)
-
                 ox = pt_to_px(xy[0])
                 oy = -pt_to_px(xy[1])  # display up -> Qt negative
                 return float(ox), float(oy), align
 
-            # Candidate modes (same as matplotlib logic)
+            # Candidate modes (try prefer_mode first)
             candidates = ["UR", "DR", "UL", "DL"]
-            # start with prefer_mode
             if prefer_mode in candidates:
                 candidates = [prefer_mode] + [m for m in candidates if m != prefer_mode]
 
-            best = None
-            best_score = None
+            best_mode = None
             best_pos = None
+            best_score = None
 
             for m in candidates:
                 ox, oy, align = mode_to_offsets(m)
 
                 # map "box_alignment" into Qt top-left
-                if align == (0, 0):          # lower-left anchored
+                if align == (0, 0):          # lower-left anchored (matplotlib)
                     x0 = qt_anchor_x + ox
                     y0 = qt_anchor_y + oy - h
                 elif align == (0, 1):        # upper-left anchored
@@ -488,7 +616,6 @@ class GraphPreview(QObject):
                     x0 = qt_anchor_x + ox - w
                     y0 = qt_anchor_y + oy
 
-                # overflow score vs axis bbox (with margin)
                 left_over = max(0.0, (ax_left + margin) - x0)
                 right_over = max(0.0, (x0 + w) - (ax_right - margin))
                 top_over = max(0.0, (ax_top + margin) - y0)
@@ -497,11 +624,11 @@ class GraphPreview(QObject):
 
                 if best_score is None or score < best_score:
                     best_score = score
-                    best = m
+                    best_mode = m
                     best_pos = (x0, y0)
 
-            if best_pos is None:
-                return
+            if best_pos is None or best_mode is None:
+                return None
 
             x0, y0 = best_pos
 
@@ -521,10 +648,11 @@ class GraphPreview(QObject):
             else:
                 y0 = max(min_y, min(max_y, y0))
 
-            tt.move(int(round(x0)), int(round(y0)))
-            self._qt_tt_mode = str(best)
+            ix = int(round(x0))
+            iy = int(round(y0))
+            return (ix, iy, str(best_mode))
         except Exception:
-            pass
+            return None
 
     # ---------------------------------------------------------------------
     # Compare-mode helpers
@@ -536,6 +664,7 @@ class GraphPreview(QObject):
                 try:
                     w = st.get("qt_tt")
                     if w is not None:
+                        self._qt_cancel_move(w)
                         w.hide()
                         w.setParent(None)
                 except Exception:
@@ -586,6 +715,7 @@ class GraphPreview(QObject):
                 try:
                     w = st.get("qt_tt")
                     if w is not None:
+                        self._qt_cancel_move(w)
                         w.hide()
                 except Exception:
                     pass
@@ -836,7 +966,6 @@ class GraphPreview(QObject):
             self._hide_qt_tooltip()
         except Exception:
             pass
-
         _gp_hide_preview_hover(self, hard=hard)
 
     def _format_value(self, col_name: str, val: float) -> str:
@@ -861,7 +990,6 @@ class GraphPreview(QObject):
                 self._preview_colors_cached = []
             else:
                 try:
-                    # fast numeric matrix; NaN for missing
                     self._preview_df_np = self._preview_df.to_numpy(dtype=float, copy=False)
                 except Exception:
                     self._preview_df_np = np.asarray(self._preview_df.to_numpy(), dtype=float)
@@ -871,15 +999,16 @@ class GraphPreview(QObject):
                 except Exception:
                     self._preview_cols_cached = []
                 try:
-                    self._preview_colors_cached = [str(self._preview_color_map.get(str(c), "#FFFFFF")) for c in self._preview_cols_cached]
+                    self._preview_colors_cached = [
+                        str(self._preview_color_map.get(str(c), "#FFFFFF")) for c in self._preview_cols_cached
+                    ]
                 except Exception:
                     self._preview_colors_cached = ["#FFFFFF"] * len(self._preview_cols_cached)
 
-            # precompute elapsed time strings (single mode uses elapsed formatter)
+            # precompute elapsed time strings
             self._preview_time_strs = None
             try:
                 if self._preview_x_np is not None and len(self._preview_x_np) > 0:
-                    # matplotlib dates are days
                     dsec = (self._preview_x_np - float(self._preview_x_np[0])) * 86400.0
                     dsec = np.maximum(dsec, 0.0)
                     out = []
@@ -902,10 +1031,11 @@ class GraphPreview(QObject):
 
     def _on_preview_hover_xy(self, xdata: float, ydata: float) -> None:
         """
-        Same behavior, much higher responsiveness:
+        Same behavior, high responsiveness:
         - Matplotlib draws ONLY the vline (blitting)
-        - Tooltip is a Qt overlay QLabel (no Matplotlib text rendering cost)
-        - All per-sensor values are read from a cached numpy matrix
+        - Tooltip is a Qt overlay QLabel
+        - Content updates only when idx changes
+        - NEW: tooltip position animates smoothly between targets
         """
         try:
             if not getattr(self, "_app_is_active", True):
@@ -946,7 +1076,6 @@ class GraphPreview(QObject):
 
             # Need caches
             if self._preview_x_np is None or self._preview_df_np is None:
-                # best-effort rebuild
                 try:
                     self._rebuild_hover_cache()
                 except Exception:
@@ -963,7 +1092,7 @@ class GraphPreview(QObject):
                 return
             idx = max(0, min(int(idx), int(len(self._preview_x_np) - 1)))
 
-            # Update vline every time (feels responsive)
+            # Update vline every time
             try:
                 vl = getattr(self, "_preview_vline", None)
                 if vl is not None:
@@ -972,7 +1101,7 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
-            # Ensure bg exists (keep original)
+            # Ensure bg exists
             try:
                 if getattr(self, "_preview_bg", None) is None and self._preview_canvas is not None:
                     self._preview_canvas.draw()
@@ -983,20 +1112,18 @@ class GraphPreview(QObject):
             # Tooltip overlay
             tt = self._ensure_qt_tooltip()
             if tt is None:
-                # fallback: no tooltip overlay, still show vline
                 self._preview_blit()
                 return
 
-            # Content updates only when idx changes (key for smoothness)
+            # Content updates only when idx changes
             if self._preview_last_tt_idx != idx:
                 self._preview_last_tt_idx = idx
 
-                # header time string (elapsed, like original single-mode tooltip)
+                # header time string
                 try:
                     if self._preview_time_strs is not None and 0 <= idx < len(self._preview_time_strs):
                         tstr = self._preview_time_strs[idx]
                     else:
-                        # fallback (should be rare)
                         dt_current = mdates.num2date(self._preview_x_np[idx])
                         dt_start = mdates.num2date(self._preview_x_np[0])
                         elapsed = dt_current - dt_start
@@ -1008,7 +1135,7 @@ class GraphPreview(QObject):
                 except Exception:
                     tstr = f"{idx}"
 
-                # row values from numpy (fast)
+                # row values from numpy
                 try:
                     vals = np.asarray(self._preview_df_np[idx, :], dtype=float)
                 except Exception:
@@ -1018,7 +1145,6 @@ class GraphPreview(QObject):
                 colors = list(self._preview_colors_cached or [])
 
                 if vals is None or len(cols) != int(getattr(vals, "size", 0)):
-                    # defensive fallback
                     try:
                         vals = np.asarray(self._preview_df.iloc[idx].to_numpy(dtype=float, na_value=np.nan), dtype=float)
                     except Exception:
@@ -1026,13 +1152,12 @@ class GraphPreview(QObject):
 
                 ncols = int(len(cols))
                 if ncols != int(vals.size):
-                    # align defensively
                     try:
                         vals = np.resize(vals, ncols).astype(float, copy=False)
                     except Exception:
                         pass
 
-                # sort descending, NaNs last (same behavior)
+                # sort descending, NaNs last
                 try:
                     work = np.where(np.isfinite(vals), vals, -1e30)
                     order = np.argsort(work)[::-1]
@@ -1066,24 +1191,30 @@ class GraphPreview(QObject):
                 except Exception:
                     pass
 
-            # Show + position tooltip every time (cheap)
+            # Show (important: show BEFORE animating; first-show snaps in _qt_move_to)
             try:
                 tt.show()
             except Exception:
                 pass
 
-            # Anchor y follows cursor y (like original); if ydata missing, use mid
+            # Anchor y follows cursor y; if ydata missing, use mid
             try:
                 if ydata is None:
                     y0, y1 = self._preview_ax.get_ylim()
-                    ty = 0.5 * (float(y0) + float(y1))
+                    yref = 0.5 * (float(y0) + float(y1))
                 else:
-                    ty = float(ydata)
+                    yref = float(ydata)
             except Exception:
-                ty = 0.0
+                yref = 0.0
 
-            # Place tooltip within the axes bbox
-            self._qt_place_tooltip_in_ax(tt, self._preview_ax, xdata=float(xdata), ydata=float(ty), prefer_mode=self._qt_tt_mode)
+            # Compute target position (clamped) + animate to it
+            pos = self._qt_compute_tooltip_pos_in_ax(
+                tt, self._preview_ax, xdata=float(xdata), ydata=float(yref), prefer_mode=self._qt_tt_mode
+            )
+            if pos is not None:
+                tx, ty, mode = pos
+                self._qt_tt_mode = str(mode)
+                self._qt_move_to(tt, int(tx), int(ty))
 
             # Blit vline (fast)
             self._preview_blit()
@@ -1375,7 +1506,7 @@ class GraphPreview(QObject):
             self._preview_autoscale_y_to_active()
             self._preview_relayout_and_redraw()
 
-            # rebuild numpy hover caches so responsiveness stays constant with many sensors
+            # rebuild numpy hover caches
             self._rebuild_hover_cache()
         except Exception:
             try:
@@ -1417,6 +1548,13 @@ class GraphPreview(QObject):
     # Plotting
     # ---------------------------------------------------------------------
     def _plot_compare_manifest(self, manifest_path: Path) -> None:
+        """
+        Compare mode: one subplot per sensor; each subplot overlays the same set of runs.
+        - Stable per-run colors across ALL subplots (run -> color)
+        - Qt overlay tooltip per subplot (animated)
+        - Hovered subplot follows cursor y; other subplots follow highest line at idx
+        - Tooltip header shows elapsed time like single mode (m:ss or h:mm:ss)
+        """
         if self._preview_canvas is None or self._preview_fig is None:
             raise RuntimeError("Preview canvas unavailable")
 
@@ -1424,6 +1562,9 @@ class GraphPreview(QObject):
         self._exit_compare_mode()
         self._hide_qt_tooltip()
 
+        # -----------------------------
+        # Load manifest
+        # -----------------------------
         try:
             m = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
@@ -1456,7 +1597,9 @@ class GraphPreview(QObject):
             except Exception:
                 run_labels.append(str(rel))
 
-        # Load and keep only requested sensors
+        # -----------------------------
+        # Load run CSVs (keep only requested sensors)
+        # -----------------------------
         run_dfs: list[pd.DataFrame] = []
         for rd in run_dirs:
             csvp = rd / "run_window.csv"
@@ -1468,7 +1611,8 @@ class GraphPreview(QObject):
                 available = set(cols or [])
                 keep = [s for s in sensors if s in available]
                 df_keep = df_all[keep].copy() if keep else pd.DataFrame(index=df_all.index)
-                # ensure all requested sensors exist (missing -> NaN)
+
+                # Ensure all sensors exist as columns (fill missing with NaN)
                 for s in sensors:
                     if s not in df_keep.columns:
                         df_keep[s] = np.nan
@@ -1477,7 +1621,6 @@ class GraphPreview(QObject):
             except Exception:
                 run_dfs.append(pd.DataFrame())
 
-        # Trim to shortest elapsed duration across runs
         run_dfs = trim_dataframes_to_shortest_duration(run_dfs)
         non_empty = [df for df in run_dfs if df is not None and not df.empty]
         if not non_empty:
@@ -1498,11 +1641,12 @@ class GraphPreview(QObject):
         except Exception:
             min_dur_sec = float(min_len - 1)
 
+        # Common time base for interpolation (elapsed seconds -> Timestamp index)
         common_elapsed = np.linspace(0.0, max(0.0, min_dur_sec), num=min_len)
-        base = pd.Timestamp("2000-01-01")
-        common_index = base + pd.to_timedelta(common_elapsed, unit="s")
+        base_ts = pd.Timestamp("2000-01-01")
+        common_index = base_ts + pd.to_timedelta(common_elapsed, unit="s")
 
-        # Precompute each run's elapsed seconds axis
+        # Per-run elapsed axes (seconds from each run's own start)
         run_elapsed_axes: list[np.ndarray] = []
         for df in run_dfs:
             if df is None or df.empty:
@@ -1514,7 +1658,9 @@ class GraphPreview(QObject):
             except Exception:
                 run_elapsed_axes.append(np.arange(len(df), dtype=float))
 
+        # -----------------------------
         # Build subplots: one per sensor
+        # -----------------------------
         self._preview_fig.clear()
         n = len(sensors)
         axes = self._preview_fig.subplots(nrows=n, ncols=1, sharex=True)
@@ -1528,11 +1674,12 @@ class GraphPreview(QObject):
         self._compare_axis_state = {}
         self._compare_last_idx = None
 
-        # Global compare palette: ensure colors don't repeat per subplot.
-        n_runs = len(run_labels)
+        # -----------------------------
+        # Stable per-run palette (run -> color)
+        # -----------------------------
         try:
             cmaps = [cm.get_cmap("tab20"), cm.get_cmap("tab20b"), cm.get_cmap("tab20c")]
-            palette = []
+            palette: list[str] = []
             for cmap in cmaps:
                 for k in range(int(getattr(cmap, "N", 20) or 20)):
                     try:
@@ -1544,7 +1691,13 @@ class GraphPreview(QObject):
         except Exception:
             palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
 
-        # Create per-axis Qt tooltip widgets (compare mode shows one tooltip per subplot)
+        run_color_map: dict[str, str] = {}
+        for j, lbl in enumerate(run_labels):
+            run_color_map[str(lbl)] = palette[j % len(palette)]
+
+        # -----------------------------
+        # Per-axis Qt tooltip widgets (compare mode shows one per subplot)
+        # -----------------------------
         def _make_compare_tt() -> Optional[QLabel]:
             try:
                 if self._preview_canvas is None:
@@ -1553,6 +1706,7 @@ class GraphPreview(QObject):
                 w.setAttribute(Qt.WA_TransparentForMouseEvents, True)
                 w.setTextFormat(Qt.RichText)
                 w.setWordWrap(False)
+
                 f = QFont("DejaVu Sans Mono")
                 try:
                     f.setStyleHint(QFont.Monospace)
@@ -1560,10 +1714,12 @@ class GraphPreview(QObject):
                     pass
                 f.setPointSize(10)
                 w.setFont(f)
+
+                # Match single-mode style
                 w.setStyleSheet(
                     "QLabel {"
-                    " background-color: rgba(0,0,0,71);"
-                    " border: 1px solid rgba(255,255,255,15);"
+                    " background-color: rgba(24,24,24,160);"
+                    " border: 1px solid rgba(255,255,255,18);"
                     " border-radius: 8px;"
                     " padding: 8px 10px;"
                     " color: #FFFFFF;"
@@ -1574,6 +1730,9 @@ class GraphPreview(QObject):
             except Exception:
                 return None
 
+        # -----------------------------
+        # Build each sensor subplot
+        # -----------------------------
         for i, sensor in enumerate(sensors):
             ax = axes[i]
 
@@ -1590,7 +1749,7 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
-            # build df for this sensor: columns are run labels
+            # Build per-sensor dataframe: columns are runs (labels), index is common_index
             df_sensor = pd.DataFrame(index=common_index)
             for lbl, df_run, x_run in zip(run_labels, run_dfs, run_elapsed_axes):
                 if df_run is None or df_run.empty or sensor not in df_run.columns or x_run.size < 2:
@@ -1606,17 +1765,15 @@ class GraphPreview(QObject):
                     y_i = np.interp(common_elapsed, x_run[mask], y[mask], left=np.nan, right=np.nan)
                 except Exception:
                     y_i = np.full(shape=(min_len,), fill_value=np.nan, dtype=float)
+
                 df_sensor[str(lbl)] = y_i
 
             is_dt, x_vals = compute_x_vals(df_sensor)
 
-            # Unique colors across ALL subplots (sensor_index * n_runs + run_index)
+            # Per-subplot color map: SAME for each sensor (run -> color)
             color_map: dict[str, str] = {}
-            for j, lbl in enumerate(list(df_sensor.columns)):
-                try:
-                    color_map[str(lbl)] = palette[(i * max(1, n_runs) + j) % len(palette)]
-                except Exception:
-                    color_map[str(lbl)] = "#FFFFFF"
+            for lbl in list(df_sensor.columns):
+                color_map[str(lbl)] = run_color_map.get(str(lbl), "#FFFFFF")
 
             lines, series_data, _colors = plot_lines_with_glow(
                 ax,
@@ -1650,7 +1807,7 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
-            # sensor label (small, top-left)
+            # sensor label
             try:
                 ax.text(
                     0.01,
@@ -1667,7 +1824,6 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
-            # only bottom axis gets elapsed formatter
             if i == (n - 1):
                 apply_elapsed_time_formatter(ax, is_dt=is_dt, x_vals=x_vals)
 
@@ -1689,6 +1845,7 @@ class GraphPreview(QObject):
 
             self._compare_axis_state[ax] = {
                 "x": np.asarray(x_vals, dtype=float),
+                "is_dt": bool(is_dt),
                 "df": df_sensor,
                 "df_np": df_np,
                 "cols": cols,
@@ -1698,6 +1855,9 @@ class GraphPreview(QObject):
                 "qt_tt": _make_compare_tt(),
             }
 
+        # -----------------------------
+        # Show canvas
+        # -----------------------------
         try:
             self._preview_label.clear()
             self._preview_label.hide()
@@ -1709,7 +1869,6 @@ class GraphPreview(QObject):
         except Exception:
             pass
 
-        # Prepare backgrounds for blitting
         self._refresh_compare_backgrounds()
 
         try:
@@ -1717,12 +1876,14 @@ class GraphPreview(QObject):
         except Exception:
             pass
 
+        # -----------------------------
+        # Hover handler (compare mode)
+        # -----------------------------
         def _compare_mouse_move(ev):
             try:
                 if self._preview_canvas is None or not self._compare_mode:
                     return
 
-                # refresh cached backgrounds on resize
                 wh = (int(self._preview_canvas.width()), int(self._preview_canvas.height()))
                 try:
                     self._preview_last_canvas_wh = wh
@@ -1740,7 +1901,7 @@ class GraphPreview(QObject):
                 display_x = x
                 display_y = h - y
 
-                # find which axis is under cursor
+                # Find which axis is under cursor
                 hit_ax = None
                 for ax in self._compare_axes:
                     try:
@@ -1758,14 +1919,15 @@ class GraphPreview(QObject):
                 if not st_hit:
                     return
 
-                # cursor -> data coords on the hovered axis
+                # Cursor -> data coords on hovered axis
                 try:
                     data_xy = hit_ax.transData.inverted().transform((display_x, display_y))
-                    xdata, ydata = float(data_xy[0]), float(data_xy[1])
+                    xdata = float(data_xy[0])
+                    ydata2 = float(data_xy[1])
                 except Exception:
                     return
 
-                # outside x-limits? hide everything
+                # Outside x-limits? hide
                 try:
                     x0, x1 = hit_ax.get_xlim()
                     if xdata < min(x0, x1) or xdata > max(x0, x1):
@@ -1774,7 +1936,7 @@ class GraphPreview(QObject):
                 except Exception:
                     pass
 
-                # sync vertical vline across ALL subplots at the same x
+                # Sync vlines across ALL subplots
                 try:
                     for ax2 in self._compare_axes:
                         st2 = self._compare_axis_state.get(ax2)
@@ -1790,7 +1952,7 @@ class GraphPreview(QObject):
                 except Exception:
                     pass
 
-                # nearest index in x (sorted)
+                # Nearest index in x (sorted)
                 try:
                     xa = st_hit.get("x")
                     if xa is None or len(xa) < 2:
@@ -1800,18 +1962,31 @@ class GraphPreview(QObject):
                     return
                 idx = int(max(0, min(int(idx), int(len(st_hit["x"]) - 1))))
 
-                # Only rebuild tooltip text when idx changes (huge performance win)
                 idx_changed = (self._compare_last_idx != idx)
                 self._compare_last_idx = idx
 
-                # timestamp header in compare mode is the full datetime index (like your screenshot)
+                # Elapsed header like single mode (m:ss or h:mm:ss)
                 try:
-                    df_idx = st_hit.get("df").index
-                    tstr = str(df_idx[int(idx)])
+                    xa_ref = np.asarray(st_hit.get("x"), dtype=float)
+                    if xa_ref.size >= 1:
+                        is_dt_ref = bool(st_hit.get("is_dt", True))
+                        base_v = float(xa_ref[0])
+                        cur_v = float(xa_ref[int(idx)])
+                        d = (cur_v - base_v) * 86400.0 if is_dt_ref else (cur_v - base_v)
+                        if not np.isfinite(d):
+                            d = 0.0
+                        d = max(0.0, float(d))
+                        total_seconds = int(d)
+                        hours = total_seconds // 3600
+                        minutes = (total_seconds % 3600) // 60
+                        seconds = total_seconds % 60
+                        tstr = f"{hours}:{minutes:02d}:{seconds:02d}" if hours > 0 else f"{minutes}:{seconds:02d}"
+                    else:
+                        tstr = ""
                 except Exception:
                     tstr = ""
 
-                # Update + place tooltips for each axis (Qt overlay; cheap)
+                # Update + animate tooltips for each axis
                 for ax2 in self._compare_axes:
                     st2 = self._compare_axis_state.get(ax2)
                     if not st2:
@@ -1820,22 +1995,37 @@ class GraphPreview(QObject):
                     if tt is None:
                         continue
 
-                    # Compute yref per your original behavior
+                    # yref behavior:
+                    # - hovered axis follows cursor y
+                    # - other axes follow the highest line at idx (nanmax across runs)
                     try:
                         y0, y1 = ax2.get_ylim()
                         lo, hi = (float(y0), float(y1)) if y0 <= y1 else (float(y1), float(y0))
                     except Exception:
                         lo, hi = (0.0, 1.0)
 
-                    try:
-                        if ax2 is hit_ax:
-                            yref = float(ydata)
+                    if ax2 is hit_ax:
+                        try:
+                            yref = float(ydata2)
+                        except Exception:
+                            yref = lo
+                    else:
+                        try:
+                            df_np2 = st2.get("df_np", None)
+                            if df_np2 is not None:
+                                row_vals = np.asarray(df_np2[int(idx), :], dtype=float)
+                                ymax = float(np.nanmax(row_vals))
+                            else:
+                                ymax = float("nan")
+                        except Exception:
+                            ymax = float("nan")
+
+                        if ymax == ymax:  # not NaN
+                            yref = ymax
                         else:
                             yref = lo + 0.65 * (hi - lo)
-                    except Exception:
-                        yref = lo
 
-                    # clamp inside axis
+                    # Clamp inside axis a bit (avoid touching borders)
                     try:
                         if hi > lo:
                             pad = 0.03 * (hi - lo)
@@ -1844,35 +2034,33 @@ class GraphPreview(QObject):
                         pass
 
                     if idx_changed:
-                        # build text for this axis at idx
-                        cols = st2.get("cols") or []
-                        colors = st2.get("colors") or []
+                        cols2 = st2.get("cols") or []
+                        colors2 = st2.get("colors") or []
                         try:
-                            vals = np.asarray(st2.get("df_np")[idx, :], dtype=float)
+                            vals2 = np.asarray(st2.get("df_np")[idx, :], dtype=float)
                         except Exception:
-                            vals = np.full((len(cols),), np.nan, dtype=float)
+                            vals2 = np.full((len(cols2),), np.nan, dtype=float)
 
-                        # sort desc; NaNs last
                         try:
-                            work = np.where(np.isfinite(vals), vals, -1e30)
-                            order = np.argsort(work)[::-1]
+                            work2 = np.where(np.isfinite(vals2), vals2, -1e30)
+                            order2 = np.argsort(work2)[::-1]
                         except Exception:
-                            order = np.arange(len(cols), dtype=int)
+                            order2 = np.arange(len(cols2), dtype=int)
 
                         names_sorted = []
                         values_sorted = []
                         colors_sorted = []
-                        for i2 in order:
+                        for i2 in order2:
                             try:
-                                name = cols[int(i2)]
+                                name = cols2[int(i2)]
                             except Exception:
                                 name = ""
                             try:
-                                v = float(vals[int(i2)])
+                                v = float(vals2[int(i2)])
                             except Exception:
                                 v = float("nan")
                             try:
-                                col = colors[int(i2)]
+                                col = colors2[int(i2)]
                             except Exception:
                                 col = "#FFFFFF"
                             names_sorted.append(name)
@@ -1890,10 +2078,15 @@ class GraphPreview(QObject):
                     except Exception:
                         pass
 
-                    # place & clamp inside that axis
-                    self._qt_place_tooltip_in_ax(tt, ax2, xdata=float(xdata), ydata=float(yref), prefer_mode=self._qt_tt_mode)
+                    pos2 = self._qt_compute_tooltip_pos_in_ax(
+                        tt, ax2, xdata=float(xdata), ydata=float(yref), prefer_mode=self._qt_tt_mode
+                    )
+                    if pos2 is not None:
+                        tx2, ty2, mode2 = pos2
+                        self._qt_tt_mode = str(mode2)
+                        self._qt_move_to(tt, int(tx2), int(ty2))
 
-                # Blit vlines only (tooltips are Qt)
+                # Blit vlines only (tooltips are Qt overlays)
                 self._compare_blit_vlines_only()
 
             except Exception:
@@ -1904,7 +2097,7 @@ class GraphPreview(QObject):
         except Exception:
             pass
 
-        # disable legend&stats button in compare mode
+        # Disable legend&stats button in compare mode
         self._ls_btn_text = None
         self._ls_btn_bbox = None
 
@@ -1913,11 +2106,11 @@ class GraphPreview(QObject):
         except Exception:
             pass
 
-        # Defer a compare-aware relayout until the widget has its real size.
         try:
             QTimer.singleShot(0, self._compare_relayout_and_redraw)
         except Exception:
             pass
+
 
     def _plot_run_csv(self, fpath: str) -> None:
         if self._preview_canvas is None or self._preview_ax is None:
@@ -1971,7 +2164,7 @@ class GraphPreview(QObject):
             color_map=self._preview_color_map,
         )
 
-        # Hide lines that aren't active (based on saved selection)
+        # Hide lines that aren't active
         aset = set(self._preview_active_cols)
         for name, ln in list(self._preview_lines.items()):
             try:
@@ -1981,13 +2174,11 @@ class GraphPreview(QObject):
 
         self._preview_x = x_vals
 
-        # Step 1: make sure hover has a dataframe immediately (before any toggles)
         try:
             self._preview_df = self._preview_df_all[self._preview_active_cols]
         except Exception:
             self._preview_df = self._preview_df_all
 
-        # Keep original tooltip builder (safe), but hover uses Qt overlay
         self._preview_build_tooltip_for_cols(self._preview_active_cols)
         self._preview_autoscale_y_to_active()
 
@@ -2033,14 +2224,11 @@ class GraphPreview(QObject):
 
         try:
             self._preview_canvas.show()
-
-            # force initial draw so blit bg exists
             try:
                 self._preview_canvas.draw()
                 self._on_preview_draw()
             except Exception:
                 pass
-
         except Exception:
             pass
 
