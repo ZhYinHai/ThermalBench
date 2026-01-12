@@ -39,6 +39,7 @@ class LegendStatsPopup(QDialog):
         color_for: Callable[[str], str],
         on_toggle: Callable[[str, bool, Optional[list[str]]], None],
         stats_map: dict[str, tuple[float, float, float]] | None = None,
+        room_temperature: Optional[float] = None,
         on_close: Optional[Callable[[], None]] = None,
     ):
         super().__init__(parent)
@@ -54,6 +55,7 @@ class LegendStatsPopup(QDialog):
         self._color_for = color_for
         self._on_toggle = on_toggle
         self._stats_map = stats_map or {}
+        self._room_temperature = room_temperature
         self._building = False
 
         root = QVBoxLayout(self)
@@ -94,8 +96,13 @@ class LegendStatsPopup(QDialog):
 
         # Table
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(4)
-        self.tree.setHeaderLabels(["Measurement", "Min", "Max", "Avg"])
+        # Add Room and Delta columns if room temperature is provided
+        if self._room_temperature is not None:
+            self.tree.setColumnCount(6)
+            self.tree.setHeaderLabels(["Measurement", "Min", "Max", "Avg", "Room", "Delta"])
+        else:
+            self.tree.setColumnCount(4)
+            self.tree.setHeaderLabels(["Measurement", "Min", "Max", "Avg"])
         self.tree.setRootIsDecorated(False)
         self.tree.setUniformRowHeights(True)
         self.tree.setSortingEnabled(False)
@@ -113,13 +120,14 @@ class LegendStatsPopup(QDialog):
         hdr.setContentsMargins(0, 0, 0, 0)
         hdr.setStyleSheet("padding:0px; margin:0px; border:none;")
         hdr.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        hdr.setStretchLastSection(True)
+        hdr.setStretchLastSection(False)
 
         # Give "Measurement" a fixed wider width so there's more gap before stats
         hdr.setSectionResizeMode(0, QHeaderView.Fixed)
         self.tree.setColumnWidth(0, 420)
 
-        for c in (1, 2, 3):
+        num_stat_cols = 5 if self._room_temperature is not None else 3
+        for c in range(1, num_stat_cols + 1):
             hdr.setSectionResizeMode(c, QHeaderView.ResizeToContents)
 
         self.tree.itemChanged.connect(self._item_changed)
@@ -305,7 +313,19 @@ class LegendStatsPopup(QDialog):
                 it.setText(2, self._fmt_stat(mx))
                 it.setText(3, self._fmt_stat(av))
 
-                for col in (1, 2, 3):
+                # Add Room and Delta columns if room temperature is provided
+                if self._room_temperature is not None:
+                    # Room temperature value
+                    it.setText(4, self._fmt_stat(self._room_temperature))
+                    # Delta (avg - room temperature)
+                    try:
+                        delta = av - self._room_temperature
+                        it.setText(5, self._fmt_stat(delta))
+                    except Exception:
+                        it.setText(5, "")
+
+                num_stat_cols = 5 if self._room_temperature is not None else 3
+                for col in range(1, num_stat_cols + 1):
                     it.setTextAlignment(col, Qt.AlignRight | Qt.AlignVCenter)
 
         finally:

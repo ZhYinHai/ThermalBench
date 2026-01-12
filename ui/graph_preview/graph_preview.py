@@ -1379,6 +1379,23 @@ class GraphPreview(QObject):
             return s
         return self._preview_stats_from_df()
 
+    def _preview_get_room_temperature(self) -> Optional[float]:
+        """Load room temperature from avg_temperature.json if available."""
+        try:
+            if not self._preview_csv_path:
+                return None
+            avg_temp_path = Path(self._preview_csv_path).parent / "avg_temperature.json"
+            if not avg_temp_path.exists():
+                return None
+            
+            data = json.loads(avg_temp_path.read_text(encoding="utf-8"))
+            room_temp = data.get("manual_average_temperature")
+            if room_temp is not None:
+                return float(room_temp)
+        except Exception:
+            pass
+        return None
+
     def _preview_infer_stats_title(self) -> str:
         return infer_stats_title(self._preview_available_cols)
 
@@ -1428,6 +1445,7 @@ class GraphPreview(QObject):
 
         stats_map = self._preview_get_stats_map()
         title = self._preview_infer_stats_title()
+        room_temp = self._preview_get_room_temperature()
 
         # dim app behind popup
         self._set_dimmed(True)
@@ -1440,6 +1458,7 @@ class GraphPreview(QObject):
             color_for=_color_for,
             on_toggle=_on_toggle,
             stats_map=stats_map,
+            room_temperature=room_temp,
             on_close=self._on_legend_popup_closed,
         )
 

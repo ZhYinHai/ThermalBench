@@ -14,6 +14,7 @@ Fixes:
 
 import argparse
 import csv
+import json
 import re
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -406,6 +407,15 @@ def main():
     plt.close(fig)
 
     pd.DataFrame(summary).to_csv(outdir / "summary.csv", index=False)
+
+    # Create JSON file for manual average temperature entry
+    avg_temp_json = {
+        "manual_average_temperature": None,
+        "unit": "°C",
+        "notes": "",
+        "last_updated": None
+    }
+    (outdir / "avg_temperature.json").write_text(json.dumps(avg_temp_json, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
