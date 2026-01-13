@@ -4,7 +4,7 @@
 import math
 from typing import Optional, Callable
 
-from PySide6.QtCore import QTimer, Qt, QEvent
+from PySide6.QtCore import QTimer, Qt, QEvent, QMimeData
 from PySide6.QtGui import QPixmap, QIcon, QFontMetrics
 from PySide6.QtWidgets import (
     QDialog,
@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QLayout,
     QFrame,
     QSizePolicy,
+    QPushButton,
+    QApplication,
 )
 
 
@@ -93,6 +95,37 @@ class LegendStatsPopup(QDialog):
         title_row.addStretch(1)
         title_row.addWidget(close_btn)
         root.addLayout(title_row)
+
+        # Copy Table Button
+        copy_btn_row = QHBoxLayout()
+        copy_btn_row.setContentsMargins(0, 0, 0, 0)
+        
+        copy_btn = QPushButton("Copy Table")
+        copy_btn.setCursor(Qt.PointingHandCursor)
+        copy_btn.clicked.connect(self._copy_table_to_clipboard)
+        copy_btn.setStyleSheet(
+            """
+            QPushButton {
+                background: #2A2A2A;
+                color: #EAEAEA;
+                border: 1px solid #3A3A3A;
+                border-radius: 6px;
+                padding: 6px 14px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background: #333333;
+                border-color: #4A4A4A;
+            }
+            QPushButton:pressed {
+                background: #252525;
+            }
+            """
+        )
+        
+        copy_btn_row.addStretch(1)
+        copy_btn_row.addWidget(copy_btn)
+        root.addLayout(copy_btn_row)
 
         # Table
         self.tree = QTreeWidget()
@@ -254,6 +287,100 @@ class LegendStatsPopup(QDialog):
         except Exception:
             pass
         super().closeEvent(event)
+
+    # ---------- Copy table to clipboard ----------
+    def _copy_table_to_clipboard(self) -> None:
+        """Copy the table data to clipboard in HTML table format for pasting into Word."""
+        try:
+            # Build header row
+            if self._room_temperature is not None:
+                headers = ["Sensor", "Min", "Max", "Avg", "Room", "Delta"]
+            else:
+                headers = ["Sensor", "Min", "Max", "Avg"]
+            
+            # Build plain text version (tab-delimited)
+            text_lines = ["\t".join(headers)]
+            
+            # Build complete HTML document for better clipboard compatibility
+            html_parts = [
+                '<html>',
+                '<head>',
+                '<meta charset="utf-8">',
+                '<style>',
+                'table { border-collapse: collapse; width: auto; table-layout: auto; font-size: 9pt; }',
+                'th, td { border: 1px solid black; padding: 0px 8px; text-align: left; white-space: nowrap; line-height: 0.8; font-size: 9pt; }',
+                'td.number { text-align: right; }',
+                'th:first-child, td:first-child { min-width: 200px; }',
+                '</style>',
+                '</head>',
+                '<body>',
+                '<table>',
+                '<thead><tr style="background-color:#ebebeb;">'
+            ]
+            for i, header in enumerate(headers):
+                if i == 0:
+                    html_parts.append(f'<th style="background-color:#ebebeb;border:1px solid black;padding:0px 8px;font-weight:bold;color:#000000;white-space:nowrap;min-width:200px;line-height:0.8;font-size:9pt;">{header}</th>')
+                else:
+                    html_parts.append(f'<th style="background-color:#ebebeb;border:1px solid black;padding:0px 8px;font-weight:bold;color:#000000;white-space:nowrap;min-width:50px;line-height:0.8;font-size:9pt;">{header}</th>')
+            html_parts.append('</tr></thead><tbody>')
+            
+            # Gather all rows in display order
+            for i in range(self.tree.topLevelItemCount()):
+                item = self.tree.topLevelItem(i)
+                if item is None:
+                    continue
+                
+                # Get sensor name
+                sensor_name = str(item.data(0, Qt.UserRole) or item.text(0) or "").strip()
+                
+                # Get stats
+                min_val = item.text(1)
+                max_val = item.text(2)
+                avg_val = item.text(3)
+                
+                if self._room_temperature is not None:
+                    room_val = item.text(4)
+                    delta_val = item.text(5)
+                    row = [sensor_name, min_val, max_val, avg_val, room_val, delta_val]
+                else:
+                    row = [sensor_name, min_val, max_val, avg_val]
+                
+                # Add to plain text
+                text_lines.append("\t".join(row))
+                
+                # Add to HTML table
+                html_parts.append('<tr>')
+                for j, cell in enumerate(row):
+                    # First column (sensor name) gets normal td, numbers get number class
+                    if j == 0:
+                        html_parts.append(f'<td style="padding:0px 8px;white-space:nowrap;min-width:200px;line-height:0.8;font-size:9pt;">{cell}</td>')
+                    else:
+                        html_parts.append(f'<td class="number" style="padding:0px 8px;white-space:nowrap;line-height:0.8;font-size:9pt;">{cell}</td>')
+                html_parts.append('</tr>')
+            
+            html_parts.extend(['</tbody></table>', '</body>', '</html>'])
+            
+            # Prepare clipboard with both plain text and HTML
+            table_text = "\n".join(text_lines)
+            table_html = "".join(html_parts)
+            
+            mime_data = QMimeData()
+            mime_data.setText(table_text)
+            mime_data.setHtml(table_html)
+            
+            clipboard = QApplication.clipboard()
+            clipboard.setMimeData(mime_data)
+            
+            # Visual feedback - briefly change button text
+            if hasattr(self, "sender") and self.sender():
+                btn = self.sender()
+                if isinstance(btn, QPushButton):
+                    original_text = btn.text()
+                    btn.setText("✓ Copied!")
+                    QTimer.singleShot(1500, lambda: btn.setText(original_text))
+        except Exception as e:
+            # Fail silently or could show an error
+            pass
 
     # ---------- helpers ----------
     def _make_color_icon(self, hex_color: str) -> QIcon:
