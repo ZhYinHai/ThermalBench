@@ -21,7 +21,15 @@ from ui.graph_preview.legend_popup_helpers import raise_center_and_focus
 from ui.graph_preview.ui_compare_popup import ComparePopup
 from ui.graph_preview.ui_dim_overlay import DimOverlay
 
-_RUN_FOLDER_RE = re.compile(r"^\d{8}_\d{6}$")
+_RUN_FOLDER_RE = re.compile(
+    r"^(?:"
+    r"\d{8}_\d{6}"
+    r"|(?:CPU|GPU|CPUGPU)_W\d+_L\d+_V\d+"
+    # Compare result folders (created by GUI): "<case> CPU vs <case> CPUGPU" (+ optional suffix)
+    r"|.+\s(?:CPU|GPU|CPUGPU)\svs\s.+\s(?:CPU|GPU|CPUGPU)(?:\s\+\d+)?"
+    r")$",
+    re.IGNORECASE,
+)
 
 
 class BenchmarkController:
@@ -46,6 +54,10 @@ class BenchmarkController:
         save_settings_callback,
         get_settings_callback,
         append_log_callback,
+        on_run_started=None,
+        on_run_finished=None,
+        on_log_started=None,
+        on_log_finished=None,
     ):
         """
         runs_model: proxy model (or QFileSystemModel)
@@ -68,6 +80,10 @@ class BenchmarkController:
         self._save_settings = save_settings_callback
         self._get_settings = get_settings_callback
         self._append_log = append_log_callback
+        self._on_run_started = on_run_started
+        self._on_run_finished = on_run_finished
+        self._on_log_started = on_log_started
+        self._on_log_finished = on_log_finished
 
         # Prevent double plotting when we programmatically set selection
         self._suppress_selection_preview = False
@@ -111,6 +127,9 @@ class BenchmarkController:
         self._pending_warm = 0
         self._pending_log = 0
         self._timer_started = False
+
+        # Pending per-run settings (persisted into the run folder once known)
+        self._pending_run_settings: dict = {}
 
         # Connect results tree selection
         try:
@@ -342,16 +361,72 @@ class BenchmarkController:
             if len(run_dirs) < 2:
                 return
 
+            def _case_label(rd: Path) -> str:
+                try:
+                    return (rd.parent.name if rd.parent is not None else "") or ""
+                except Exception:
+                    return ""
+
+            def _stress_label(rd: Path) -> str:
+                """Return CPU/GPU/CPUGPU, best-effort."""
+                try:
+                    m = re.match(r"^(CPU|GPU|CPUGPU)_W\d+_L\d+_V\d+$", str(rd.name), flags=re.IGNORECASE)
+                    if m:
+                        return str(m.group(1)).upper()
+                except Exception:
+                    pass
+
+                # Fallback: try test_settings.json (older/different naming)
+                try:
+                    p = rd / "test_settings.json"
+                    if p.exists():
+                        s = json.loads(p.read_text(encoding="utf-8"))
+                        sm = str((s or {}).get("stress_mode") or "").upper()
+                        if "CPU" in sm and "GPU" in sm:
+                            return "CPUGPU"
+                        if "GPU" in sm:
+                            return "GPU"
+                        if "CPU" in sm:
+                            return "CPU"
+                except Exception:
+                    pass
+
+                return "CPU"
+
+            def _compare_run_dir_name(rd_a: Path, rd_b: Path) -> str:
+                a_case = _case_label(rd_a)
+                b_case = _case_label(rd_b)
+                a_stress = _stress_label(rd_a)
+                b_stress = _stress_label(rd_b)
+                left = f"{a_case} {a_stress}".strip() if a_case else a_stress
+                right = f"{b_case} {b_stress}".strip() if b_case else b_stress
+                return f"{left} vs {right}"
+
+            case_a = _case_label(run_dirs[0]) or run_dirs[0].name
+            case_b = _case_label(run_dirs[1]) or run_dirs[1].name
             if len(run_dirs) == 2:
-                case_name = f"{run_dirs[0].name} vs {run_dirs[1].name}"
+                case_name = f"{case_a} vs {case_b}"
             else:
-                case_name = f"{run_dirs[0].name} vs {run_dirs[1].name} +{len(run_dirs) - 2}"
+                case_name = f"{case_a} vs {case_b} +{len(run_dirs) - 2}"
 
             out_case_dir = (self._runs_root / case_name)
             out_case_dir.mkdir(parents=True, exist_ok=True)
 
-            new_run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_run_dir = out_case_dir / new_run_id
+            base_run_name = _compare_run_dir_name(run_dirs[0], run_dirs[1])
+            if len(run_dirs) != 2:
+                base_run_name = f"{base_run_name} +{len(run_dirs) - 2}"
+
+            out_run_dir = out_case_dir / base_run_name
+            if out_run_dir.exists():
+                # Avoid collisions while keeping names readable.
+                i = 1
+                while True:
+                    cand = out_case_dir / f"{base_run_name} +{i}"
+                    if not cand.exists():
+                        out_run_dir = cand
+                        break
+                    i += 1
+
             out_run_dir.mkdir(parents=True, exist_ok=True)
 
             # Store run paths relative to runs root so previews are portable.
@@ -447,7 +522,7 @@ class BenchmarkController:
             return None
 
     def _current_run_folder(self) -> Optional[Path]:
-        """Return the selected run folder (YYYYMMDD_HHMMSS) if valid, else None."""
+        """Return the selected run folder if valid, else None."""
         try:
             idx = self._runs_tree.currentIndex()
             fpath = self._idx_to_path(idx)
@@ -676,10 +751,63 @@ class BenchmarkController:
         if confirm != QMessageBox.Yes:
             return
 
+        def _is_empty_dir(p: Path) -> bool:
+            try:
+                if not p.exists() or not p.is_dir():
+                    return False
+                with os.scandir(str(p)) as it:
+                    for _ in it:
+                        return False
+                return True
+            except Exception:
+                return False
+
+        def _cleanup_empty_parents(p: Path) -> None:
+            """Remove empty parent folders up to runs_root (exclusive)."""
+            try:
+                root = self._runs_root.resolve()
+            except Exception:
+                root = self._runs_root
+
+            cur = None
+            try:
+                cur = p.resolve()
+            except Exception:
+                cur = p
+
+            # Only operate inside runs_root.
+            try:
+                cur.relative_to(root)
+            except Exception:
+                return
+
+            while True:
+                try:
+                    if cur is None or cur == root:
+                        return
+                    if not _is_empty_dir(cur):
+                        return
+                    try:
+                        cur.rmdir()
+                    except Exception:
+                        return
+                    cur = cur.parent
+                except Exception:
+                    return
+
         failed: list[tuple[Path, str]] = []
         for rd in run_dirs:
             try:
+                parent = None
+                try:
+                    parent = rd.parent
+                except Exception:
+                    parent = None
                 shutil.rmtree(rd)
+
+                # If the case folder becomes empty, remove it too.
+                if parent is not None:
+                    _cleanup_empty_parents(parent)
             except Exception as exc:
                 failed.append((rd, str(exc)))
 
@@ -790,6 +918,36 @@ class BenchmarkController:
     # -------------------------------------------------------------------------
     # Benchmark Execution
     # -------------------------------------------------------------------------
+    @staticmethod
+    def _fmt_hhmmss(total_seconds: int) -> str:
+        try:
+            total_seconds = int(total_seconds)
+        except Exception:
+            total_seconds = 0
+        total_seconds = max(0, total_seconds)
+        h = total_seconds // 3600
+        m = (total_seconds % 3600) // 60
+        s = total_seconds % 60
+        return f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+
+    def _write_test_settings_for_run_dir(self, run_dir: Path) -> None:
+        try:
+            if run_dir is None or not run_dir.exists() or not run_dir.is_dir():
+                return
+
+            payload = dict(self._pending_run_settings or {})
+            if not payload:
+                return
+
+            outp = run_dir / "test_settings.json"
+            try:
+                outp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            except Exception:
+                # best-effort
+                pass
+        except Exception:
+            pass
+
     def run(self):
         try:
             if self.proc is not None and self.proc.state() != QProcess.NotRunning:
@@ -815,8 +973,10 @@ class BenchmarkController:
         logsec = settings.get("log_total_sec", 0)
         hwinfo = settings.get("hwinfo_csv", "").strip()
         fur_demo = settings.get("fur_demo", "furmark-knot-gl")
+        fur_demo_display = settings.get("fur_demo_display", "").strip()
         fur_w = settings.get("fur_width", 3840)
         fur_h = settings.get("fur_height", 1600)
+        fur_res_display = settings.get("fur_res_display", "").strip()
         furmark_exe = settings.get("furmark_exe", "")
         prime_exe = settings.get("prime_exe", "")
 
@@ -869,6 +1029,44 @@ class BenchmarkController:
         self._pending_log = logsec
         self._timer_started = False
 
+        # Notify UI that a run is starting (for live monitor table).
+        try:
+            if callable(getattr(self, "_on_run_started", None)):
+                self._on_run_started(dict(settings or {}), list(columns or []))
+        except Exception:
+            pass
+
+        # Snapshot settings for persistence into the run folder once it's created.
+        try:
+            stress_cpu = bool(getattr(self._sensor_manager, "stress_cpu", True))
+            stress_gpu = bool(getattr(self._sensor_manager, "stress_gpu", True))
+            if stress_cpu and stress_gpu:
+                stress_mode = "CPU + GPU"
+            elif stress_cpu:
+                stress_mode = "CPU only"
+            elif stress_gpu:
+                stress_mode = "GPU only"
+            else:
+                stress_mode = "None"
+
+            demo_disp = fur_demo_display or str(fur_demo)
+            res_disp = fur_res_display or f"{fur_w}x{fur_h}"
+
+            self._pending_run_settings = {
+                "case_name": str(case),
+                "warmup_total_sec": int(warm),
+                "warmup_display": self._fmt_hhmmss(int(warm)),
+                "log_total_sec": int(logsec),
+                "log_display": self._fmt_hhmmss(int(logsec)),
+                "stress_mode": str(stress_mode),
+                "furmark_demo": str(demo_disp),
+                "furmark_resolution": f"{int(fur_w)}x{int(fur_h)}",
+                "furmark_resolution_display": str(res_disp),
+                "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        except Exception:
+            self._pending_run_settings = {}
+
         self.proc.start()
 
     def abort(self):
@@ -894,6 +1092,24 @@ class BenchmarkController:
                 self._timer_started = True
                 self.start_live_timer(self._pending_warm, self._pending_log)
 
+            # Warmup -> Log window transition: reset live monitor stats so
+            # min/max/avg reflect only the logging window.
+            if "GUI_TIMER:LOG_START" in line:
+                try:
+                    if callable(getattr(self, "_on_log_started", None)):
+                        self._on_log_started()
+                except Exception:
+                    pass
+
+            # Logging window finished: freeze live monitor stats so they match
+            # the Legend & Stats popup (which uses the log window only).
+            if "GUI_TIMER:LOG_END" in line:
+                try:
+                    if callable(getattr(self, "_on_log_finished", None)):
+                        self._on_log_finished()
+                except Exception:
+                    pass
+
             m = RUNMAP_RE.search(line)
             if m:
                 self.last_run_dir = m.group(1).strip()
@@ -901,6 +1117,7 @@ class BenchmarkController:
                 try:
                     cand = Path(self.last_run_dir)
                     if cand.exists() and cand.is_dir():
+                        self._write_test_settings_for_run_dir(cand)
                         self._latest_cached_folder = cand
                         self._latest_cached_at_ts = time.time()
                         # best-effort: prefer mtime of run_window.csv if present
@@ -927,11 +1144,18 @@ class BenchmarkController:
         self.stop_live_timer("Idle" if code == 0 else "Stopped")
         self._open_btn.setEnabled(bool(self.last_run_dir and Path(self.last_run_dir).exists()))
 
+        try:
+            if callable(getattr(self, "_on_run_finished", None)):
+                self._on_run_finished()
+        except Exception:
+            pass
+
         # Refresh cache one more time (in case RUN MAP didn't arrive for some reason)
         try:
             if self.last_run_dir:
                 cand = Path(self.last_run_dir)
                 if cand.exists() and cand.is_dir():
+                    self._write_test_settings_for_run_dir(cand)
                     self._latest_cached_folder = cand
                     self._latest_cached_at_ts = time.time()
         except Exception:

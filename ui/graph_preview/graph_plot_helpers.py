@@ -7,12 +7,91 @@ inline implementation in `ui/graph_preview.py`.
 
 from __future__ import annotations
 
+import re
 import numpy as np
 import pandas as pd
 
 import matplotlib.cm as cm
 import matplotlib.dates as mdates
 import matplotlib.patheffects as pe
+
+
+import re
+import numpy as np
+import pandas as pd
+
+import matplotlib.cm as cm
+import matplotlib.dates as mdates
+import matplotlib.patheffects as pe
+
+
+def extract_unit_from_column(col_name: str) -> str:
+    """Extract the unit from a column name (text inside brackets).
+    
+    Examples:
+        'CPU (Tctl/Tdie) [°C]' -> '°C'
+        'Memory Clock [MHz]' -> 'MHz'
+        'Package C6 Residency [%]' -> '%'
+        'Tcas [T]' -> 'T'
+    """
+    match = re.search(r'\[([^\]]+)\]', str(col_name))
+    if match:
+        return match.group(1)
+    return "other"
+
+
+def group_columns_by_unit(cols: list[str]) -> dict[str, list[str]]:
+    """Group column names by their unit (text inside brackets).
+    
+    Returns a dictionary where keys are unit strings and values are lists of column names.
+    Columns without units are grouped under 'other'.
+    """
+    groups: dict[str, list[str]] = {}
+    for col in cols:
+        unit = extract_unit_from_column(col)
+        if unit not in groups:
+            groups[unit] = []
+        groups[unit].append(col)
+    return groups
+
+
+def get_measurement_type_label(unit: str) -> str:
+    """Get a human-readable label for a measurement type based on unit.
+    
+    Maps common units to measurement categories.
+    """
+    unit_lower = str(unit).lower().strip()
+    
+    # Temperature
+    if unit_lower in ('°c', 'c', '°f', 'f', 'k'):
+        return "Temperature"
+    
+    # Power / Watt
+    if unit_lower in ('w', 'watts', 'watt', 'mw', 'milliwatts'):
+        return "Power (W)"
+    
+    # RPM / Speed
+    if unit_lower in ('rpm', 'r/min', 'rev/min'):
+        return "RPM"
+    
+    # Percentage
+    if unit_lower in ('%', 'percent', 'percentage'):
+        return "Percentage (%)"
+    
+    # Voltage
+    if unit_lower in ('v', 'volt', 'volts', 'mv', 'millivolt'):
+        return "Voltage (V)"
+    
+    # Frequency / Clock
+    if unit_lower in ('mhz', 'ghz', 'khz', 'hz'):
+        return "Clock (MHz)"
+    
+    # Timing
+    if unit_lower in ('t', 'ns', 'nanosecond'):
+        return "Timing (T)"
+    
+    # Default: use the unit itself
+    return f"[{unit}]"
 
 
 def load_run_csv_dataframe(fpath: str) -> tuple[pd.DataFrame, list[str]]:

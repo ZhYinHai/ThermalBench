@@ -5,12 +5,13 @@ import math
 from typing import Optional, Callable
 
 from PySide6.QtCore import QTimer, Qt, QEvent, QMimeData
-from PySide6.QtGui import QPixmap, QIcon, QFontMetrics
+from PySide6.QtGui import QPixmap, QIcon, QFontMetrics, QFont
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
+    QWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QHeaderView,
@@ -22,6 +23,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QApplication,
 )
+
+from ui.graph_preview.graph_plot_helpers import group_columns_by_unit, get_measurement_type_label
 
 
 class LegendStatsPopup(QDialog):
@@ -42,6 +45,7 @@ class LegendStatsPopup(QDialog):
         on_toggle: Callable[[str, bool, Optional[list[str]]], None],
         stats_map: dict[str, tuple[float, float, float]] | None = None,
         room_temperature: Optional[float] = None,
+        test_settings: Optional[dict] = None,
         on_close: Optional[Callable[[], None]] = None,
     ):
         super().__init__(parent)
@@ -58,7 +62,9 @@ class LegendStatsPopup(QDialog):
         self._on_toggle = on_toggle
         self._stats_map = stats_map or {}
         self._room_temperature = room_temperature
+        self._test_settings = test_settings if isinstance(test_settings, dict) else None
         self._building = False
+        self._post_toggle_timer: Optional[QTimer] = None
 
         root = QVBoxLayout(self)
         root.setSizeConstraint(QLayout.SetDefaultConstraint)
@@ -99,6 +105,35 @@ class LegendStatsPopup(QDialog):
         # Copy Table Button
         copy_btn_row = QHBoxLayout()
         copy_btn_row.setContentsMargins(0, 0, 0, 0)
+
+        settings_btn = QPushButton("Settings")
+        settings_btn.setCursor(Qt.PointingHandCursor)
+        settings_btn.setCheckable(True)
+        settings_btn.setChecked(False)
+        settings_btn.clicked.connect(self._toggle_settings_panel)
+        settings_btn.setStyleSheet(
+            """
+            QPushButton {
+                background: #2A2A2A;
+                color: #EAEAEA;
+                border: 1px solid #3A3A3A;
+                border-radius: 6px;
+                padding: 6px 14px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background: #333333;
+                border-color: #4A4A4A;
+            }
+            QPushButton:pressed {
+                background: #252525;
+            }
+            QPushButton:checked {
+                background: #1F2B1F;
+                border-color: #2E4A2E;
+            }
+            """
+        )
         
         copy_btn = QPushButton("Copy Table")
         copy_btn.setCursor(Qt.PointingHandCursor)
@@ -124,8 +159,12 @@ class LegendStatsPopup(QDialog):
         )
         
         copy_btn_row.addStretch(1)
+        copy_btn_row.addWidget(settings_btn)
         copy_btn_row.addWidget(copy_btn)
         root.addLayout(copy_btn_row)
+
+        self._copy_btn = copy_btn
+        self._settings_btn = settings_btn
 
         # Table
         self.tree = QTreeWidget()
@@ -157,7 +196,7 @@ class LegendStatsPopup(QDialog):
 
         # Give "Measurement" a fixed wider width so there's more gap before stats
         hdr.setSectionResizeMode(0, QHeaderView.Fixed)
-        self.tree.setColumnWidth(0, 420)
+        self.tree.setColumnWidth(0, 320)
 
         num_stat_cols = 5 if self._room_temperature is not None else 3
         for c in range(1, num_stat_cols + 1):
@@ -165,12 +204,60 @@ class LegendStatsPopup(QDialog):
 
         self.tree.itemChanged.connect(self._item_changed)
 
+        # Body row: table (left) + test settings (right)
+        body_row = QHBoxLayout()
+        body_row.setContentsMargins(0, 0, 0, 0)
+        body_row.setSpacing(12)
+
         PAD = 14  # must match root.setContentsMargins(14,14,14,14)
         tree_wrap = QVBoxLayout()
         tree_wrap.setContentsMargins(-PAD, 0, -PAD, 0)  # bleed into dialog padding
         tree_wrap.setSpacing(0)
         tree_wrap.addWidget(self.tree, 1)
-        root.addLayout(tree_wrap, 1)
+
+        tree_container = QFrame()
+        tree_container.setFrameShape(QFrame.NoFrame)
+        tree_container.setLayout(tree_wrap)
+
+        body_row.addWidget(tree_container, 1)
+
+        self._settings_panel = QFrame()
+        self._settings_panel.setObjectName("SettingsPanel")
+        self._settings_panel.setFrameShape(QFrame.NoFrame)
+        self._settings_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        self._settings_panel.setMinimumWidth(170)
+        self._settings_panel.setMaximumWidth(210)
+        # Default to the original Legend & Stats view (no settings panel).
+        self._settings_panel.setVisible(False)
+
+        # Older runs may not have recorded settings; keep the button enabled and
+        # show a friendly message in the panel instead.
+        try:
+            has_settings = bool(self._test_settings and isinstance(self._test_settings, dict) and self._test_settings)
+            if not has_settings:
+                self._settings_btn.setToolTip("No settings recorded for this run")
+        except Exception:
+            pass
+
+        sp_root = QVBoxLayout(self._settings_panel)
+        sp_root.setContentsMargins(8, 8, 8, 8)
+        sp_root.setSpacing(6)
+
+        sp_title = QLabel("Test Settings")
+        sp_title.setStyleSheet("color:#9A9A9A; font-weight:600; font-size:11px;")
+        sp_root.addWidget(sp_title)
+
+        self._settings_label = QLabel()
+        self._settings_label.setTextFormat(Qt.RichText)
+        self._settings_label.setWordWrap(True)
+        self._settings_label.setStyleSheet("color:#EAEAEA; font-size:11px;")
+        sp_root.addWidget(self._settings_label, 1)
+
+        self._render_test_settings()
+
+        body_row.addWidget(self._settings_panel, 0)
+
+        root.addLayout(body_row, 1)
 
         # One-press toggle: click anywhere in the row toggles the checkbox
         self.tree.viewport().installEventFilter(self)
@@ -194,10 +281,12 @@ class LegendStatsPopup(QDialog):
             QDialog { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 10px; }
             QLabel { background: transparent; }
 
+            QFrame#SettingsPanel { background: #151515; border: 1px solid #2A2A2A; border-radius: 10px; }
+
             QTreeWidget { background: transparent; border: none; color: #EAEAEA; outline: none; }
 
             QTreeWidget::item {
-                padding: 8px 8px;
+                padding: 6px 6px;
                 border-radius: 0px;
                 background: transparent;
             }
@@ -215,7 +304,7 @@ class LegendStatsPopup(QDialog):
                 background: transparent;
                 color: #9A9A9A;
                 font-weight: 600;
-                padding: 8px 14px;
+                padding: 6px 10px;
                 border: none;
             }
 
@@ -280,6 +369,71 @@ class LegendStatsPopup(QDialog):
 
         self._rebuild(active_set or set())
 
+        # Autosize after initial layout so the last row isn't clipped.
+        QTimer.singleShot(0, self._autosize_to_content)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Re-run sizing on show to account for DPI/font rounding.
+        QTimer.singleShot(0, self._autosize_to_content)
+
+    def _toggle_settings_panel(self) -> None:
+        try:
+            sp = getattr(self, "_settings_panel", None)
+            btn = getattr(self, "_settings_btn", None)
+            if sp is None:
+                return
+
+            want_on = bool(btn.isChecked()) if btn is not None else (not sp.isVisible())
+
+            sp.setVisible(want_on)
+            QTimer.singleShot(0, self._autosize_to_content)
+        except Exception:
+            pass
+
+    def _render_test_settings(self) -> None:
+        try:
+            if getattr(self, "_settings_label", None) is None:
+                return
+
+            s = self._test_settings or {}
+
+            def g(key: str, default: str = "") -> str:
+                try:
+                    v = s.get(key)
+                    return str(v).strip() if v is not None else default
+                except Exception:
+                    return default
+
+            warm = g("warmup_display") or g("warmup_total_sec")
+            logt = g("log_display") or g("log_total_sec")
+            stress = g("stress_mode")
+            demo = g("furmark_demo")
+            res = g("furmark_resolution_display") or g("furmark_resolution")
+
+            if not any([warm, logt, stress, demo, res]):
+                self._settings_label.setText("<span style='color:#9A9A9A;'>No settings recorded for this run.</span>")
+                return
+
+            lines = []
+            if warm:
+                lines.append(f"<b>Warm up time:</b> {warm}")
+            if logt:
+                lines.append(f"<b>Log time:</b> {logt}")
+            if stress:
+                lines.append(f"<b>Stresstest:</b> {stress}")
+            if demo:
+                lines.append(f"<b>FurMark demo:</b> {demo}")
+            if res:
+                lines.append(f"<b>FurMark resolution:</b> {res}")
+
+            self._settings_label.setText("<br>".join(lines))
+        except Exception:
+            try:
+                self._settings_label.setText("<span style='color:#9A9A9A;'>No settings recorded for this run.</span>")
+            except Exception:
+                pass
+
     def closeEvent(self, event):
         try:
             if callable(getattr(self, "_on_close", None)):
@@ -324,14 +478,40 @@ class LegendStatsPopup(QDialog):
                     html_parts.append(f'<th style="background-color:#ebebeb;border:1px solid black;padding:0px 8px;font-weight:bold;color:#000000;white-space:nowrap;min-width:50px;line-height:0.8;font-size:9pt;">{header}</th>')
             html_parts.append('</tr></thead><tbody>')
             
-            # Gather all rows in display order
+            col_count = len(headers)
+
+            # Gather all rows in display order (including group headers)
             for i in range(self.tree.topLevelItemCount()):
                 item = self.tree.topLevelItem(i)
                 if item is None:
                     continue
+
+                is_group_header = False
+                try:
+                    is_group_header = bool(item.data(0, Qt.UserRole + 1))
+                except Exception:
+                    is_group_header = False
+
+                if is_group_header:
+                    group_name = (item.text(0) or "").strip()
+                    if not group_name:
+                        continue
+
+                    # Plain text: put the group name in the first column, blanks after.
+                    text_lines.append("\t".join([group_name] + [""] * (col_count - 1)))
+
+                    # HTML: a full-width row spanning all columns.
+                    html_parts.append(
+                        f"<tr><td colspan=\"{col_count}\" style=\"padding:2px 8px;white-space:nowrap;"
+                        f"background-color:#f3f3f3;border:1px solid black;line-height:0.9;font-size:9pt;"
+                        f"font-weight:bold;\">{group_name}</td></tr>"
+                    )
+                    continue
                 
                 # Get sensor name
                 sensor_name = str(item.data(0, Qt.UserRole) or item.text(0) or "").strip()
+                if not sensor_name:
+                    continue
                 
                 # Get stats
                 min_val = item.text(1)
@@ -416,44 +596,78 @@ class LegendStatsPopup(QDialog):
                 except Exception:
                     return float("-inf")
 
-            ordered = sorted(
-                (str(c) for c in (self._columns or [])),
-                key=lambda n: (_avg_for(n), n.lower()),
-                reverse=True,
-            )
+            # Group sensors by measurement unit, then sort sensors within each group by avg desc.
+            cols = [str(c) for c in (self._columns or [])]
+            groups = group_columns_by_unit(cols)
 
-            for name in ordered:
-                it = QTreeWidgetItem(self.tree)
-                it.setText(0, name)
-                it.setData(0, Qt.UserRole, name)
-                it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            def group_sort_key(item: tuple[str, list[str]]):
+                unit = item[0]
+                label = get_measurement_type_label(unit)
+                if "Temperature" in label:
+                    return (0, label)
+                if "Power" in label or "W" in label:
+                    return (1, label)
+                if "RPM" in label:
+                    return (2, label)
+                return (3, label)
 
+            for unit, group_cols in sorted(list(groups.items()), key=group_sort_key):
+                if not group_cols:
+                    continue
+
+                # Header row
                 try:
-                    it.setIcon(0, self._make_color_icon(self._color_for(name)))
-                except Exception:
-                    pass
-
-                it.setCheckState(0, Qt.Checked if name in aset else Qt.Unchecked)
-
-                mn, mx, av = self._stats_map.get(name, (float("nan"), float("nan"), float("nan")))
-                it.setText(1, self._fmt_stat(mn))
-                it.setText(2, self._fmt_stat(mx))
-                it.setText(3, self._fmt_stat(av))
-
-                # Add Room and Delta columns if room temperature is provided
-                if self._room_temperature is not None:
-                    # Room temperature value
-                    it.setText(4, self._fmt_stat(self._room_temperature))
-                    # Delta (avg - room temperature)
+                    header = QTreeWidgetItem(self.tree)
+                    header.setData(0, Qt.UserRole + 1, True)  # group header marker
+                    header.setText(0, str(get_measurement_type_label(unit)))
+                    header.setFlags(Qt.ItemIsEnabled)
+                    f = QFont(self.tree.font())
+                    f.setBold(True)
+                    header.setData(0, Qt.FontRole, f)
                     try:
-                        delta = av - self._room_temperature
-                        it.setText(5, self._fmt_stat(delta))
+                        self.tree.setFirstItemColumnSpanned(header, True)
                     except Exception:
-                        it.setText(5, "")
+                        pass
+                except Exception:
+                    header = None
 
-                num_stat_cols = 5 if self._room_temperature is not None else 3
-                for col in range(1, num_stat_cols + 1):
-                    it.setTextAlignment(col, Qt.AlignRight | Qt.AlignVCenter)
+                ordered = sorted(
+                    (str(c) for c in group_cols),
+                    key=lambda n: (_avg_for(n), n.lower()),
+                    reverse=True,
+                )
+
+                for name in ordered:
+                    it = QTreeWidgetItem(self.tree)
+                    it.setText(0, name)
+                    it.setData(0, Qt.UserRole, name)
+                    it.setData(0, Qt.UserRole + 1, False)
+                    it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+
+                    try:
+                        it.setIcon(0, self._make_color_icon(self._color_for(name)))
+                    except Exception:
+                        pass
+
+                    it.setCheckState(0, Qt.Checked if name in aset else Qt.Unchecked)
+
+                    mn, mx, av = self._stats_map.get(name, (float("nan"), float("nan"), float("nan")))
+                    it.setText(1, self._fmt_stat(mn))
+                    it.setText(2, self._fmt_stat(mx))
+                    it.setText(3, self._fmt_stat(av))
+
+                    # Add Room and Delta columns if room temperature is provided
+                    if self._room_temperature is not None:
+                        it.setText(4, self._fmt_stat(self._room_temperature))
+                        try:
+                            delta = av - self._room_temperature
+                            it.setText(5, self._fmt_stat(delta))
+                        except Exception:
+                            it.setText(5, "")
+
+                    num_stat_cols = 5 if self._room_temperature is not None else 3
+                    for col in range(1, num_stat_cols + 1):
+                        it.setTextAlignment(col, Qt.AlignRight | Qt.AlignVCenter)
 
         finally:
             self._building = False
@@ -478,16 +692,39 @@ class LegendStatsPopup(QDialog):
             self.layout().activate()
             self.tree.doItemsLayout()
 
-            self.tree.setColumnWidth(0, 420)
+            self.tree.setColumnWidth(0, 320)
 
-            for c in (1, 2, 3):
-                self.tree.resizeColumnToContents(c)
+            # Ensure ALL stat columns are sized to content (incl. Room/Delta).
+            # Add a small buffer to avoid digit clipping due to font/DPI rounding.
+            try:
+                for c in range(1, int(self.tree.columnCount())):
+                    try:
+                        self.tree.resizeColumnToContents(c)
+                    except Exception:
+                        pass
+
+                    try:
+                        hint = int(self.tree.sizeHintForColumn(c))
+                    except Exception:
+                        hint = int(self.tree.columnWidth(c))
+
+                    # Larger buffer to ensure the last decimal digit isn't clipped.
+                    buf = 18
+                    try:
+                        self.tree.setColumnWidth(c, max(int(self.tree.columnWidth(c)), hint) + buf)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             sbh = self.tree.horizontalScrollBar()
             if sbh is not None:
                 sbh.setValue(0)
 
-            header_len = self.tree.header().length()
+            try:
+                header_len = sum(int(self.tree.columnWidth(c)) for c in range(int(self.tree.columnCount())))
+            except Exception:
+                header_len = self.tree.header().length()
             tree_frame = self.tree.frameWidth() * 2
             vscroll_w = 0
             vsb = self.tree.verticalScrollBar()
@@ -495,7 +732,15 @@ class LegendStatsPopup(QDialog):
                 vscroll_w = vsb.sizeHint().width()
 
             margins = self.layout().contentsMargins()
-            ideal_w = header_len + tree_frame + vscroll_w + margins.left() + margins.right() + 2
+            # Extra slack to avoid right-edge clipping due to style/padding rounding.
+            ideal_w = header_len + tree_frame + vscroll_w + margins.left() + margins.right() + 10
+
+            try:
+                sp = getattr(self, "_settings_panel", None)
+                if sp is not None and sp.isVisible():
+                    ideal_w += int(self.layout().spacing()) + int(sp.sizeHint().width())
+            except Exception:
+                pass
 
             rows = self.tree.topLevelItemCount()
 
@@ -510,14 +755,28 @@ class LegendStatsPopup(QDialog):
             # Add a small buffer to avoid bottom-row clipping due to DPI/font rounding.
             tree_h = header_h + rows * row_h + frame_h + 4
 
+            try:
+                sp = getattr(self, "_settings_panel", None)
+                if sp is not None and sp.isVisible():
+                    sp.setFixedHeight(tree_h)
+            except Exception:
+                pass
+
             title_h = 0
             if getattr(self, "_title_label", None) is not None:
                 title_h = max(title_h, self._title_label.sizeHint().height())
             if getattr(self, "_close_btn", None) is not None:
                 title_h = max(title_h, self._close_btn.sizeHint().height())
 
+            copy_h = 0
+            if getattr(self, "_copy_btn", None) is not None:
+                copy_h = max(copy_h, self._copy_btn.sizeHint().height())
+            if getattr(self, "_settings_btn", None) is not None:
+                copy_h = max(copy_h, self._settings_btn.sizeHint().height())
+
             spacing = int(self.layout().spacing())
-            ideal_h = margins.top() + margins.bottom() + title_h + spacing + tree_h
+            # Title row + copy button row + table, with spacing between each.
+            ideal_h = margins.top() + margins.bottom() + title_h + spacing + copy_h + spacing + tree_h
 
             screen = self.screen()
             if screen is not None:
@@ -576,8 +835,29 @@ class LegendStatsPopup(QDialog):
             return
 
         self._on_toggle(str(col), checked, None)
-        self._ensure_all_rows_present()
-        self._reset_view_offsets()
+        self._schedule_post_toggle_cleanup()
+
+    def _schedule_post_toggle_cleanup(self) -> None:
+        try:
+            if self._post_toggle_timer is None:
+                t = QTimer(self)
+                t.setSingleShot(True)
+                try:
+                    t.setTimerType(Qt.PreciseTimer)
+                except Exception:
+                    pass
+                t.timeout.connect(self._post_toggle_cleanup)
+                self._post_toggle_timer = t
+            self._post_toggle_timer.start(40)
+        except Exception:
+            pass
+
+    def _post_toggle_cleanup(self) -> None:
+        try:
+            self._ensure_all_rows_present()
+            self._reset_view_offsets()
+        except Exception:
+            pass
 
     def _checked_count(self) -> int:
         try:
@@ -585,6 +865,11 @@ class LegendStatsPopup(QDialog):
             for i in range(self.tree.topLevelItemCount()):
                 it = self.tree.topLevelItem(i)
                 if it is not None and it.checkState(0) == Qt.Checked:
+                    try:
+                        if bool(it.data(0, Qt.UserRole + 1)):
+                            continue
+                    except Exception:
+                        pass
                     n += 1
             return n
         except Exception:
@@ -597,6 +882,13 @@ class LegendStatsPopup(QDialog):
                 it = self.tree.topLevelItem(i)
                 if it is None:
                     continue
+
+                try:
+                    if bool(it.data(0, Qt.UserRole + 1)):
+                        continue
+                except Exception:
+                    pass
+
                 name = str(it.data(0, Qt.UserRole) or it.text(0) or "").strip()
                 if name and it.checkState(0) == Qt.Checked:
                     s.add(name)
@@ -615,6 +907,13 @@ class LegendStatsPopup(QDialog):
                 it = self.tree.topLevelItem(i)
                 if it is None:
                     continue
+
+                try:
+                    if bool(it.data(0, Qt.UserRole + 1)):
+                        continue
+                except Exception:
+                    pass
+
                 name = str(it.data(0, Qt.UserRole) or it.text(0) or "").strip()
                 present.append(name)
 
@@ -627,12 +926,8 @@ class LegendStatsPopup(QDialog):
             # - names don't match expected set
             # - any blank name (Qt glitch)
             # - any duplicates (Qt glitch)
-            if (
-                self.tree.topLevelItemCount() != len(expected)
-                or present_set != expected_set
-                or has_blank
-                or has_dupes
-            ):
+            sensor_rows = len(present)
+            if (sensor_rows != len(expected) or present_set != expected_set or has_blank or has_dupes):
                 aset = self._active_set_from_ui()
                 if not aset and expected:
                     aset = {expected[0]}
@@ -665,6 +960,14 @@ class LegendStatsPopup(QDialog):
                 if item is None:
                     return False
 
+                # Ignore clicks on group header rows
+                try:
+                    if bool(item.data(0, Qt.UserRole + 1)):
+                        self._reset_view_offsets()
+                        return True
+                except Exception:
+                    pass
+
                 rect = self.tree.visualItemRect(item)
                 if (pos.x() - rect.x()) < 24:
                     return False
@@ -678,7 +981,6 @@ class LegendStatsPopup(QDialog):
                     0, Qt.Unchecked if item.checkState(0) == Qt.Checked else Qt.Checked
                 )
                 self._reset_view_offsets()
-                self._ensure_all_rows_present()
                 return True
 
         return super().eventFilter(obj, event)

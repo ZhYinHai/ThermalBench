@@ -236,6 +236,11 @@ def format_value(gp: Any, col_name: str, val: float) -> str:
         if val != val:
             return "-"
         s = str(col_name).lower()
+        if "[rpm]" in s or " rpm" in s or s.endswith("rpm"):
+            try:
+                return f"{int(round(float(val))):,} RPM"
+            except Exception:
+                return f"{val:.0f} RPM"
         if "°c" in s or "[°c]" in s:
             return f"{val:.2f} °C" if abs(val) < 100 else f"{val:.1f} °C"
         if "[w]" in s or " w" in s:

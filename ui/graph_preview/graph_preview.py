@@ -34,6 +34,9 @@ from .graph_plot_helpers import (
     load_run_csv_dataframe,
     plot_lines_with_glow,
     trim_dataframes_to_shortest_duration,
+    extract_unit_from_column,
+    group_columns_by_unit,
+    get_measurement_type_label,
 )
 
 from .ui_dim_overlay import DimOverlay
@@ -119,6 +122,12 @@ class GraphPreview(QObject):
         self._preview_colors_cached: list[str] = []
         self._preview_time_strs: Optional[list[str]] = None
         self._preview_last_tt_idx = None
+
+        # Debounce timers for smoother legend toggling
+        self._preview_apply_active_timer: Optional[QTimer] = None
+        self._preview_pending_active_cols: Optional[list[str]] = None
+        self._hover_cache_timer: Optional[QTimer] = None
+        self._single_bg_refresh_timer: Optional[QTimer] = None
 
         # --- Qt overlay tooltip (single mode)
         self._qt_tt: Optional[QLabel] = None
@@ -281,6 +290,14 @@ class GraphPreview(QObject):
         self._compare_axis_state = {}
         self._compare_last_canvas_wh = None
         self._compare_last_idx = None
+
+        # single-mode multi-axis state (for splitting by measurement type)
+        self._single_mode_multi_axis = False
+        self._single_axes = []
+        self._single_axis_state = {}
+        self._single_axis_vlines = {}
+        self._single_last_canvas_wh = None
+        self._single_last_idx = None
 
     # ---------------------------------------------------------------------
     # Qt tooltip animation helpers (per-widget)
@@ -703,6 +720,53 @@ class GraphPreview(QObject):
         except Exception:
             pass
 
+    def _exit_single_mode_multi_axis(self) -> None:
+        """Exit single-mode multi-axis view and reset to default single axis."""
+        # ensure single-mode overlay tooltips are destroyed/hidden
+        try:
+            for st in list((self._single_axis_state or {}).values()):
+                try:
+                    w = st.get("qt_tt")
+                    if w is not None:
+                        self._qt_cancel_move(w)
+                        w.hide()
+                        w.setParent(None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            self._single_mode_multi_axis = False
+            self._single_axes = []
+            self._single_axis_state = {}
+            self._single_axis_vlines = {}
+            self._single_last_canvas_wh = None
+            self._single_last_idx = None
+        except Exception:
+            pass
+
+        # Reset figure back to a single axis
+        try:
+            if self._preview_fig is not None and self._preview_canvas is not None:
+                self._preview_fig.clear()
+                self._preview_ax = self._preview_fig.add_subplot(111)
+                try:
+                    self._preview_apply_axes_rect(right_frac=0.985, left_margin_px=self._preview_left_margin_px_base)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            if self._preview_canvas is not None:
+                if hasattr(self, "_default_mouse_move_event"):
+                    self._preview_canvas.mouseMoveEvent = self._default_mouse_move_event
+                if hasattr(self, "_default_mouse_press_event"):
+                    self._preview_canvas.mousePressEvent = self._default_mouse_press_event
+        except Exception:
+            pass
+
     def _hide_compare_hover_all(self) -> None:
         # hide vlines + compare overlay tooltips
         try:
@@ -721,6 +785,92 @@ class GraphPreview(QObject):
                     pass
         except Exception:
             pass
+
+    def _hide_single_hover_all(self) -> None:
+        """Hide vlines + single-mode overlay tooltips (multi-axis)."""
+        try:
+            for st in (self._single_axis_state or {}).values():
+                try:
+                    if st.get("vline") is not None:
+                        st["vline"].set_visible(False)
+                except Exception:
+                    pass
+                try:
+                    w = st.get("qt_tt")
+                    if w is not None:
+                        self._qt_cancel_move(w)
+                        w.hide()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if self._preview_canvas is not None:
+                self._single_blit_vlines_only()
+        except Exception:
+            pass
+
+    def _refresh_single_backgrounds(self) -> None:
+        try:
+            if self._preview_canvas is None or not self._single_axes:
+                return
+            self._preview_canvas.draw()
+            for ax in self._single_axes:
+                try:
+                    bg = self._preview_canvas.copy_from_bbox(ax.bbox)
+                    st = self._single_axis_state.get(ax)
+                    if st is not None:
+                        st["bg"] = bg
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _single_blit_vlines_only(self) -> None:
+        """Fast single multi-axis blit: vlines only (tooltips are Qt overlays)."""
+        try:
+            if self._preview_canvas is None or not self._single_axes:
+                return
+            c = self._preview_canvas
+
+            # Ensure backgrounds exist
+            need_bg = False
+            for ax in self._single_axes:
+                st = self._single_axis_state.get(ax)
+                if st is None or st.get("bg") is None:
+                    need_bg = True
+                    break
+            if need_bg:
+                self._refresh_single_backgrounds()
+
+            for ax in self._single_axes:
+                st = self._single_axis_state.get(ax)
+                if not st:
+                    continue
+                bg = st.get("bg")
+                if bg is None:
+                    continue
+                try:
+                    c.restore_region(bg)
+                except Exception:
+                    continue
+
+                try:
+                    vl = st.get("vline")
+                    if vl is not None and vl.get_visible():
+                        ax.draw_artist(vl)
+                except Exception:
+                    pass
+                try:
+                    c.blit(ax.bbox)
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                if self._preview_canvas is not None:
+                    self._preview_canvas.draw_idle()
+            except Exception:
+                pass
         try:
             if self._preview_canvas is not None:
                 # restore background + hide vlines quickly
@@ -868,6 +1018,40 @@ class GraphPreview(QObject):
     # Draw / blit cache
     # ---------------------------------------------------------------------
     def _on_preview_draw(self, event=None) -> None:
+        # Single-mode multi-axis does not have a stable `_preview_ax` (the figure is cleared
+        # and subplots are created). We still need the draw hook to:
+        #  - update Legend&stats button bbox for hover/click hit-testing
+        #  - cache per-axis backgrounds for fast vline-only blitting
+        if getattr(self, "_single_mode_multi_axis", False):
+            try:
+                if self._preview_canvas is None:
+                    return
+                renderer = self._preview_canvas.get_renderer()
+                if renderer is not None:
+                    try:
+                        if self._ls_btn_text is not None:
+                            self._ls_btn_bbox = self._ls_btn_text.get_window_extent(renderer)
+                        else:
+                            self._ls_btn_bbox = None
+                    except Exception:
+                        self._ls_btn_bbox = None
+
+                try:
+                    # cache backgrounds per axis
+                    for ax in (self._single_axes or []):
+                        try:
+                            bg = self._preview_canvas.copy_from_bbox(ax.bbox)
+                            st = (self._single_axis_state or {}).get(ax)
+                            if st is not None:
+                                st["bg"] = bg
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            return
+
         _gp_on_preview_draw(self, event)
 
     def _preview_blit(self) -> None:
@@ -1262,6 +1446,9 @@ class GraphPreview(QObject):
             if getattr(self, "_compare_mode", False):
                 self._compare_relayout_and_redraw()
                 return
+            if getattr(self, "_single_mode_multi_axis", False):
+                self._single_mode_relayout_and_redraw()
+                return
         except Exception:
             pass
         _gp_preview_relayout_and_redraw(self)
@@ -1396,6 +1583,19 @@ class GraphPreview(QObject):
             pass
         return None
 
+    def _preview_get_test_settings(self) -> Optional[dict]:
+        """Load test settings from test_settings.json in the run folder, if present."""
+        try:
+            if not self._preview_csv_path:
+                return None
+            p = Path(self._preview_csv_path).parent / "test_settings.json"
+            if not p.exists():
+                return None
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
     def _preview_infer_stats_title(self) -> str:
         return infer_stats_title(self._preview_available_cols)
 
@@ -1425,7 +1625,7 @@ class GraphPreview(QObject):
                     active = [c for c in bulk_active_list if c in self._preview_available_cols]
                     if not active and self._preview_available_cols:
                         active = [self._preview_available_cols[0]]
-                    self._preview_set_active_cols(active)
+                    self._preview_schedule_set_active_cols(active)
                     return
 
                 active = list(self._preview_active_cols)
@@ -1437,7 +1637,7 @@ class GraphPreview(QObject):
                         active.remove(col)
                     if not active and self._preview_available_cols:
                         active = [self._preview_available_cols[0]]
-                self._preview_set_active_cols(active)
+                self._preview_schedule_set_active_cols(active)
             except Exception:
                 pass
 
@@ -1446,6 +1646,7 @@ class GraphPreview(QObject):
         stats_map = self._preview_get_stats_map()
         title = self._preview_infer_stats_title()
         room_temp = self._preview_get_room_temperature()
+        test_settings = self._preview_get_test_settings()
 
         # dim app behind popup
         self._set_dimmed(True)
@@ -1459,6 +1660,7 @@ class GraphPreview(QObject):
             on_toggle=_on_toggle,
             stats_map=stats_map,
             room_temperature=room_temp,
+            test_settings=test_settings,
             on_close=self._on_legend_popup_closed,
         )
 
@@ -1486,6 +1688,40 @@ class GraphPreview(QObject):
 
         QTimer.singleShot(0, _after_show_1)
 
+    def _preview_schedule_set_active_cols(self, cols: list[str]) -> None:
+        """Debounce legend toggles so multiple clicks batch into one redraw."""
+        try:
+            cols = [c for c in (cols or []) if c in (self._preview_available_cols or [])]
+            if not cols and self._preview_available_cols:
+                cols = [self._preview_available_cols[0]]
+            self._preview_pending_active_cols = list(cols)
+
+            if self._preview_apply_active_timer is None:
+                t = QTimer(self.parent)
+                t.setSingleShot(True)
+                try:
+                    t.setTimerType(Qt.PreciseTimer)
+                except Exception:
+                    pass
+                t.timeout.connect(self._preview_flush_pending_active_cols)
+                self._preview_apply_active_timer = t
+
+            # Small delay to coalesce rapid toggles; keeps UI feeling snappy.
+            self._preview_apply_active_timer.start(35)
+        except Exception:
+            try:
+                self._preview_set_active_cols(cols)
+            except Exception:
+                pass
+
+    def _preview_flush_pending_active_cols(self) -> None:
+        try:
+            cols = list(self._preview_pending_active_cols or [])
+            self._preview_pending_active_cols = None
+            self._preview_set_active_cols(cols)
+        except Exception:
+            pass
+
     def _preview_set_active_cols(self, cols: list[str]) -> None:
         try:
             cols = [c for c in cols if c in self._preview_available_cols]
@@ -1502,7 +1738,66 @@ class GraphPreview(QObject):
 
     def _preview_apply_active_series(self) -> None:
         try:
-            if self._preview_ax is None or self._preview_canvas is None or self._preview_df_all is None:
+            if getattr(self, "_compare_mode", False):
+                return
+
+            if self._preview_canvas is None or self._preview_df_all is None:
+                return
+
+            # If we are currently in single-axis mode but the active selection spans
+            # multiple measurement types, switch to multi-axis mode so each unit gets
+            # its own subplot.
+            try:
+                if not getattr(self, "_single_mode_multi_axis", False):
+                    active_set = set(self._preview_active_cols or [])
+                    all_cols = list(self._preview_available_cols or [])
+                    groups = group_columns_by_unit(all_cols)
+
+                    active_units: list[str] = []
+                    for unit, cols in (groups or {}).items():
+                        try:
+                            if any(c in active_set for c in (cols or [])):
+                                active_units.append(unit)
+                        except Exception:
+                            continue
+
+                    if len(active_units) > 1 and self._preview_fig is not None and self._preview_x is not None:
+                        def sort_key(item):
+                            unit = item[0]
+                            label = get_measurement_type_label(unit)
+                            if "Temperature" in label:
+                                return (0, label)
+                            elif "Power" in label or "Watt" in label:
+                                return (1, label)
+                            elif "RPM" in label:
+                                return (2, label)
+                            else:
+                                return (3, label)
+
+                        # Plot ALL columns for each active unit; visibility is handled by active_set.
+                        sorted_groups = sorted(
+                            [(u, list(groups.get(u, []) or [])) for u in active_units],
+                            key=sort_key,
+                        )
+
+                        self._plot_run_csv_multi_axis(
+                            self._preview_df_all,
+                            sorted_groups,
+                            np.asarray(self._preview_x, dtype=float),
+                            bool(getattr(self, "_preview_is_dt", False)),
+                            dict(getattr(self, "_preview_color_map", {}) or {}),
+                        )
+                        return
+            except Exception:
+                pass
+
+            # Single-mode multi-axis: update visibility per subplot, and rebuild layout
+            # if measurement groups become empty/non-empty.
+            if getattr(self, "_single_mode_multi_axis", False):
+                self._single_apply_active_series()
+                return
+
+            if self._preview_ax is None:
                 return
 
             aset = set(self._preview_active_cols)
@@ -1525,8 +1820,231 @@ class GraphPreview(QObject):
             self._preview_autoscale_y_to_active()
             self._preview_relayout_and_redraw()
 
-            # rebuild numpy hover caches
-            self._rebuild_hover_cache()
+            # Rebuild hover caches after a short idle (expensive)
+            self._schedule_hover_cache_rebuild()
+        except Exception:
+            try:
+                if self._preview_canvas is not None:
+                    self._preview_canvas.draw_idle()
+            except Exception:
+                pass
+
+    def _schedule_hover_cache_rebuild(self) -> None:
+        try:
+            if self._hover_cache_timer is None:
+                t = QTimer(self.parent)
+                t.setSingleShot(True)
+                try:
+                    t.setTimerType(Qt.PreciseTimer)
+                except Exception:
+                    pass
+                t.timeout.connect(self._rebuild_hover_cache)
+                self._hover_cache_timer = t
+            self._hover_cache_timer.start(60)
+        except Exception:
+            try:
+                self._rebuild_hover_cache()
+            except Exception:
+                pass
+
+    def _single_apply_active_series(self) -> None:
+        """Apply active sensor selection to single-mode multi-axis plots.
+
+        - Shows/hides lines immediately.
+        - If an entire measurement unit becomes empty (or becomes active again),
+          rebuilds the subplot stack so the remaining plots expand to fill the canvas.
+        """
+        try:
+            if self._preview_canvas is None or self._preview_fig is None or self._preview_df_all is None:
+                return
+            if not getattr(self, "_single_mode_multi_axis", False) or not getattr(self, "_single_axes", None):
+                return
+
+            active_set = set(self._preview_active_cols or [])
+            all_cols = list(self._preview_available_cols or [])
+            all_groups = group_columns_by_unit(all_cols)
+
+            def sort_key(item):
+                unit = item[0]
+                label = get_measurement_type_label(unit)
+                if "Temperature" in label:
+                    return (0, label)
+                elif "Power" in label or "Watt" in label:
+                    return (1, label)
+                elif "RPM" in label:
+                    return (2, label)
+                else:
+                    return (3, label)
+
+            # Units that currently have at least one active sensor.
+            required_units: list[str] = []
+            for unit, group_cols in (all_groups or {}).items():
+                try:
+                    if any(c in active_set for c in (group_cols or [])):
+                        required_units.append(unit)
+                except Exception:
+                    continue
+
+            required_units = [u for u in required_units if u in (all_groups or {})]
+            required_units_sorted = [u for (u, _cols) in sorted(((u, all_groups.get(u, [])) for u in required_units), key=sort_key)]
+            required_unit_set = set(required_units_sorted)
+
+            current_units: list[str] = []
+            for ax in list(self._single_axes or []):
+                st = (self._single_axis_state or {}).get(ax)
+                if st and st.get("unit"):
+                    current_units.append(str(st.get("unit")))
+            current_unit_set = set(current_units)
+
+            # Rebuild if the subplot stack needs to change (unit became empty / reappeared),
+            # or if any required column isn't currently plotted.
+            need_replot = (current_unit_set != required_unit_set)
+            if not need_replot:
+                for ax in list(self._single_axes or []):
+                    st = (self._single_axis_state or {}).get(ax)
+                    if not st:
+                        continue
+                    unit = st.get("unit")
+                    if unit not in required_unit_set:
+                        need_replot = True
+                        break
+                    want_cols = list((all_groups or {}).get(unit, []) or [])
+                    have_lines = st.get("lines") or {}
+                    for c in want_cols:
+                        if c not in have_lines:
+                            need_replot = True
+                            break
+                    if need_replot:
+                        break
+
+            # If we only need a single unit, fall back to single-axis mode.
+            if need_replot:
+                try:
+                    x_vals = self._preview_x
+                    if x_vals is None:
+                        return
+                except Exception:
+                    return
+
+                try:
+                    self._exit_single_mode_multi_axis()
+                except Exception:
+                    pass
+
+                if len(required_units_sorted) > 1:
+                    sorted_groups = [(u, list((all_groups or {}).get(u, []) or [])) for u in required_units_sorted if (all_groups or {}).get(u)]
+                    self._plot_run_csv_multi_axis(
+                        self._preview_df_all,
+                        sorted_groups,
+                        np.asarray(x_vals, dtype=float),
+                        bool(getattr(self, "_preview_is_dt", False)),
+                        dict(getattr(self, "_preview_color_map", {}) or {}),
+                    )
+                else:
+                    # Single-axis: keep behavior consistent with initial plot.
+                    self._plot_run_csv_single_axis(
+                        self._preview_df_all,
+                        list(all_cols),
+                        np.asarray(x_vals, dtype=float),
+                        bool(getattr(self, "_preview_is_dt", False)),
+                        dict(getattr(self, "_preview_color_map", {}) or {}),
+                    )
+                return
+
+            # Update visibility + per-axis tooltip caches for active series.
+            for ax in list(self._single_axes or []):
+                st = (self._single_axis_state or {}).get(ax)
+                if not st:
+                    continue
+
+                unit = st.get("unit")
+                group_cols = list((all_groups or {}).get(unit, []) or [])
+
+                lines = st.get("lines") or {}
+                for name, ln in list(lines.items()):
+                    try:
+                        ln.set_visible(name in active_set)
+                    except Exception:
+                        pass
+
+                active_cols = [c for c in group_cols if c in active_set]
+                st["cols"] = list(active_cols)
+                st["colors"] = [str(self._preview_color_map.get(c, "#FFFFFF")) for c in active_cols]
+
+                # Rebuild numpy hover caches to reflect active cols only.
+                try:
+                    if active_cols:
+                        df_np = self._preview_df_all[active_cols].to_numpy(dtype=float, copy=False)
+                        st["df"] = self._preview_df_all[active_cols].copy()
+                    else:
+                        df_np = np.zeros((int(len(self._preview_x or [])), 0), dtype=float)
+                        st["df"] = self._preview_df_all.iloc[:, 0:0].copy()
+                    st["df_np"] = df_np
+                except Exception:
+                    pass
+
+            # Autoscale each subplot to its active lines.
+            for ax in list(self._single_axes or []):
+                st = (self._single_axis_state or {}).get(ax)
+                if not st:
+                    continue
+                active_cols = list(st.get("cols") or [])
+                if not active_cols:
+                    continue
+                ys = []
+                series_data = st.get("series_data") or {}
+                for name in active_cols:
+                    y = series_data.get(name)
+                    if y is None:
+                        continue
+                    try:
+                        y = np.asarray(y, dtype=float)
+                        y = y[np.isfinite(y)]
+                        if y.size:
+                            ys.append(y)
+                    except Exception:
+                        pass
+                if not ys:
+                    continue
+                try:
+                    y_all = np.concatenate(ys)
+                    ymin = float(np.nanmin(y_all))
+                    ymax = float(np.nanmax(y_all))
+                    if np.isfinite(ymin) and np.isfinite(ymax):
+                        pad = 1.0 if ymin == ymax else 0.06 * (ymax - ymin)
+                        ax.set_ylim(ymin - pad, ymax + pad)
+                except Exception:
+                    pass
+
+            try:
+                self._single_last_idx = None
+            except Exception:
+                pass
+
+            try:
+                self._single_mode_relayout_and_redraw()
+            except Exception:
+                pass
+
+            # Background refresh is relatively heavy; debounce it.
+            try:
+                if self._single_bg_refresh_timer is None:
+                    t = QTimer(self.parent)
+                    t.setSingleShot(True)
+                    try:
+                        t.setTimerType(Qt.PreciseTimer)
+                    except Exception:
+                        pass
+                    t.timeout.connect(self._refresh_single_backgrounds)
+                    self._single_bg_refresh_timer = t
+                self._single_bg_refresh_timer.start(80)
+            except Exception:
+                pass
+
+            try:
+                self._preview_canvas.draw_idle()
+            except Exception:
+                pass
         except Exception:
             try:
                 if self._preview_canvas is not None:
@@ -1604,6 +2122,43 @@ class GraphPreview(QObject):
 
         run_dirs: list[Path] = []
         run_labels: list[str] = []
+
+        def _stress_label_for_run_dir(rd: Path) -> str:
+            """Best-effort CPU/GPU/CPUGPU label for a run folder."""
+            try:
+                m2 = re.match(r"^(CPU|GPU|CPUGPU)_W\d+_L\d+_V\d+$", str(rd.name), flags=re.IGNORECASE)
+                if m2:
+                    return str(m2.group(1)).upper()
+            except Exception:
+                pass
+
+            # Fallback: infer from recorded settings (if present)
+            try:
+                p = rd / "test_settings.json"
+                if p.exists():
+                    s = json.loads(p.read_text(encoding="utf-8"))
+                    sm = str((s or {}).get("stress_mode") or "").upper()
+                    if "CPU" in sm and "GPU" in sm:
+                        return "CPUGPU"
+                    if "GPU" in sm:
+                        return "GPU"
+                    if "CPU" in sm:
+                        return "CPU"
+            except Exception:
+                pass
+
+            return "CPU"
+
+        def _compare_display_label(rd: Path) -> str:
+            """Use '<case> <stress>' for compare tooltips/legend."""
+            try:
+                case = (rd.parent.name if rd.parent is not None else "").strip()
+            except Exception:
+                case = ""
+            stress = _stress_label_for_run_dir(rd)
+            return (f"{case} {stress}".strip() if case else stress)
+
+        used_labels: dict[str, int] = {}
         for rel in runs_rel:
             try:
                 p = Path(*str(rel).replace("\\", "/").split("/"))
@@ -1612,7 +2167,10 @@ class GraphPreview(QObject):
             rd = (runs_root / p)
             run_dirs.append(rd)
             try:
-                run_labels.append(rd.name)
+                base = _compare_display_label(rd)
+                n = used_labels.get(base, 0) + 1
+                used_labels[base] = n
+                run_labels.append(base if n == 1 else f"{base} #{n}")
             except Exception:
                 run_labels.append(str(rel))
 
@@ -2136,6 +2694,7 @@ class GraphPreview(QObject):
             raise RuntimeError("Preview canvas unavailable")
 
         self._exit_compare_mode()
+        self._exit_single_mode_multi_axis()
 
         self._close_legend_popup()
         self._preview_csv_path = fpath
@@ -2143,9 +2702,6 @@ class GraphPreview(QObject):
         df_data, cols = load_run_csv_dataframe(fpath)
 
         self._preview_df_all = df_data[cols]
-        self._preview_colors = [
-            self._preview_color_map.get(c, "#FFFFFF") for c in self._preview_active_cols
-        ]
         self._preview_available_cols = list(cols)
 
         # apply last saved selection for THIS result (if any)
@@ -2153,6 +2709,7 @@ class GraphPreview(QObject):
 
         is_dt, x_vals = compute_x_vals(df_data)
         self._preview_is_dt = bool(is_dt)
+        self._preview_x = x_vals
 
         try:
             self._tt_anim_timer.stop()
@@ -2160,6 +2717,67 @@ class GraphPreview(QObject):
             pass
         self._tt_anim_start_xy = None
         self._tt_anim_target_xy = None
+
+        # Group columns by measurement type (unit)
+        all_groups = group_columns_by_unit(list(cols))
+        
+        # Filter groups to only include units that have at least one active column.
+        # Keep ALL columns within that unit so selecting additional sensors later is instant.
+        active_set = set(self._preview_active_cols)
+        filtered_groups: dict[str, list[str]] = {}
+        for unit, group_cols in all_groups.items():
+            active_in_group = [c for c in group_cols if c in active_set]
+            if active_in_group:
+                filtered_groups[unit] = list(group_cols)
+        
+        # Sort groups by a consistent order (temperature first, then others)
+        def sort_key(item):
+            unit = item[0]
+            label = get_measurement_type_label(unit)
+            if "Temperature" in label:
+                return (0, label)
+            elif "Power" in label or "Watt" in label:
+                return (1, label)
+            elif "RPM" in label:
+                return (2, label)
+            else:
+                return (3, label)
+        
+        sorted_groups = sorted(filtered_groups.items(), key=sort_key)
+        
+        # Decide: multi-axis if we have multiple measurement types, otherwise single
+        num_groups = len(sorted_groups)
+        use_multi_axis = num_groups > 1
+        
+        # Build color map for all columns
+        self._preview_color_map = build_tab20_color_map(list(cols))
+        
+        # =========================================
+        # Multi-axis mode (split by measurement type)
+        # =========================================
+        if use_multi_axis:
+            self._plot_run_csv_multi_axis(
+                df_data, sorted_groups, x_vals, is_dt, self._preview_color_map
+            )
+        # =========================================
+        # Single-axis mode (all on one graph)
+        # =========================================
+        else:
+            self._plot_run_csv_single_axis(
+                df_data, list(cols), x_vals, is_dt, self._preview_color_map
+            )
+
+    def _plot_run_csv_single_axis(
+        self,
+        df_data: pd.DataFrame,
+        cols: list[str],
+        x_vals: np.ndarray,
+        is_dt: bool,
+        color_map: dict[str, str],
+    ) -> None:
+        """Plot all active columns on a single axis."""
+        if self._preview_canvas is None or self._preview_ax is None:
+            return
 
         self._preview_ax.clear()
         self._ls_btn_text = None
@@ -2172,15 +2790,13 @@ class GraphPreview(QObject):
             dot_dashes=self._preview_dot_dashes,
         )
 
-        self._preview_color_map = build_tab20_color_map(list(cols))
-
         self._preview_lines, self._preview_series_data, self._preview_colors = plot_lines_with_glow(
             self._preview_ax,
-            df_all=self._preview_df_all,
+            df_all=df_data,
             cols=list(cols),
             x_vals=x_vals,
             is_dt=is_dt,
-            color_map=self._preview_color_map,
+            color_map=color_map,
         )
 
         # Hide lines that aren't active
@@ -2194,9 +2810,9 @@ class GraphPreview(QObject):
         self._preview_x = x_vals
 
         try:
-            self._preview_df = self._preview_df_all[self._preview_active_cols]
+            self._preview_df = df_data[self._preview_active_cols]
         except Exception:
-            self._preview_df = self._preview_df_all
+            self._preview_df = df_data
 
         self._preview_build_tooltip_for_cols(self._preview_active_cols)
         self._preview_autoscale_y_to_active()
@@ -2235,6 +2851,7 @@ class GraphPreview(QObject):
         except Exception:
             self._ls_btn_text = None
             self._ls_btn_bbox = None
+
         try:
             self._preview_label.clear()
             self._preview_label.hide()
@@ -2271,3 +2888,537 @@ class GraphPreview(QObject):
             self._preview_mpl_cid = None
 
         QTimer.singleShot(0, self._preview_relayout_and_redraw)
+
+    def _plot_run_csv_multi_axis(
+        self,
+        df_data: pd.DataFrame,
+        sorted_groups: list[tuple[str, list[str]]],
+        x_vals: np.ndarray,
+        is_dt: bool,
+        color_map: dict[str, str],
+    ) -> None:
+        """Plot active columns split across multiple axes by measurement type."""
+        if self._preview_canvas is None or self._preview_fig is None:
+            return
+
+        self._single_mode_multi_axis = True
+        self._ls_btn_text = None
+        self._ls_btn_bbox = None
+
+        # Clear figure and create subplots
+        self._preview_fig.clear()
+        n = len(sorted_groups)
+        axes = self._preview_fig.subplots(nrows=n, ncols=1, sharex=True)
+        if not isinstance(axes, (list, tuple, np.ndarray)):
+            axes = [axes]
+        else:
+            axes = list(np.ravel(axes))
+
+        self._single_axes = axes
+        self._single_axis_state = {}
+        self._single_axis_vlines = {}
+
+        # Per-axis Qt tooltip widgets (single-mode multi-axis shows one per subplot)
+        def _make_single_tt() -> Optional[QLabel]:
+            try:
+                if self._preview_canvas is None:
+                    return None
+                w = QLabel(self._preview_canvas)
+                w.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                w.setTextFormat(Qt.RichText)
+                w.setWordWrap(False)
+
+                f = QFont("DejaVu Sans Mono")
+                try:
+                    f.setStyleHint(QFont.Monospace)
+                except Exception:
+                    pass
+                f.setPointSize(10)
+                w.setFont(f)
+
+                w.setStyleSheet(
+                    "QLabel {"
+                    " background-color: rgba(24,24,24,160);"
+                    " border: 1px solid rgba(255,255,255,18);"
+                    " border-radius: 8px;"
+                    " padding: 8px 10px;"
+                    " color: #FFFFFF;"
+                    "}"
+                )
+                w.hide()
+                return w
+            except Exception:
+                return None
+
+        # Plot each measurement type on its own axis
+        for idx, (unit, group_cols) in enumerate(sorted_groups):
+            ax = axes[idx]
+            measurement_label = get_measurement_type_label(unit)
+
+            apply_dark_axes_style(
+                self._preview_fig,
+                ax,
+                grid_color=self._preview_grid_color,
+                dot_dashes=self._preview_dot_dashes,
+            )
+
+            try:
+                ax.spines["top"].set_visible(False)
+                ax.spines["bottom"].set_visible(False)
+            except Exception:
+                pass
+
+            # Plot lines for this measurement group
+            lines, series_data, colors = plot_lines_with_glow(
+                ax,
+                df_all=df_data,
+                cols=group_cols,
+                x_vals=x_vals,
+                is_dt=is_dt,
+                color_map=color_map,
+            )
+
+            # Hide lines not in active set
+            active_set = set(self._preview_active_cols)
+            for col_name, ln in list(lines.items()):
+                try:
+                    ln.set_visible(col_name in active_set)
+                except Exception:
+                    pass
+
+            # Set x limits
+            try:
+                if len(x_vals) > 0:
+                    ax.set_xlim(left=x_vals[0], right=x_vals[-1])
+            except Exception:
+                pass
+
+            # Create vline for this axis
+            try:
+                vline = create_hover_vline(
+                    ax,
+                    x0=x_vals[0],
+                    grid_color=self._preview_grid_color,
+                    dot_dashes=self._preview_dot_dashes,
+                )
+            except Exception:
+                vline = None
+
+            # Add measurement label above the axes (left), so it doesn't collide with plot content.
+            try:
+                ax.text(
+                    0.0,
+                    1.02,
+                    str(measurement_label),
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="bottom",
+                    fontsize=11,
+                    color="#EAEAEA",
+                    zorder=2600,
+                    clip_on=False,
+                )
+            except Exception:
+                pass
+
+            # Add Legend & stats button only on the TOP-most graph, aligned to the same row (right).
+            if idx == 0:
+                try:
+                    self._ls_btn_text = ax.text(
+                        1.0,
+                        1.02,
+                        "≡ Legend & stats",
+                        transform=ax.transAxes,
+                        ha="right",
+                        va="bottom",
+                        fontsize=9,
+                        color="#BDBDBD",
+                        zorder=3000,
+                        clip_on=False,
+                        bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
+                    )
+                    self._ls_btn_bbox = None
+                except Exception:
+                    self._ls_btn_text = None
+                    self._ls_btn_bbox = None
+
+            # Store axis state
+            try:
+                df_np = df_data[group_cols].to_numpy(dtype=float, copy=False)
+            except Exception:
+                try:
+                    df_np = np.asarray(df_data[group_cols].to_numpy(), dtype=float)
+                except Exception:
+                    df_np = None
+
+            cols2 = [str(c) for c in list(group_cols)]
+            colors2 = [str(color_map.get(str(c), "#FFFFFF")) for c in cols2]
+
+            self._single_axis_state[ax] = {
+                "unit": unit,
+                "cols": cols2,
+                "lines": lines,
+                "series_data": series_data,
+                "colors": colors2,
+                "x": np.asarray(x_vals, dtype=float),
+                "is_dt": bool(is_dt),
+                "df": df_data[group_cols].copy(),
+                "df_np": df_np,
+                "vline": vline,
+                "bg": None,
+                "qt_tt": _make_single_tt(),
+            }
+            self._single_axis_vlines[ax] = vline
+
+            # Apply time formatter only to the last (bottom) axis
+            if idx == len(sorted_groups) - 1:
+                apply_elapsed_time_formatter(ax, is_dt=is_dt, x_vals=x_vals)
+            else:
+                # Remove x-axis labels for non-bottom axes
+                try:
+                    ax.set_xticklabels([])
+                except Exception:
+                    pass
+
+        # Adjust layout (will be refined in relayout)
+        try:
+            self._preview_fig.subplots_adjust(
+                left=0.08,
+                right=0.985,
+                top=0.93,
+                bottom=0.05,
+                hspace=0.35,
+            )
+        except Exception:
+            pass
+
+        try:
+            self._preview_label.clear()
+            self._preview_label.hide()
+        except Exception:
+            pass
+
+        try:
+            self._preview_canvas.show()
+            self._preview_canvas.draw()
+        except Exception:
+            pass
+
+        # Cache backgrounds for fast vline blit
+        try:
+            self._single_last_canvas_wh = (int(self._preview_canvas.width()), int(self._preview_canvas.height()))
+        except Exception:
+            pass
+        try:
+            self._refresh_single_backgrounds()
+        except Exception:
+            pass
+
+        # Set up multi-axis hover handler
+        try:
+            if self._preview_mpl_cid is not None:
+                try:
+                    self._preview_canvas.mpl_disconnect(self._preview_mpl_cid)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Install custom mouse move handler for multi-axis mode
+        def _single_multi_mouse_move(ev):
+            try:
+                if self._preview_canvas is None or not self._single_mode_multi_axis:
+                    return
+
+                wh = (int(self._preview_canvas.width()), int(self._preview_canvas.height()))
+                try:
+                    if self._single_last_canvas_wh != wh:
+                        self._single_last_canvas_wh = wh
+                        self._refresh_single_backgrounds()
+                except Exception:
+                    pass
+
+                # Check legend&stats button
+                try:
+                    if hasattr(ev, 'pos') and ev.pos():
+                        x, y = ev.pos().x(), ev.pos().y()
+                        if self._is_over_ls_button(int(x), int(y)):
+                            if not self._hovering_ls_btn:
+                                self._hovering_ls_btn = True
+                                self._preview_canvas.setCursor(Qt.PointingHandCursor)
+                            return
+                        else:
+                            if self._hovering_ls_btn:
+                                self._hovering_ls_btn = False
+                                self._preview_canvas.setCursor(Qt.ArrowCursor)
+                except Exception:
+                    pass
+
+                # Get mouse position
+                try:
+                    x = ev.pos().x()
+                    y = ev.pos().y()
+                    self._qt_last_mouse_xy = (int(x), int(y))
+                except Exception:
+                    return
+
+                h = self._preview_canvas.height()
+                display_x = x
+                display_y = h - y
+
+                # Find which axis is under the cursor
+                hit_ax = None
+                for ax in self._single_axes:
+                    try:
+                        if ax.bbox.contains(display_x, display_y):
+                            hit_ax = ax
+                            break
+                    except Exception:
+                        pass
+
+                if hit_ax is None:
+                    self._hide_single_hover_all()
+                    return
+
+                # Get x data from cursor position
+                try:
+                    data_xy = hit_ax.transData.inverted().transform((display_x, display_y))
+                    xdata = float(data_xy[0])
+                    ydata2 = float(data_xy[1])
+                except Exception:
+                    return
+
+                # Outside x-limits? hide
+                try:
+                    x0, x1 = hit_ax.get_xlim()
+                    if xdata < min(x0, x1) or xdata > max(x0, x1):
+                        self._hide_single_hover_all()
+                        return
+                except Exception:
+                    pass
+
+                # Update all vlines
+                try:
+                    xa = np.asarray(self._single_axis_state[hit_ax].get("x"), dtype=float)
+                    if xa is None or len(xa) < 2:
+                        return
+
+                    idx = self._nearest_index_sorted(xa, float(xdata))
+                    idx_changed = (self._single_last_idx != idx)
+                    self._single_last_idx = idx
+
+                    idx = int(max(0, min(int(idx), int(len(xa) - 1))))
+
+                    # Elapsed header (m:ss or h:mm:ss)
+                    try:
+                        base_v = float(xa[0])
+                        cur_v = float(xa[int(idx)])
+                        d = (cur_v - base_v) * 86400.0 if bool(self._single_axis_state[hit_ax].get("is_dt", True)) else (cur_v - base_v)
+                        if not np.isfinite(d):
+                            d = 0.0
+                        d = max(0.0, float(d))
+                        total_seconds = int(d)
+                        hours = total_seconds // 3600
+                        minutes = (total_seconds % 3600) // 60
+                        seconds = total_seconds % 60
+                        tstr = f"{hours}:{minutes:02d}:{seconds:02d}" if hours > 0 else f"{minutes}:{seconds:02d}"
+                    except Exception:
+                        tstr = ""
+
+                    # Update vlines on all axes to the same x position
+                    for ax in self._single_axes:
+                        vline = self._single_axis_vlines.get(ax)
+                        if vline is not None:
+                            try:
+                                vline.set_xdata([xa[int(idx)], xa[int(idx)]])
+                                vline.set_visible(True)
+                            except Exception:
+                                pass
+
+                    # Update + animate tooltips for each axis
+                    for ax2 in self._single_axes:
+                        st2 = self._single_axis_state.get(ax2)
+                        if not st2:
+                            continue
+                        tt = st2.get("qt_tt")
+                        if tt is None:
+                            continue
+
+                        # yref behavior:
+                        # - hovered axis follows cursor y
+                        # - other axes follow the highest line at idx (nanmax across series)
+                        try:
+                            y0, y1 = ax2.get_ylim()
+                            lo, hi = (float(y0), float(y1)) if y0 <= y1 else (float(y1), float(y0))
+                        except Exception:
+                            lo, hi = (0.0, 1.0)
+
+                        if ax2 is hit_ax:
+                            try:
+                                yref = float(ydata2)
+                            except Exception:
+                                yref = lo
+                        else:
+                            try:
+                                df_np2 = st2.get("df_np", None)
+                                if df_np2 is not None:
+                                    row_vals = np.asarray(df_np2[int(idx), :], dtype=float)
+                                    ymax = float(np.nanmax(row_vals))
+                                else:
+                                    ymax = float("nan")
+                            except Exception:
+                                ymax = float("nan")
+
+                            if ymax == ymax:
+                                yref = ymax
+                            else:
+                                yref = lo + 0.65 * (hi - lo)
+
+                        try:
+                            if hi > lo:
+                                pad = 0.03 * (hi - lo)
+                                yref = max(lo + pad, min(hi - pad, yref))
+                        except Exception:
+                            pass
+
+                        if idx_changed:
+                            cols3 = st2.get("cols") or []
+                            colors3 = st2.get("colors") or []
+                            try:
+                                df_np3 = st2.get("df_np")
+                                vals3 = np.asarray(df_np3[int(idx), :], dtype=float) if df_np3 is not None else np.full((len(cols3),), np.nan, dtype=float)
+                            except Exception:
+                                vals3 = np.full((len(cols3),), np.nan, dtype=float)
+
+                            try:
+                                work3 = np.where(np.isfinite(vals3), vals3, -1e30)
+                                order3 = np.argsort(work3)[::-1]
+                            except Exception:
+                                order3 = np.arange(len(cols3), dtype=int)
+
+                            names_sorted = []
+                            values_sorted = []
+                            colors_sorted = []
+                            for i3 in order3:
+                                try:
+                                    name = cols3[int(i3)]
+                                except Exception:
+                                    name = ""
+                                try:
+                                    v = float(vals3[int(i3)])
+                                except Exception:
+                                    v = float("nan")
+                                try:
+                                    col = colors3[int(i3)]
+                                except Exception:
+                                    col = "#FFFFFF"
+                                names_sorted.append(name)
+                                values_sorted.append(self._format_value(name, v))
+                                colors_sorted.append(col)
+
+                            html = self._qt_build_tooltip_html(tstr, names_sorted, values_sorted, colors_sorted)
+                            try:
+                                tt.setText(html)
+                            except Exception:
+                                pass
+
+                        try:
+                            tt.show()
+                        except Exception:
+                            pass
+
+                        pos2 = self._qt_compute_tooltip_pos_in_ax(
+                            tt, ax2, xdata=float(xdata), ydata=float(yref), prefer_mode=self._qt_tt_mode
+                        )
+                        if pos2 is not None:
+                            tx2, ty2, mode2 = pos2
+                            self._qt_tt_mode = str(mode2)
+                            self._qt_move_to(tt, int(tx2), int(ty2))
+
+                    # Blit vlines only (tooltips are Qt overlays)
+                    try:
+                        self._single_blit_vlines_only()
+                    except Exception:
+                        try:
+                            self._preview_canvas.draw_idle()
+                        except Exception:
+                            pass
+
+                except Exception:
+                    pass
+
+            except Exception:
+                pass
+
+        try:
+            self._preview_canvas.mouseMoveEvent = _single_multi_mouse_move
+        except Exception:
+            pass
+
+        # Draw
+        try:
+            self._preview_canvas.draw_idle()
+        except Exception:
+            pass
+
+        try:
+            QTimer.singleShot(0, self._single_mode_relayout_and_redraw)
+        except Exception:
+            pass
+
+    def _single_mode_relayout_and_redraw(self) -> None:
+        """Relayout multi-axis subplots on resize/show."""
+        try:
+            if self._preview_canvas is None or self._preview_fig is None:
+                return
+            if not self._preview_canvas.isVisible():
+                return
+            if not getattr(self, "_single_mode_multi_axis", False) or not getattr(self, "_single_axes", None):
+                return
+
+            self._preview_canvas.draw()
+            renderer = self._preview_canvas.get_renderer()
+            if renderer is None:
+                return
+
+            # Compute left margin
+            left_px = float(getattr(self, "_preview_left_margin_px_base", 60) or 60)
+            for ax in list(self._single_axes):
+                try:
+                    self._preview_ax = ax
+                    left_px = max(left_px, float(self._preview_required_left_margin_px(renderer, pad_px=8)))
+                except Exception:
+                    continue
+
+            try:
+                fig_w_px = float(self._preview_fig.get_figwidth() * self._preview_fig.dpi)
+                left = (left_px / fig_w_px) if fig_w_px > 1 else 0.08
+                left = max(0.02, min(left, 0.35))
+
+                self._preview_fig.subplots_adjust(
+                    left=left,
+                    right=0.985,
+                    top=0.93,
+                    bottom=0.05,
+                    hspace=0.35,
+                )
+            except Exception:
+                pass
+
+            try:
+                self._preview_invalidate_interaction_cache()
+            except Exception:
+                pass
+
+            self._preview_canvas.draw()
+            try:
+                self._refresh_single_backgrounds()
+            except Exception:
+                pass
+        except Exception:
+            try:
+                if self._preview_canvas is not None:
+                    self._preview_canvas.draw_idle()
+            except Exception:
+                pass
+

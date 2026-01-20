@@ -3,14 +3,22 @@ import re
 
 from PySide6.QtCore import QSortFilterProxyModel, QModelIndex, Qt
 
-_RUN_FOLDER_RE = re.compile(r"^\d{8}_\d{6}$")  # YYYYMMDD_HHMMSS
+_RUN_FOLDER_RE = re.compile(
+    r"^(?:"
+    r"\d{8}_\d{6}"
+    r"|(?:CPU|GPU|CPUGPU)_W\d+_L\d+_V\d+"
+    # Compare result folders (created by GUI): "<case> CPU vs <case> CPUGPU" (+ optional suffix)
+    r"|.+\s(?:CPU|GPU|CPUGPU)\svs\s.+\s(?:CPU|GPU|CPUGPU)(?:\s\+\d+)?"
+    r")$",
+    re.IGNORECASE,
+)
 
 
 class RunsProxyModel(QSortFilterProxyModel):
     """
     Proxy model that:
     - Removes ALL icons (DecorationRole)
-    - Makes run folders (YYYYMMDD_HHMMSS) behave like leaf nodes:
+        - Makes run folders behave like leaf nodes:
       - Their children are filtered out
       - hasChildren/canFetchMore are forced False so no expand arrow appears
     """

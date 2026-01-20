@@ -33,6 +33,8 @@ from .widgets.ui_time_spin import make_time_spin
 from .graph_preview import GraphPreview
 from .sensor_manager import SensorManager
 from .benchmark_controller import BenchmarkController
+from .live_monitor_widget import LiveMonitorWidget
+from .live_graph_widget import LiveGraphWidget
 
 # keep if you have it
 from .runs_proxy_model import RunsProxyModel
@@ -43,6 +45,9 @@ from core.settings_store import get_settings_path, load_json, save_json
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
+
+        # Default startup size
+        DEFAULT_W, DEFAULT_H = 1300, 850
 
         # Enable custom titlebar by making window frameless
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
@@ -129,6 +134,13 @@ class MainWindow(QWidget):
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+
+        # Live monitor table (shown during runs)
+        self._live_monitor = LiveMonitorWidget(self)
+        self._live_graph = LiveGraphWidget(self)
+        self._output_stack = None
+        self._output_btn_live = None
+        self._output_btn_console = None
 
         self.live_timer = QLabel("Idle")
         self.live_timer.setObjectName("LiveTimer")
@@ -242,6 +254,10 @@ class MainWindow(QWidget):
             save_settings_callback=self.save_settings,
             get_settings_callback=self._get_current_settings,
             append_log_callback=self.append,
+            on_run_started=self._on_run_started,
+            on_run_finished=self._on_run_finished,
+            on_log_started=self._on_log_started,
+            on_log_finished=self._on_log_finished,
         )
 
         # Connect component signals
@@ -444,8 +460,85 @@ class MainWindow(QWidget):
         btns.addWidget(self.open_btn)
         root.addLayout(btns)
 
-        root.addWidget(self._bold_label("Output"))
-        root.addWidget(self.log)
+        # Output area: Live monitor (during run) + Console (log)
+        out_hdr = QHBoxLayout()
+        out_hdr.setContentsMargins(0, 0, 0, 0)
+        out_hdr.addWidget(self._bold_label("Output"))
+        out_hdr.addStretch(1)
+
+        def _mk_out_btn(text: str):
+            b = QPushButton(text)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setCheckable(True)
+            b.setStyleSheet(
+                """
+                QPushButton {
+                    background: #2A2A2A;
+                    color: #EAEAEA;
+                    border: 1px solid #3A3A3A;
+                    border-radius: 6px;
+                    padding: 6px 12px;
+                    font-size: 12px;
+                }
+                QPushButton:hover { background: #333333; border-color: #4A4A4A; }
+                QPushButton:pressed { background: #252525; }
+                QPushButton:checked { background: #1F2B1F; border-color: #2E4A2E; }
+                """
+            )
+            return b
+
+        self._output_btn_live = _mk_out_btn("Live")
+        self._output_btn_console = _mk_out_btn("Console")
+        self._output_btn_live.setAutoExclusive(True)
+        self._output_btn_console.setAutoExclusive(True)
+
+        out_hdr.addWidget(self._output_btn_live)
+        out_hdr.addWidget(self._output_btn_console)
+        root.addLayout(out_hdr)
+
+        # Live panel: left = table, right = live graph
+        live_panel = QWidget()
+        live_layout = QVBoxLayout(live_panel)
+        live_layout.setContentsMargins(0, 0, 0, 0)
+        live_layout.setSpacing(0)
+
+        self._live_split = QSplitter(Qt.Horizontal)
+        try:
+            self._live_split.setCollapsible(0, False)
+            self._live_split.setCollapsible(1, False)
+        except Exception:
+            pass
+
+        self._live_split.addWidget(self._live_monitor)
+        self._live_split.addWidget(self._live_graph)
+
+        # Keep this run-layout ratio (table : graph)
+        self._live_split_ratio = (0.34, 0.66)  # tweak to match your screenshot exactly
+
+        live_layout.addWidget(self._live_split, 1)
+
+        # Stream samples from the table parser to the live graph
+        try:
+            self._live_monitor.sample_updated.connect(self._live_graph.on_sample)
+        except Exception:
+            pass
+
+        # Stream (de)selection from the live table to the live graph
+        try:
+            self._live_monitor.active_columns_changed.connect(self._live_graph.set_active_columns)
+        except Exception:
+            pass
+
+        self._output_stack = QStackedWidget()
+        self._output_stack.addWidget(live_panel)          # index 0
+        self._output_stack.addWidget(self.log)            # index 1
+        self._output_stack.setCurrentIndex(1)
+        self._output_btn_console.setChecked(True)
+
+        self._output_btn_live.clicked.connect(lambda *_: self._output_stack.setCurrentIndex(0))
+        self._output_btn_console.clicked.connect(lambda *_: self._output_stack.setCurrentIndex(1))
+
+        root.addWidget(self._output_stack, 1)
 
         # --------------------------
         # Results page
@@ -490,7 +583,7 @@ class MainWindow(QWidget):
             splitter.setStretchFactor(1, 1)
             splitter.setCollapsible(0, False)
             splitter.setCollapsible(1, False)
-            total = self.width() or 1200
+            total = self.width() or DEFAULT_W
             left = max(120, int(total * 0.25))
             right = max(400, total - left)
             splitter.setSizes([left, right])
@@ -512,7 +605,7 @@ class MainWindow(QWidget):
         self._btn_run_page.setChecked(True)
         self._stack.setCurrentIndex(self._page_run_index)
 
-        self.resize(1200, 800)
+        self.resize(DEFAULT_W, DEFAULT_H)
 
         # Load settings and initialize state
         self.load_settings()
@@ -596,10 +689,14 @@ class MainWindow(QWidget):
             "log_total_sec": logsec,
             "hwinfo_csv": self.hwinfo_edit.text().strip(),
             "fur_demo": fur_demo,
+            "fur_demo_display": demo_display,
             "fur_width": fur_w,
             "fur_height": fur_h,
+            "fur_res_display": res_display,
             "furmark_exe": self.furmark_exe,
             "prime_exe": self.prime_exe,
+            "stress_cpu": bool(getattr(self.sensors, "stress_cpu", True)),
+            "stress_gpu": bool(getattr(self.sensors, "stress_gpu", True)),
         }
 
     # ---------- settings ----------
@@ -709,6 +806,59 @@ class MainWindow(QWidget):
         """Append text to log."""
         self.log.append(text.rstrip())
 
+    # ---------- live monitor hooks ----------
+    def _on_run_started(self, settings: dict, columns: list[str]) -> None:
+        try:
+            csv_path = str((settings or {}).get("hwinfo_csv") or "").strip()
+            cols = [str(c) for c in (columns or []) if str(c).strip()]
+
+            try:
+                self._live_monitor.start(csv_path=csv_path, columns=cols)
+                self._live_graph.start(columns=cols)
+            except Exception:
+                pass
+
+            if self._output_stack is not None:
+                self._output_stack.setCurrentIndex(0)
+                QTimer.singleShot(0, self._apply_live_split_ratio)
+            if self._output_btn_live is not None:
+                self._output_btn_live.setChecked(True)
+        except Exception:
+            pass
+
+        self._apply_live_split_ratio()
+
+    def _on_run_finished(self) -> None:
+        try:
+            try:
+                self._live_monitor.stop()
+                self._live_graph.stop()
+            except Exception:
+                pass
+
+            if self._output_stack is not None:
+                self._output_stack.setCurrentIndex(1)
+            if self._output_btn_console is not None:
+                self._output_btn_console.setChecked(True)
+        except Exception:
+            pass
+
+    def _on_log_started(self) -> None:
+        """Called when warmup ends and the logging window begins."""
+        try:
+            self._live_monitor.reset_window_stats()
+            self._live_graph.mark_phase_boundary()
+        except Exception:
+            pass
+
+    def _on_log_finished(self) -> None:
+        """Called when the logging window ends (freeze live stats)."""
+        try:
+            self._live_monitor.stop()
+            self._live_graph.stop()
+        except Exception:
+            pass
+
     def pick_hwinfo(self):
         """Open file dialog to select HWiNFO CSV."""
         path, _ = QFileDialog.getOpenFileName(self, "Select hwinfo.csv", str(Path.cwd()), "CSV Files (*.csv)")
@@ -723,3 +873,39 @@ class MainWindow(QWidget):
             self._runs_tree.collapse(index)
         else:
             self._runs_tree.expand(index)
+
+    def _apply_live_split_ratio(self) -> None:
+        try:
+            sp = getattr(self, "_live_split", None)
+            if sp is None:
+                return
+
+            w = max(1, sp.width())
+            a, b = getattr(self, "_live_split_ratio", (0.34, 0.66))
+
+            left = int(w * float(a))
+            right = max(1, w - left)
+
+            # Avoid splitter "drift"
+            sp.blockSignals(True)
+            try:
+                sp.setSizes([left, right])
+                try:
+                    self._live_graph._relayout_visible_axes()
+                    self._live_graph._update_phase_labels()
+                    self._live_graph._canvas.draw_idle()
+                except Exception:
+                    pass
+            finally:
+                sp.blockSignals(False)
+        except Exception:
+            pass
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        try:
+            # only enforce while Live output is shown
+            if self._output_stack is not None and self._output_stack.currentIndex() == 0:
+                QTimer.singleShot(0, self._apply_live_split_ratio)
+        except Exception:
+            pass

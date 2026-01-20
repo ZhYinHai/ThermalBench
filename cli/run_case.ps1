@@ -94,6 +94,44 @@ function Countdown-OrAbort($seconds, $label) {
   }
 }
 
+function Get-RunName([string]$CaseName, [int]$WarmupSec, [int]$LogSec, [switch]$StressCPU, [switch]$StressGPU) {
+  # Stress prefix
+  $stressName = ""
+  if ($StressCPU.IsPresent -and $StressGPU.IsPresent) { $stressName = "CPUGPU" }
+  elseif ($StressCPU.IsPresent) { $stressName = "CPU" }
+  elseif ($StressGPU.IsPresent) { $stressName = "GPU" }
+  else { $stressName = "CPU" }
+
+  # Convert seconds -> minutes for naming (UI uses minute-based inputs)
+  $wMin = [int][math]::Round(($WarmupSec / 60.0), 0)
+  $lMin = [int][math]::Round(($LogSec / 60.0), 0)
+  if ($wMin -lt 0) { $wMin = 0 }
+  if ($lMin -lt 0) { $lMin = 0 }
+
+  $base = ("{0}_W{1}_L{2}" -f $stressName, $wMin, $lMin)
+
+  # Auto-increment version if same base already exists for this case.
+  $repoRoot = Split-Path -Parent $PSScriptRoot
+  $caseDir = Join-Path $repoRoot ("runs\{0}" -f $CaseName)
+  New-Item -ItemType Directory -Force $caseDir | Out-Null
+
+  $re = ("^{0}_V(\\d+)$" -f [regex]::Escape($base))
+  $maxV = 0
+  try {
+    Get-ChildItem -LiteralPath $caseDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+      $n = $_.Name
+      if ($n -match $re) {
+        $v = 0
+        try { $v = [int]$matches[1] } catch { $v = 0 }
+        if ($v -gt $maxV) { $maxV = $v }
+      }
+    }
+  } catch {}
+
+  $nextV = $maxV + 1
+  return ("{0}_V{1}" -f $base, $nextV)
+}
+
 function Start-StressTools {
   # return pids even if one tool is not started
   $furPid = 0
@@ -197,10 +235,26 @@ try {
   Write-Host "GUI_TIMER:WARMUP_START"
   Countdown-OrAbort -seconds $WarmupSec -label "Warm-up (stress ON, logging IGNORE)"
 
-  $runId  = Get-Date -Format "yyyyMMdd_HHmmss"
+  $runId  = Get-RunName -CaseName $CaseName -WarmupSec $WarmupSec -LogSec $LogSec -StressCPU:$StressCPU -StressGPU:$StressGPU
   # Place run outputs at repository-level `runs/` (one level above this script's folder)
   $repoRoot = Split-Path -Parent $PSScriptRoot
+
+  # Safety net: never reuse an existing output directory (prevents overwriting prior runs)
+  $m = [regex]::Match($runId, '^(.*)_V(\d+)$')
+  $base = $runId
+  $v = 1
+  if ($m.Success) {
+    $base = $m.Groups[1].Value
+    try { $v = [int]$m.Groups[2].Value } catch { $v = 1 }
+  }
+
   $outDir = Join-Path $repoRoot ("runs\{0}\{1}" -f $CaseName, $runId)
+  while (Test-Path -LiteralPath $outDir) {
+    $v = $v + 1
+    $runId = ("{0}_V{1}" -f $base, $v)
+    $outDir = Join-Path $repoRoot ("runs\{0}\{1}" -f $CaseName, $runId)
+  }
+
   New-Item -ItemType Directory -Force $outDir | Out-Null
   Write-Host ""
   Write-Host "RUN MAP: $outDir"
@@ -213,6 +267,8 @@ try {
 
   $windowEnd = Get-Date
   Write-Host ("WindowEnd:   {0}" -f $windowEnd.ToString("yyyy-MM-dd HH:mm:ss.fff"))
+
+  Write-Host "GUI_TIMER:LOG_END"
 
 } catch {
   if ($_.Exception.Message -eq "ABORT") {
