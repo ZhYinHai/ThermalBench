@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QDialogButtonBox,
     QCheckBox,
+    QMessageBox,
 )
 from PySide6.QtWidgets import QComboBox
 from PySide6.QtGui import QPalette, QColor
@@ -35,8 +36,11 @@ class SettingsDialog(QDialog):
         furmark_exe: str,
         prime_exe: str,
         theme: str,
+        update_callback=None,
     ):
         super().__init__(parent)
+
+        self._update_callback = update_callback
 
         self.corner_radius = 12
         apply_rounded_corners(self, self.corner_radius)
@@ -110,6 +114,18 @@ class SettingsDialog(QDialog):
         root.addLayout(row)
 
 
+        # --- Updates ---
+        if self._update_callback is not None:
+            upd_row = QHBoxLayout()
+            upd_row.addWidget(QLabel("Updates"))
+            self.check_updates_btn = QPushButton("Check for updates…")
+            self.check_updates_btn.clicked.connect(self._on_check_updates)
+            upd_row.addWidget(self.check_updates_btn)
+            upd_row.addStretch(1)
+            upd_row.setSpacing(10)
+            root.addLayout(upd_row)
+
+
         # --- Buttons ---
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
@@ -117,6 +133,15 @@ class SettingsDialog(QDialog):
         root.addWidget(btns)
 
         self.resize(640, 260)
+
+    def _on_check_updates(self) -> None:
+        try:
+            cb = getattr(self, "_update_callback", None)
+            if cb is None:
+                return
+            cb()
+        except Exception as e:
+            QMessageBox.warning(self, "Update", f"Could not start update check:\n\n{e}")
 
     def _resolve_theme(self, t: str) -> str:
         """Resolve a theme value to 'light' or 'dark'.

@@ -29,7 +29,7 @@ class InteractiveCanvas(FigureCanvas):
             elif et == QEvent.Leave:
                 self.pointer_left.emit()
 
-            # Critical: switching to another app (Chrome) triggers these
+            # Critical: switching to another app triggers these
             elif et in (QEvent.WindowDeactivate, QEvent.FocusOut):
                 self.focus_lost.emit()
 

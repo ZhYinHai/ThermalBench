@@ -1,8 +1,9 @@
 # ui/main_window.py
+import sys
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QSize, QTimer
+from PySide6.QtCore import Qt, QSize, QTimer, QObject, QThread, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QWidget,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QStackedWidget,
     QFrame,
+    QMessageBox,
 )
 
 from .widgets.ui_theme import apply_theme, style_combobox_popup
@@ -40,6 +42,58 @@ from .live_graph_widget import LiveGraphWidget
 from .runs_proxy_model import RunsProxyModel
 
 from core.settings_store import get_settings_path, load_json, save_json
+
+from core.version import __version__
+from core.updater import (
+    ReleaseInfo,
+    UpdateError,
+    download_release_asset,
+    fetch_latest_release_info,
+    is_newer_version,
+    launch_installer,
+)
+
+
+# Manual update checker (Windows-only)
+GITHUB_OWNER = "ZhYinHai"
+GITHUB_REPO = "ThermalBench"
+INSTALLER_PREFIX = "ThermalBench-Setup-v"
+
+
+class _FetchLatestReleaseWorker(QObject):
+    finished = Signal(object)  # ReleaseInfo
+    failed = Signal(str)
+
+    def __init__(self, owner: str, repo: str, installer_prefix: str):
+        super().__init__()
+        self._owner = owner
+        self._repo = repo
+        self._installer_prefix = installer_prefix
+
+    def run(self) -> None:
+        try:
+            info = fetch_latest_release_info(
+                self._owner, self._repo, installer_prefix=self._installer_prefix
+            )
+            self.finished.emit(info)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class _DownloadInstallerWorker(QObject):
+    finished = Signal(str)  # installer_path
+    failed = Signal(str)
+
+    def __init__(self, release: ReleaseInfo):
+        super().__init__()
+        self._release = release
+
+    def run(self) -> None:
+        try:
+            installer_path = download_release_asset(self._release)
+            self.finished.emit(str(installer_path))
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 class MainWindow(QWidget):
@@ -623,6 +677,16 @@ class MainWindow(QWidget):
         self.fur_res_combo.currentIndexChanged.connect(lambda *_: self.save_settings())
         self.hwinfo_edit.textChanged.connect(lambda *_: self._update_run_button_state())
 
+        # Update threads (kept as attributes to avoid GC)
+        self._update_fetch_thread = None
+        self._update_fetch_worker = None
+        self._update_download_thread = None
+        self._update_download_worker = None
+        self._update_in_progress = False
+
+    def _set_update_busy(self, busy: bool) -> None:
+        self._update_in_progress = bool(busy)
+
     # ---------- rail/page switching ----------
     def _on_page_changed(self, index: int) -> None:
         try:
@@ -671,6 +735,124 @@ class MainWindow(QWidget):
                 pass
         else:
             self.run_btn.setToolTip("Start the test")
+
+    # ---------- manual update checker ----------
+    def check_for_updates(self) -> None:
+        if sys.platform != "win32":
+            QMessageBox.information(self, "Update", "Update checking is Windows-only.")
+            return
+
+        if getattr(self, "_update_in_progress", False):
+            QMessageBox.information(self, "Update", "An update check is already running.")
+            return
+
+        if not GITHUB_OWNER or not GITHUB_REPO:
+            QMessageBox.warning(
+                self,
+                "Update",
+                "GitHub repo is not configured. Set GITHUB_OWNER and GITHUB_REPO in ui/main_window.py.",
+            )
+            return
+
+        self._set_update_busy(True)
+
+        thread = QThread(self)
+        worker = _FetchLatestReleaseWorker(GITHUB_OWNER, GITHUB_REPO, INSTALLER_PREFIX)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_update_release_info)
+        worker.failed.connect(self._on_update_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self._update_fetch_thread = thread
+        self._update_fetch_worker = worker
+        thread.start()
+
+    def _on_update_failed(self, reason: str) -> None:
+        self._set_update_busy(False)
+        QMessageBox.warning(self, "Update", f"Update check failed:\n\n{reason}")
+
+    def _on_update_release_info(self, release: ReleaseInfo) -> None:
+        try:
+            newer = is_newer_version(__version__, release.version)
+        except Exception as e:
+            self._set_update_busy(False)
+            QMessageBox.warning(self, "Update", f"Could not compare versions:\n\n{e}")
+            return
+
+        if not newer:
+            self._set_update_busy(False)
+            QMessageBox.information(
+                self,
+                "Update",
+                f"You are up to date.\n\nInstalled: {__version__}\nLatest: {release.version}",
+            )
+            return
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Update Available")
+        box.setText(f"A new version is available: {release.version}")
+        box.setInformativeText(f"Installed: {__version__}\n\nDownload and install?")
+        if release.notes:
+            box.setDetailedText(release.notes)
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.Yes)
+
+        if box.exec() != QMessageBox.Yes:
+            self._set_update_busy(False)
+            return
+
+        # Download in background
+        thread = QThread(self)
+        worker = _DownloadInstallerWorker(release)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_update_downloaded)
+        worker.failed.connect(self._on_update_download_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self._update_download_thread = thread
+        self._update_download_worker = worker
+        thread.start()
+
+    def _on_update_download_failed(self, reason: str) -> None:
+        self._set_update_busy(False)
+        QMessageBox.warning(self, "Update", f"Download failed:\n\n{reason}")
+
+    def _on_update_downloaded(self, installer_path_str: str) -> None:
+        installer_path = Path(installer_path_str)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Install Update")
+        box.setText("Installer downloaded.")
+        box.setInformativeText(f"Install now?\n\n{installer_path}")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.Yes)
+
+        if box.exec() != QMessageBox.Yes:
+            self._set_update_busy(False)
+            return
+
+        try:
+            launch_installer(installer_path)
+        except Exception as e:
+            self._set_update_busy(False)
+            QMessageBox.warning(self, "Update", f"Failed to start installer:\n\n{e}")
+            return
+
+        QApplication.quit()
 
     def _get_current_settings(self) -> dict:
         """Get current settings as a dictionary."""
@@ -780,6 +962,7 @@ class MainWindow(QWidget):
             furmark_exe=self.furmark_exe,
             prime_exe=self.prime_exe,
             theme=self.theme_mode,
+            update_callback=self.check_for_updates,
         )
         if dlg.exec() != QDialog.Accepted:
             return

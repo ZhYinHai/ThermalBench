@@ -16,6 +16,8 @@ import argparse
 import csv
 import json
 import re
+import sys
+import unicodedata
 from pathlib import Path
 from typing import Optional, Tuple, List
 
@@ -72,14 +74,49 @@ def sanitize(name: str) -> str:
 
 
 def sniff_encoding(path: Path) -> str:
-    for enc in ("utf-8-sig", "utf-8", "cp1252"):
+    """Best-effort encoding detection for HWiNFO CSV.
+
+    HWiNFO CSV exports are typically ANSI/Windows-1252 or UTF-8, but some
+    systems/tools may produce UTF-16 with BOM.
+    """
+    try:
+        head = path.read_bytes()[:4]
+    except Exception:
+        head = b""
+
+    if head.startswith(b"\xff\xfe") or head.startswith(b"\xfe\xff"):
+        return "utf-16"
+    if head.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+
+    for enc in ("utf-8", "utf-8-sig", "cp1252"):
         try:
             with open(path, "r", encoding=enc, newline="") as f:
                 f.readline()
             return enc
         except Exception:
             continue
-    return "utf-8-sig"
+    return "cp1252"
+
+
+def norm_hwinfo_text(s: str) -> str:
+    """Normalize common HWiNFO header/pattern text issues.
+
+    - Fix broken degree symbol renderings ("\ufffdC", "\u00c2\u00b0C").
+    - Apply Unicode normalization and whitespace cleanup.
+    """
+    s = str(s)
+
+    # Common mojibake / replacement-char variants
+    s = s.replace("[\ufffdC]", "[\u00b0C]").replace("\ufffdC", "\u00b0C")
+    s = s.replace("\u00c2\u00b0", "\u00b0")  # "Â°" -> "°"
+    s = s.replace("[\u00c2\u00b0C]", "[\u00b0C]")
+
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.strip().strip('"')
+    return s
 
 
 def read_raw_header(path: Path, encoding: str) -> List[str]:
@@ -91,7 +128,7 @@ def read_raw_header(path: Path, encoding: str) -> List[str]:
 
     cleaned = []
     for i, h in enumerate(header):
-        h = str(h).strip().strip('"')
+        h = norm_hwinfo_text(h)
         if h == "":
             h = f"__EMPTY_{i}__"
         cleaned.append(h)
@@ -119,7 +156,14 @@ def parse_dt_series(date_s: pd.Series, time_s: pd.Series) -> pd.Series:
 
 
 def add_spd_hub_max(df: pd.DataFrame) -> None:
-    """Add derived: 'SPD Hub Max [°C]' = row-wise max of all SPD Hub Temperature columns."""
+    """Add derived: 'SPD Hub Max [°C]' from SPD Hub sensors.
+
+    Definition:
+    - Find all columns matching "SPD Hub Temperature [°C]".
+    - Compute the average of each hub over the window.
+    - Pick the single hub with the highest average, and use *that hub's
+      time-series* as the derived "SPD Hub Max [°C]".
+    """
     spd_cols = [
         c for c in df.columns
         if re.match(r"^SPD Hub Temperature \[°C\](\s#\d+)?$", str(c))
@@ -128,7 +172,13 @@ def add_spd_hub_max(df: pd.DataFrame) -> None:
         return
 
     spd_numeric = df[spd_cols].apply(pd.to_numeric, errors="coerce")
-    df["SPD Hub Max [°C]"] = spd_numeric.max(axis=1)
+    means = spd_numeric.mean(axis=0, skipna=True)
+    means = means.dropna()
+    if means.empty:
+        return
+
+    best_col = str(means.idxmax())
+    df["SPD Hub Max [°C]"] = spd_numeric[best_col]
 
 
 def is_spd_individual(col: str) -> bool:
@@ -147,7 +197,7 @@ def select_series(df: pd.DataFrame, patterns: List[str]) -> List[str]:
     exact_map = {str(c).lower(): c for c in cols}
 
     selected: List[str] = []
-    patterns = patterns or []
+    patterns = [norm_hwinfo_text(p) for p in (patterns or [])]
 
     for p in patterns:
         p = str(p)
@@ -174,9 +224,14 @@ def select_series(df: pd.DataFrame, patterns: List[str]) -> List[str]:
             if rx.search(str(c)):
                 selected.append(c)
 
+    # Allow requesting this virtual/derived series without it existing as a raw CSV header.
+    virtual_exact = {"spd hub max [°c]"}
+
     missing_exact = [
         p for p in patterns
-        if (("[" in str(p)) or (" #" in str(p))) and (str(p).lower() not in exact_map)
+        if (("[" in str(p)) or (" #" in str(p)))
+        and (str(p).lower() not in exact_map)
+        and (str(p).lower() not in virtual_exact)
     ]
     if missing_exact:
         raise SystemExit("Exact columns not found in CSV:\n- " + "\n- ".join(missing_exact))
@@ -187,8 +242,17 @@ def select_series(df: pd.DataFrame, patterns: List[str]) -> List[str]:
     selected = [c for c in selected if not (c in seen or seen.add(c))]
 
     # SPD logic
-    spd_requested = any("spd hub" in str(p).lower() for p in patterns) or any(is_spd_individual(c) for c in selected)
+    spd_max_requested = any(str(p).lower() == "spd hub max [°c]" for p in patterns)
+    spd_requested = spd_max_requested or any("spd hub" in str(p).lower() for p in patterns) or any(is_spd_individual(c) for c in selected)
     selected = [c for c in selected if not is_spd_individual(c)]
+
+    if spd_requested and "SPD Hub Max [°C]" not in df.columns:
+        print(
+            "[WARN] Requested SPD Hub Max, but no 'SPD Hub Temperature [°C]' columns were found in the CSV to compute it. "
+            "Skipping SPD Hub Max.",
+            file=sys.stderr,
+        )
+
     if spd_requested and "SPD Hub Max [°C]" in df.columns and "SPD Hub Max [°C]" not in selected:
         selected.append("SPD Hub Max [°C]")
 
@@ -312,6 +376,9 @@ def main():
         window_start=args.window_start,
         window_end=args.window_end,
     )
+
+    # Normalize loaded column names (helps with degree symbol / whitespace issues)
+    df.columns = make_unique([norm_hwinfo_text(c) for c in df.columns])
 
     add_spd_hub_max(df)
 
