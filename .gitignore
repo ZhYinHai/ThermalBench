@@ -11,6 +11,14 @@ temptesting_abort.flag
 dist/
 build/
 *.spec.bak
+
+# Inno Setup output (upload to GitHub Releases, don't commit)
+dist_installer/
+*.exe
+
+# Optional: keep other build artifacts out of git
+*.msi
+*.msix
 # Large files
 *.zip
 ThermalBench.zip
