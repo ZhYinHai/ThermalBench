@@ -78,6 +78,13 @@ class BenchmarkController:
         self._runs_root = runs_root
         self._graph_preview = graph_preview
         self._sensor_manager = sensor_manager
+
+        # Debounced preview scheduling: selecting a result can trigger heavy CSV parsing
+        # + matplotlib replot. Scheduling it to the next tick gives immediate UI feedback
+        # (selection highlight) and collapses rapid selection changes into one preview.
+        self._pending_preview_target: Optional[str] = None
+        self._pending_preview_is_dir: bool = False
+        self._preview_debounce_timer: Optional[QTimer] = None
         self._save_settings = save_settings_callback
         self._get_settings = get_settings_callback
         self._append_log = append_log_callback
@@ -146,6 +153,57 @@ class BenchmarkController:
 
         self._update_remove_btn_state()
         self._update_compare_btn_state()
+
+    def _schedule_preview_target(self, *, fpath: str, is_dir: bool) -> None:
+        try:
+            self._pending_preview_target = str(fpath)
+            self._pending_preview_is_dir = bool(is_dir)
+
+            if self._preview_debounce_timer is None:
+                t = QTimer(self.parent)
+                t.setSingleShot(True)
+                try:
+                    t.setTimerType(Qt.PreciseTimer)
+                except Exception:
+                    pass
+                t.timeout.connect(self._apply_pending_preview_target)
+                self._preview_debounce_timer = t
+
+            # 0ms => next event-loop turn (lets selection paint first)
+            self._preview_debounce_timer.start(0)
+        except Exception:
+            # Fallback: run immediately
+            try:
+                if is_dir:
+                    self._graph_preview.preview_folder(str(fpath))
+                else:
+                    self._graph_preview.preview_path(str(fpath))
+            except Exception:
+                pass
+
+    def _apply_pending_preview_target(self) -> None:
+        tgt = None
+        is_dir = False
+        try:
+            tgt = self._pending_preview_target
+            is_dir = bool(self._pending_preview_is_dir)
+        except Exception:
+            tgt = None
+
+        if not tgt:
+            return
+
+        # If we're suppressing previews (during programmatic selection changes), bail.
+        if getattr(self, "_suppress_selection_preview", False):
+            return
+
+        try:
+            if is_dir:
+                self._graph_preview.preview_folder(str(tgt))
+            else:
+                self._graph_preview.preview_path(str(tgt))
+        except Exception:
+            pass
 
     # -------------------------------------------------------------------------
     # compare + selection helpers
@@ -691,13 +749,10 @@ class BenchmarkController:
                 return
 
             if p.is_dir():
-                try:
-                    self._graph_preview.preview_folder(str(p))
-                except Exception:
-                    pass
+                self._schedule_preview_target(fpath=str(p), is_dir=True)
                 return
 
-            self._graph_preview.preview_path(fpath)
+            self._schedule_preview_target(fpath=fpath, is_dir=False)
         except Exception:
             pass
 

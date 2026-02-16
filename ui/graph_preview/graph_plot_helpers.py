@@ -36,7 +36,16 @@ def extract_unit_from_column(col_name: str) -> str:
     """
     match = re.search(r'\[([^\]]+)\]', str(col_name))
     if match:
-        return match.group(1)
+        unit = str(match.group(1))
+        # Normalize common CSV encoding artifacts (e.g. 'Â°C', 'Â%').
+        try:
+            unit = unit.replace("\ufeff", "")
+            unit = unit.replace("\u00a0", " ")
+            unit = unit.replace("Â", "")
+            unit = unit.strip()
+        except Exception:
+            pass
+        return unit
     return "other"
 
 

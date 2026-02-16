@@ -576,7 +576,11 @@ class LegendStatsPopup(QDialog):
             v = float(v)
             if not math.isfinite(v):
                 return ""
-            return f"{v:.1f}"
+            # Avoid displaying "-0.0" due to floating rounding noise.
+            v1 = round(v, 1)
+            if v1 == 0:
+                v1 = 0.0
+            return f"{v1:.1f}"
         except Exception:
             return ""
 
@@ -614,6 +618,12 @@ class LegendStatsPopup(QDialog):
             for unit, group_cols in sorted(list(groups.items()), key=group_sort_key):
                 if not group_cols:
                     continue
+
+                # Only temperature measurements should show Room/Delta.
+                try:
+                    is_temp_group = str(get_measurement_type_label(unit)).strip().lower() == "temperature"
+                except Exception:
+                    is_temp_group = False
 
                 # Header row
                 try:
@@ -658,11 +668,15 @@ class LegendStatsPopup(QDialog):
 
                     # Add Room and Delta columns if room temperature is provided
                     if self._room_temperature is not None:
-                        it.setText(4, self._fmt_stat(self._room_temperature))
-                        try:
-                            delta = av - self._room_temperature
-                            it.setText(5, self._fmt_stat(delta))
-                        except Exception:
+                        if is_temp_group:
+                            it.setText(4, self._fmt_stat(self._room_temperature))
+                            try:
+                                delta = av - self._room_temperature
+                                it.setText(5, self._fmt_stat(delta))
+                            except Exception:
+                                it.setText(5, "")
+                        else:
+                            it.setText(4, "")
                             it.setText(5, "")
 
                     num_stat_cols = 5 if self._room_temperature is not None else 3

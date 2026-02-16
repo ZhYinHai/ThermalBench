@@ -108,7 +108,8 @@ class MainWindow(QWidget):
         super().__init__()
 
         # Default startup size
-        DEFAULT_W, DEFAULT_H = 1300, 850
+        DEFAULT_W, DEFAULT_H = 1366, 768
+        self.resize(DEFAULT_W, DEFAULT_H)
 
         # Enable custom titlebar by making window frameless
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
@@ -614,6 +615,15 @@ class MainWindow(QWidget):
         results_layout.setSpacing(8)
 
         splitter = QSplitter(Qt.Horizontal)
+        # Results page splitter: keep the folder tree around ~20% of window width by default.
+        # If the user drags the splitter, we remember their ratio and preserve it on resize.
+        self._results_split = splitter
+        self._results_split_ratio = (0.15, 0.85)
+        self._results_split_user_set = False
+        try:
+            splitter.splitterMoved.connect(self._on_results_splitter_moved)
+        except Exception:
+            pass
         tree_panel = QWidget()
         tree_panel.setStyleSheet("""
             QWidget {
@@ -649,7 +659,7 @@ class MainWindow(QWidget):
             splitter.setCollapsible(0, False)
             splitter.setCollapsible(1, False)
             total = self.width() or DEFAULT_W
-            left = max(120, int(total * 0.25))
+            left = max(120, int(total * 0.20))
             right = max(400, total - left)
             splitter.setSizes([left, right])
         except Exception:
@@ -671,6 +681,12 @@ class MainWindow(QWidget):
         self._stack.setCurrentIndex(self._page_run_index)
 
         self.resize(DEFAULT_W, DEFAULT_H)
+
+        # Apply results splitter ratio once after initial layout.
+        try:
+            QTimer.singleShot(0, self._apply_results_split_ratio)
+        except Exception:
+            pass
 
         # Load settings and initialize state
         self.load_settings()
@@ -781,6 +797,7 @@ class MainWindow(QWidget):
             if index == getattr(self, "_page_results_index", -1):
                 # Let the UI finish switching tabs first, then select/plot.
                 QTimer.singleShot(0, self.benchmark.select_latest_result)
+                QTimer.singleShot(0, self._apply_results_split_ratio)
         except Exception:
             pass
 
@@ -1296,11 +1313,58 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
+    def _on_results_splitter_moved(self, *_args) -> None:
+        try:
+            sp = getattr(self, "_results_split", None)
+            if sp is None:
+                return
+            sizes = list(sp.sizes() or [])
+            if len(sizes) < 2:
+                return
+            total = float(max(1, int(sizes[0]) + int(sizes[1])))
+            a = float(max(0.05, min(0.95, float(sizes[0]) / total)))
+            self._results_split_ratio = (a, 1.0 - a)
+            self._results_split_user_set = True
+        except Exception:
+            pass
+
+    def _apply_results_split_ratio(self) -> None:
+        try:
+            sp = getattr(self, "_results_split", None)
+            if sp is None:
+                return
+
+            # Only enforce while Results page is visible.
+            try:
+                if getattr(self, "_stack", None) is not None:
+                    if self._stack.currentIndex() != getattr(self, "_page_results_index", -1):
+                        return
+            except Exception:
+                pass
+
+            w = max(1, sp.width())
+            a, _b = getattr(self, "_results_split_ratio", (0.20, 0.80))
+            left = max(120, int(w * float(a)))
+            right = max(1, w - left)
+
+            sp.blockSignals(True)
+            try:
+                sp.setSizes([left, right])
+            finally:
+                sp.blockSignals(False)
+        except Exception:
+            pass
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         try:
             # only enforce while Live output is shown
             if self._output_stack is not None and self._output_stack.currentIndex() == 0:
                 QTimer.singleShot(0, self._apply_live_split_ratio)
+        except Exception:
+            pass
+
+        try:
+            QTimer.singleShot(0, self._apply_results_split_ratio)
         except Exception:
             pass

@@ -604,14 +604,9 @@ def main():
 
     pd.DataFrame(summary).to_csv(outdir / "summary.csv", index=False)
 
-    # Create JSON file for manual average temperature entry
-    avg_temp_json = {
-        "manual_average_temperature": None,
-        "unit": "°C",
-        "notes": "",
-        "last_updated": None
-    }
-    (outdir / "avg_temperature.json").write_text(json.dumps(avg_temp_json, indent=2), encoding="utf-8")
+    # NOTE: We no longer create avg_temperature.json for new runs.
+    # Ambient temperature for deltas is sourced from the ambient sensor series
+    # (merged into run_window.csv) and legacy runs can still provide the JSON.
 
 
 if __name__ == "__main__":

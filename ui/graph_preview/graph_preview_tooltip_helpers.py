@@ -28,6 +28,85 @@ def on_preview_draw(gp: Any, event=None) -> None:
                 gp._ls_btn_bbox = gp._ls_btn_text.get_window_extent(renderer)
             else:
                 gp._ls_btn_bbox = None
+
+            # Temperature delta toggle button: place it just to the left of the
+            # Legend & stats button and cache its bbox for hit testing.
+            try:
+                if getattr(gp, "_delta_btn_text", None) is not None:
+                    # If we have the LS bbox, position the delta button by pixel offset.
+                    if gp._ls_btn_bbox is not None:
+                        gap_px = 14.0
+                        # Find the desired RIGHT edge in display coords.
+                        desired_right_x = float(gp._ls_btn_bbox.x0) - gap_px
+
+                        # Use the delta button's own axes for transforms (works in multi-axis too).
+                        ax_btn = getattr(gp._delta_btn_text, "axes", None) or gp._preview_ax
+                        y_axes = 0.995
+                        try:
+                            # For multi-axis mode, delta/ls are drawn at y=1.02; keep the same anchor.
+                            _px, _py = gp._delta_btn_text.get_position()
+                            y_axes = float(_py)
+                        except Exception:
+                            y_axes = 0.995
+
+                        _x0_disp, y0_disp = ax_btn.transAxes.transform((0.995, y_axes))
+                        new_axes_x, _ = ax_btn.transAxes.inverted().transform((desired_right_x, y0_disp))
+                        try:
+                            gp._delta_btn_text.set_position((float(new_axes_x), float(y_axes)))
+                        except Exception:
+                            pass
+
+                    gp._delta_btn_bbox = gp._delta_btn_text.get_window_extent(renderer)
+                else:
+                    gp._delta_btn_bbox = None
+            except Exception:
+                gp._delta_btn_bbox = None
+
+            # Zero-Y toggle button: place it just to the left of the ΔT button
+            # and cache its bbox for hit testing.
+            try:
+                if getattr(gp, "_zero_btn_text", None) is not None:
+                    if getattr(gp, "_delta_btn_bbox", None) is not None:
+                        gap_px = 18.0
+                        desired_right_x = float(gp._delta_btn_bbox.x0) - gap_px
+
+                        ax_btn = getattr(gp._zero_btn_text, "axes", None) or gp._preview_ax
+                        y_axes = 0.995
+                        try:
+                            _px, _py = gp._zero_btn_text.get_position()
+                            y_axes = float(_py)
+                        except Exception:
+                            y_axes = 0.995
+
+                        _x0_disp, y0_disp = ax_btn.transAxes.transform((0.995, y_axes))
+                        new_axes_x, _ = ax_btn.transAxes.inverted().transform((desired_right_x, y0_disp))
+                        try:
+                            gp._zero_btn_text.set_position((float(new_axes_x), float(y_axes)))
+                        except Exception:
+                            pass
+
+                    gp._zero_btn_bbox = gp._zero_btn_text.get_window_extent(renderer)
+
+                    # If styling changes (active state) make the bbox wider, ensure we still have
+                    # a clean gap by nudging left once if needed.
+                    try:
+                        if gp._delta_btn_bbox is not None and gp._zero_btn_bbox is not None:
+                            min_gap = 14.0
+                            max_right = float(gp._delta_btn_bbox.x0) - float(min_gap)
+                            if float(gp._zero_btn_bbox.x1) > max_right:
+                                shift = float(gp._zero_btn_bbox.x1) - max_right
+                                ax_btn = getattr(gp._zero_btn_text, "axes", None) or gp._preview_ax
+                                _px, _py = gp._zero_btn_text.get_position()
+                                x_disp, y_disp = ax_btn.transAxes.transform((float(_px), float(_py)))
+                                new_axes_x2, _ = ax_btn.transAxes.inverted().transform((float(x_disp) - shift, float(y_disp)))
+                                gp._zero_btn_text.set_position((float(new_axes_x2), float(_py)))
+                                gp._zero_btn_bbox = gp._zero_btn_text.get_window_extent(renderer)
+                    except Exception:
+                        pass
+                else:
+                    gp._zero_btn_bbox = None
+            except Exception:
+                gp._zero_btn_bbox = None
     except Exception:
         pass
 
@@ -68,6 +147,8 @@ def preview_invalidate_interaction_cache(gp: Any) -> None:
         gp._preview_tt_h_px = None
         gp._preview_tt_mode = "UR"
         gp._ls_btn_bbox = None
+        gp._delta_btn_bbox = None
+        gp._zero_btn_bbox = None
     except Exception:
         pass
     try:
