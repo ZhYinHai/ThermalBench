@@ -17,6 +17,7 @@ from ui.graph_preview.graph_plot_helpers import (
     apply_dark_axes_style,
     build_tab20_color_map,
     group_columns_by_unit,
+    get_measurement_type_label,
 )
 
 
@@ -186,11 +187,27 @@ class LiveGraphWidget(QFrame):
                 pass
             return
 
+        # Match LiveMonitorWidget ordering: keep Temperature on top.
+        _prio = {
+            "Temperature": 0,
+            "Voltage (V)": 1,
+            "Clock (MHz)": 2,
+            "Timing (T)": 3,
+            "Power (W)": 4,
+            "RPM": 5,
+            "Percentage (%)": 6,
+        }
         self._unit_order = list(units)
+        self._unit_order.sort(
+            key=lambda u: (
+                _prio.get(get_measurement_type_label(u), 99),
+                get_measurement_type_label(u),
+            )
+        )
         self._unit_cols = {u: list(groups_all.get(u, []) or []) for u in units}
 
-        n = len(units)
-        for i, unit in enumerate(units):
+        n = len(self._unit_order)
+        for i, unit in enumerate(self._unit_order):
             ax = self._fig.add_subplot(n, 1, i + 1)
             self._axes.append(ax)
             self._unit_axes[unit] = ax

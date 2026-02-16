@@ -13,6 +13,22 @@ datas = [
 binaries = []
 hiddenimports = []
 
+# Requests relies on certifi's CA bundle. In frozen apps the data file can be missed unless
+# we explicitly bundle it.
+try:
+    datas += collect_data_files('certifi')
+    # Be extra explicit: some PyInstaller layouts can still omit cacert.pem.
+    try:
+        import certifi
+
+        _ca_path = certifi.where()
+        if _ca_path:
+            datas += [(_ca_path, 'certifi')]
+    except Exception:
+        pass
+except Exception:
+    pass
+
 # Collect PySide6 explicitly (collect_all failed, so use individual helpers)
 try:
     hiddenimports += collect_submodules('PySide6')

@@ -58,6 +58,7 @@ class BenchmarkController:
         on_run_finished=None,
         on_log_started=None,
         on_log_finished=None,
+        on_ambient_csv=None,
     ):
         """
         runs_model: proxy model (or QFileSystemModel)
@@ -84,6 +85,7 @@ class BenchmarkController:
         self._on_run_finished = on_run_finished
         self._on_log_started = on_log_started
         self._on_log_finished = on_log_finished
+        self._on_ambient_csv = on_ambient_csv
 
         # Prevent double plotting when we programmatically set selection
         self._suppress_selection_preview = False
@@ -1087,6 +1089,20 @@ class BenchmarkController:
         data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", errors="replace")
         for line in data.splitlines():
             self._append_log(line)
+
+            # Ambient CSV path (emitted by run_case.ps1) so the GUI can include
+            # ambient in live plot + min/max/avg table.
+            if line.startswith("GUI_AMBIENT_CSV:"):
+                try:
+                    ambient_csv = line.split(":", 1)[1].strip()
+                except Exception:
+                    ambient_csv = ""
+                if ambient_csv:
+                    try:
+                        if callable(getattr(self, "_on_ambient_csv", None)):
+                            self._on_ambient_csv(str(ambient_csv))
+                    except Exception:
+                        pass
 
             if (not self._timer_started) and "GUI_TIMER:WARMUP_START" in line:
                 self._timer_started = True

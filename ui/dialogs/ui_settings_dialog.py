@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QDialogButtonBox,
     QCheckBox,
-    QMessageBox,
 )
 from PySide6.QtWidgets import QComboBox
 from PySide6.QtGui import QPalette, QColor
@@ -117,11 +116,15 @@ class SettingsDialog(QDialog):
         # --- Updates ---
         if self._update_callback is not None:
             upd_row = QHBoxLayout()
-            upd_row.addWidget(QLabel("Updates"))
             self.check_updates_btn = QPushButton("Check for updates…")
             self.check_updates_btn.clicked.connect(self._on_check_updates)
             upd_row.addWidget(self.check_updates_btn)
-            upd_row.addStretch(1)
+
+            self.update_status_label = QLabel("")
+            self.update_status_label.setWordWrap(True)
+            self.update_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self.update_status_label.setStyleSheet("color: #8A8A8A;")
+            upd_row.addWidget(self.update_status_label, 1)
             upd_row.setSpacing(10)
             root.addLayout(upd_row)
 
@@ -139,9 +142,34 @@ class SettingsDialog(QDialog):
             cb = getattr(self, "_update_callback", None)
             if cb is None:
                 return
-            cb()
+            cb(
+                set_status=self._set_update_status,
+                set_button_text=self.check_updates_btn.setText,
+                set_button_enabled=self.check_updates_btn.setEnabled,
+            )
         except Exception as e:
-            QMessageBox.warning(self, "Update", f"Could not start update check:\n\n{e}")
+            self._set_update_status(f"Error: {e}", "error")
+
+    def _set_update_status(self, text: str, level: str = "info") -> None:
+        """Set the inline update status message next to the update button."""
+        try:
+            lab = getattr(self, "update_status_label", None)
+            if lab is None:
+                return
+
+            lab.setText(text or "")
+
+            lvl = (level or "info").strip().lower()
+            if lvl in {"ok", "success"}:
+                lab.setStyleSheet("color: #2E7D32;")
+            elif lvl in {"warn", "warning"}:
+                lab.setStyleSheet("color: #9A6A00;")
+            elif lvl in {"error", "bad"}:
+                lab.setStyleSheet("color: #B00020;")
+            else:
+                lab.setStyleSheet("color: #8A8A8A;")
+        except Exception:
+            pass
 
     def _resolve_theme(self, t: str) -> str:
         """Resolve a theme value to 'light' or 'dark'.

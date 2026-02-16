@@ -345,6 +345,97 @@ def load_hwinfo_window_df(
     return df_out, first_ts, last_ts, total_rows
 
 
+def _load_ambient_log_df(ambient_csv: Path) -> pd.DataFrame:
+    """Load ambient log CSV produced by ambient_logger.py.
+
+    Expected columns:
+      - timestamp: "YYYY-MM-DD HH:MM:SS.mmm"
+      - ambient_c: float
+    """
+    df = pd.read_csv(ambient_csv, header=0)
+    if df.shape[0] == 0:
+        return pd.DataFrame(columns=["dt", "ambient_c"])
+
+    # Normalize column names
+    cols = {str(c).strip().lower(): str(c) for c in df.columns}
+    ts_col = cols.get("timestamp") or cols.get("time") or cols.get("datetime")
+    v_col = cols.get("ambient_c") or cols.get("ambient") or cols.get("value")
+    if not ts_col or not v_col:
+        return pd.DataFrame(columns=["dt", "ambient_c"])
+
+    dt = pd.to_datetime(df[ts_col].astype(str), errors="coerce")
+    amb = pd.to_numeric(df[v_col], errors="coerce")
+    out = pd.DataFrame({"dt": dt, "ambient_c": amb})
+    out = out.dropna(subset=["dt"]).sort_values("dt")
+    return out
+
+
+def _merge_ambient_into_hwinfo_df(
+    *,
+    df_hw: pd.DataFrame,
+    ambient_df: pd.DataFrame,
+    window_start: Optional[str],
+    window_end: Optional[str],
+    out_col_name: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Merge ambient readings into the HWiNFO window df by nearest timestamp.
+
+    Returns (df_hw_with_ambient, ambient_window_df).
+    """
+    if df_hw is None or df_hw.empty:
+        return df_hw, pd.DataFrame()
+    if ambient_df is None or ambient_df.empty:
+        return df_hw, pd.DataFrame()
+    if "Date" not in df_hw.columns or "Time" not in df_hw.columns:
+        return df_hw, pd.DataFrame()
+
+    dt_hw = parse_dt_series(df_hw["Date"], df_hw["Time"])
+    if not dt_hw.notna().any():
+        return df_hw, pd.DataFrame()
+
+    ws = pd.to_datetime(window_start, errors="coerce") if window_start else None
+    we = pd.to_datetime(window_end, errors="coerce") if window_end else None
+
+    tol = pd.Timedelta(seconds=2)
+
+    amb = ambient_df.copy()
+    if ws is not None and we is not None and (not pd.isna(ws)) and (not pd.isna(we)):
+        # Include a small pad so boundary rows still merge (nearest within tolerance).
+        amb = amb[(amb["dt"] >= (ws - tol)) & (amb["dt"] <= (we + tol))]
+    if amb.empty:
+        return df_hw, pd.DataFrame()
+
+    # Align ambient to each hwinfo row by nearest timestamp.
+    left = pd.DataFrame({"_row": df_hw.index.to_numpy(), "dt": dt_hw})
+    left = left.dropna(subset=["dt"]).sort_values("dt")
+
+    merged = pd.merge_asof(
+        left,
+        amb[["dt", "ambient_c"]].sort_values("dt"),
+        on="dt",
+        direction="nearest",
+        tolerance=tol,
+    )
+
+    # Create full-length aligned series
+    aligned = pd.Series(index=df_hw.index, dtype="float64")
+    try:
+        aligned.loc[merged["_row"].to_numpy()] = merged["ambient_c"].to_numpy(dtype=float)
+    except Exception:
+        # fallback: best-effort assignment
+        for _, r in merged.iterrows():
+            try:
+                aligned.loc[int(r["_row"])] = float(r["ambient_c"]) if pd.notna(r["ambient_c"]) else float("nan")
+            except Exception:
+                continue
+
+    df_hw = df_hw.copy()
+    df_hw[out_col_name] = aligned
+
+    amb_window = amb.copy()
+    return df_hw, amb_window
+
+
 # ----------------- main -----------------
 def main():
     ap = argparse.ArgumentParser()
@@ -355,6 +446,9 @@ def main():
     ap.add_argument("--window-start", default=None)
     ap.add_argument("--window-end", default=None)
     ap.add_argument("--export-window-csv", action="store_true")
+
+    ap.add_argument("--ambient-csv", default=None, help="Optional ambient log CSV (timestamp, ambient_c)")
+    ap.add_argument("--ambient-col-name", default="Ambient [°C]", help="Column name to use in outputs")
 
     args = ap.parse_args()
 
@@ -382,7 +476,32 @@ def main():
 
     add_spd_hub_max(df)
 
+    # Best-effort: merge ambient log as a virtual temperature series.
+    ambient_window_df = pd.DataFrame()
+    try:
+        if args.ambient_csv:
+            amb_path = Path(str(args.ambient_csv))
+            if amb_path.exists() and amb_path.is_file():
+                amb_df = _load_ambient_log_df(amb_path)
+                df, ambient_window_df = _merge_ambient_into_hwinfo_df(
+                    df_hw=df,
+                    ambient_df=amb_df,
+                    window_start=args.window_start,
+                    window_end=args.window_end,
+                    out_col_name=str(args.ambient_col_name),
+                )
+    except Exception:
+        ambient_window_df = pd.DataFrame()
+
     selected = select_series(df, args.patterns)
+
+    # Ensure ambient shows up in run_window.csv + plots + summary when available.
+    try:
+        amb_name = str(args.ambient_col_name)
+        if amb_name in df.columns and amb_name not in selected:
+            selected.append(amb_name)
+    except Exception:
+        pass
     if not selected:
         raise SystemExit("Geen kolommen geselecteerd. Check --patterns against your CSV headers.")
 
@@ -396,6 +515,16 @@ def main():
         cols += [c for c in selected if c in df.columns and c not in cols]
 
         (outdir / "run_window.csv").write_text(df[cols].to_csv(index=False), encoding="utf-8")
+
+        # Also export the ambient window slice for auditing (if we have it).
+        try:
+            if ambient_window_df is not None and not ambient_window_df.empty:
+                (outdir / "ambient_window.csv").write_text(
+                    ambient_window_df.to_csv(index=False),
+                    encoding="utf-8",
+                )
+        except Exception:
+            pass
 
         if args.window_start and args.window_end:
             (outdir / "window_check.txt").write_text(

@@ -67,4 +67,8 @@ Name: "{autoprograms}\\{#MyAppName}"; Filename: "{app}\\{#AppExeName}"
 Name: "{autodesktop}\\{#MyAppName}"; Filename: "{app}\\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\\{#AppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+; Normal UI install: show the optional "Launch" checkbox on the final page.
+Filename: "{app}\\{#AppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall; Check: not WizardSilent
+
+; Silent install (used by in-app updater): auto-launch after installation completes.
+Filename: "{app}\\{#AppExeName}"; Flags: nowait runhidden; Check: WizardSilent

@@ -1,4 +1,5 @@
 # ui/main_window.py
+import os
 import sys
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QFrame,
     QMessageBox,
+    QProgressDialog,
 )
 
 from .widgets.ui_theme import apply_theme, style_combobox_popup
@@ -51,6 +53,7 @@ from core.updater import (
     fetch_latest_release_info,
     is_newer_version,
     launch_installer,
+    launch_installer_with_updater_ui,
 )
 
 
@@ -81,6 +84,7 @@ class _FetchLatestReleaseWorker(QObject):
 
 
 class _DownloadInstallerWorker(QObject):
+    progress = Signal(int, int)  # downloaded_bytes, total_bytes (-1 if unknown)
     finished = Signal(str)  # installer_path
     failed = Signal(str)
 
@@ -90,7 +94,10 @@ class _DownloadInstallerWorker(QObject):
 
     def run(self) -> None:
         try:
-            installer_path = download_release_asset(self._release)
+            def _on_progress(downloaded: int, total: int | None) -> None:
+                self.progress.emit(int(downloaded), int(total) if total is not None else -1)
+
+            installer_path = download_release_asset(self._release, progress_cb=_on_progress)
             self.finished.emit(str(installer_path))
         except Exception as e:
             self.failed.emit(str(e))
@@ -105,6 +112,9 @@ class MainWindow(QWidget):
 
         # Enable custom titlebar by making window frameless
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+
+        # Keep the real window title in sync (taskbar/alt-tab) with the custom titlebar text
+        self.setWindowTitle(f"ThermalBench v{__version__}")
 
         self.settings_path = get_settings_path("ThermalBench")
         self.furmark_exe = ""
@@ -312,6 +322,7 @@ class MainWindow(QWidget):
             on_run_finished=self._on_run_finished,
             on_log_started=self._on_log_started,
             on_log_finished=self._on_log_finished,
+            on_ambient_csv=self._on_ambient_csv,
         )
 
         # Connect component signals
@@ -336,7 +347,7 @@ class MainWindow(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self.titlebar = TitleBar(self, "ThermalBench")
+        self.titlebar = TitleBar(self, f"ThermalBench v{__version__}")
         outer.addWidget(self.titlebar)
         
         # Titlebar bottom border line
@@ -683,9 +694,86 @@ class MainWindow(QWidget):
         self._update_download_thread = None
         self._update_download_worker = None
         self._update_in_progress = False
+        self._update_progress_dialog: QProgressDialog | None = None
+
+        self._update_last_release: ReleaseInfo | None = None
+        self._update_downloaded_installer: Path | None = None
+        self._update_ui_set_status = None
+        self._update_ui_set_button_text = None
+        self._update_ui_set_button_enabled = None
 
     def _set_update_busy(self, busy: bool) -> None:
         self._update_in_progress = bool(busy)
+
+    def _bind_update_ui(
+        self,
+        *,
+        set_status,
+        set_button_text,
+        set_button_enabled,
+    ) -> None:
+        self._update_ui_set_status = set_status
+        self._update_ui_set_button_text = set_button_text
+        self._update_ui_set_button_enabled = set_button_enabled
+
+    def _update_ui(
+        self,
+        *,
+        status_text: str | None = None,
+        status_level: str = "info",
+        button_text: str | None = None,
+        button_enabled: bool | None = None,
+    ) -> None:
+        """Best-effort: update Settings dialog inline status/button without hard dependency."""
+        try:
+            if status_text is not None and self._update_ui_set_status is not None:
+                try:
+                    self._update_ui_set_status(status_text, status_level)
+                except Exception:
+                    # Dialog likely closed/destroyed
+                    self._update_ui_set_status = None
+
+            if button_text is not None and self._update_ui_set_button_text is not None:
+                try:
+                    self._update_ui_set_button_text(button_text)
+                except Exception:
+                    self._update_ui_set_button_text = None
+
+            if button_enabled is not None and self._update_ui_set_button_enabled is not None:
+                try:
+                    self._update_ui_set_button_enabled(bool(button_enabled))
+                except Exception:
+                    self._update_ui_set_button_enabled = None
+        except Exception:
+            pass
+
+    def _show_update_progress(self, text: str) -> None:
+        """Show a simple progress UI while update work runs in background threads."""
+        try:
+            if self._update_progress_dialog is None:
+                dlg = QProgressDialog(self)
+                dlg.setWindowTitle("Update")
+                dlg.setCancelButton(None)
+                dlg.setRange(0, 0)  # indeterminate
+                dlg.setMinimumDuration(0)
+                dlg.setAutoClose(False)
+                dlg.setAutoReset(False)
+                dlg.setWindowModality(Qt.WindowModal)
+                self._update_progress_dialog = dlg
+
+            self._update_progress_dialog.setLabelText(text)
+            self._update_progress_dialog.show()
+            self._update_progress_dialog.raise_()
+            self._update_progress_dialog.activateWindow()
+        except Exception:
+            pass
+
+    def _hide_update_progress(self) -> None:
+        try:
+            if self._update_progress_dialog is not None:
+                self._update_progress_dialog.hide()
+        except Exception:
+            pass
 
     # ---------- rail/page switching ----------
     def _on_page_changed(self, index: int) -> None:
@@ -737,24 +825,106 @@ class MainWindow(QWidget):
             self.run_btn.setToolTip("Start the test")
 
     # ---------- manual update checker ----------
-    def check_for_updates(self) -> None:
+    def check_for_updates(self, *, set_status, set_button_text, set_button_enabled) -> None:
+        """Manual updater entrypoint used by Settings dialog.
+
+        This is a multi-step flow driven by the same button:
+        - Check for updates
+        - If update available: Download
+        - If downloaded: Install
+        All status is surfaced inline next to the button.
+        """
+        self._bind_update_ui(
+            set_status=set_status,
+            set_button_text=set_button_text,
+            set_button_enabled=set_button_enabled,
+        )
+
         if sys.platform != "win32":
-            QMessageBox.information(self, "Update", "Update checking is Windows-only.")
+            self._update_ui(status_text="Windows-only.", status_level="error")
             return
 
-        if getattr(self, "_update_in_progress", False):
-            QMessageBox.information(self, "Update", "An update check is already running.")
-            return
+        # Dev/test hook: bypass GitHub and stage a local installer for the Install step.
+        # Usage:
+        #   set THERMALBENCH_UPDATER_TEST_INSTALLER=C:\path\to\ThermalBench-Setup-vX.Y.Z.exe
+        test_installer = os.environ.get("THERMALBENCH_UPDATER_TEST_INSTALLER", "").strip()
+        if test_installer:
+            installer_path = Path(test_installer).expanduser()
+            if not installer_path.exists():
+                self._update_ui(
+                    status_text=f"Test installer not found: {installer_path}",
+                    status_level="error",
+                )
+                return
 
-        if not GITHUB_OWNER or not GITHUB_REPO:
-            QMessageBox.warning(
-                self,
-                "Update",
-                "GitHub repo is not configured. Set GITHUB_OWNER and GITHUB_REPO in ui/main_window.py.",
+            self._update_last_release = None
+            self._update_downloaded_installer = installer_path
+            self._update_ui(
+                status_text="Test mode: installer staged. Click again to install…",
+                status_level="info",
+                button_text="Install update…",
+                button_enabled=True,
             )
             return
 
+        if not GITHUB_OWNER or not GITHUB_REPO:
+            self._update_ui(
+                status_text="Updater not configured.",
+                status_level="error",
+            )
+            return
+
+        # If an installer is already downloaded, clicking becomes the install action.
+        if self._update_downloaded_installer is not None:
+            try:
+                self._update_ui(
+                    status_text="Installing update… (ThermalBench will close briefly)",
+                    status_level="info",
+                    button_enabled=False,
+                )
+                launch_installer_with_updater_ui(
+                    self._update_downloaded_installer,
+                    wait_for_pid=os.getpid(),
+                    silent=True,
+                )
+            except Exception as e:
+                self._update_ui(
+                    status_text=f"Error: {e}",
+                    status_level="error",
+                    button_enabled=True,
+                )
+                return
+
+            # The updater helper shows a progress window and will restart the app when done.
+            # We still must exit for the installer to replace files.
+            QTimer.singleShot(250, QApplication.quit)
+            return
+
+        # If we already know an update is available, clicking becomes the download action.
+        if self._update_last_release is not None:
+            try:
+                if is_newer_version(__version__, self._update_last_release.version):
+                    self._start_update_download(self._update_last_release)
+                    return
+            except Exception:
+                # fall back to re-check
+                self._update_last_release = None
+
+        # Otherwise, click triggers a fresh check.
+        self._start_update_check()
+
+    def _start_update_check(self) -> None:
+        if getattr(self, "_update_in_progress", False):
+            self._update_ui(status_text="Busy…", status_level="info")
+            return
+
         self._set_update_busy(True)
+        self._update_ui(
+            status_text="Checking…",
+            status_level="info",
+            button_text="Checking…",
+            button_enabled=False,
+        )
 
         thread = QThread(self)
         worker = _FetchLatestReleaseWorker(GITHUB_OWNER, GITHUB_REPO, INSTALLER_PREFIX)
@@ -773,47 +943,25 @@ class MainWindow(QWidget):
         self._update_fetch_worker = worker
         thread.start()
 
-    def _on_update_failed(self, reason: str) -> None:
-        self._set_update_busy(False)
-        QMessageBox.warning(self, "Update", f"Update check failed:\n\n{reason}")
-
-    def _on_update_release_info(self, release: ReleaseInfo) -> None:
-        try:
-            newer = is_newer_version(__version__, release.version)
-        except Exception as e:
-            self._set_update_busy(False)
-            QMessageBox.warning(self, "Update", f"Could not compare versions:\n\n{e}")
+    def _start_update_download(self, release: ReleaseInfo) -> None:
+        if getattr(self, "_update_in_progress", False):
+            self._update_ui(status_text="Busy…", status_level="info")
             return
 
-        if not newer:
-            self._set_update_busy(False)
-            QMessageBox.information(
-                self,
-                "Update",
-                f"You are up to date.\n\nInstalled: {__version__}\nLatest: {release.version}",
-            )
-            return
+        self._set_update_busy(True)
+        self._update_ui(
+            status_text="Downloading…",
+            status_level="info",
+            button_text="Downloading…",
+            button_enabled=False,
+        )
 
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Question)
-        box.setWindowTitle("Update Available")
-        box.setText(f"A new version is available: {release.version}")
-        box.setInformativeText(f"Installed: {__version__}\n\nDownload and install?")
-        if release.notes:
-            box.setDetailedText(release.notes)
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        box.setDefaultButton(QMessageBox.Yes)
-
-        if box.exec() != QMessageBox.Yes:
-            self._set_update_busy(False)
-            return
-
-        # Download in background
         thread = QThread(self)
         worker = _DownloadInstallerWorker(release)
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
+        worker.progress.connect(self._on_update_download_progress)
         worker.finished.connect(self._on_update_downloaded)
         worker.failed.connect(self._on_update_download_failed)
         worker.finished.connect(thread.quit)
@@ -826,33 +974,86 @@ class MainWindow(QWidget):
         self._update_download_worker = worker
         thread.start()
 
+    def _on_update_failed(self, reason: str) -> None:
+        self._set_update_busy(False)
+        self._update_ui(
+            status_text=f"Error: {reason}",
+            status_level="error",
+            button_text="Check for updates…",
+            button_enabled=True,
+        )
+
+    def _on_update_release_info(self, release: ReleaseInfo) -> None:
+        try:
+            newer = is_newer_version(__version__, release.version)
+        except Exception as e:
+            self._set_update_busy(False)
+            self._update_ui(
+                status_text=f"Error: {e}",
+                status_level="error",
+                button_text="Check for updates…",
+                button_enabled=True,
+            )
+            return
+
+        if not newer:
+            self._set_update_busy(False)
+            self._update_last_release = None
+            self._update_downloaded_installer = None
+            self._update_ui(
+                status_text="Up to date.",
+                status_level="ok",
+                button_text="Check for updates…",
+                button_enabled=True,
+            )
+            return
+
+        # Update available: surface inline and let the same button become Download.
+        self._update_last_release = release
+        self._set_update_busy(False)
+        self._update_ui(
+            status_text=f"Update available: {release.version}",
+            status_level="warn",
+            button_text=f"Download {release.version}",
+            button_enabled=True,
+        )
+
+    def _on_update_download_progress(self, downloaded_bytes: int, total_bytes: int) -> None:
+        try:
+            if total_bytes and total_bytes > 0:
+                pct = int(round((downloaded_bytes / total_bytes) * 100))
+                self._update_ui(status_text=f"Downloading… {pct}%", status_level="info")
+            else:
+                self._update_ui(status_text="Downloading…", status_level="info")
+        except Exception:
+            pass
+
     def _on_update_download_failed(self, reason: str) -> None:
         self._set_update_busy(False)
-        QMessageBox.warning(self, "Update", f"Download failed:\n\n{reason}")
+        # Keep the last release so the user can click Download again.
+        btn = "Download update"
+        try:
+            if self._update_last_release is not None and self._update_last_release.version:
+                btn = f"Download {self._update_last_release.version}"
+        except Exception:
+            pass
+        self._update_ui(
+            status_text=f"Error: {reason}",
+            status_level="error",
+            button_text=btn,
+            button_enabled=True,
+        )
 
     def _on_update_downloaded(self, installer_path_str: str) -> None:
         installer_path = Path(installer_path_str)
-
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Question)
-        box.setWindowTitle("Install Update")
-        box.setText("Installer downloaded.")
-        box.setInformativeText(f"Install now?\n\n{installer_path}")
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        box.setDefaultButton(QMessageBox.Yes)
-
-        if box.exec() != QMessageBox.Yes:
-            self._set_update_busy(False)
-            return
-
-        try:
-            launch_installer(installer_path)
-        except Exception as e:
-            self._set_update_busy(False)
-            QMessageBox.warning(self, "Update", f"Failed to start installer:\n\n{e}")
-            return
-
-        QApplication.quit()
+        self._set_update_busy(False)
+        self._update_downloaded_installer = installer_path
+        self._update_ui(
+            status_text="Downloaded. Ready to install.",
+            status_level="warn",
+            button_text="Install update",
+            button_enabled=True,
+        )
 
     def _get_current_settings(self) -> dict:
         """Get current settings as a dictionary."""
@@ -995,6 +1196,11 @@ class MainWindow(QWidget):
             csv_path = str((settings or {}).get("hwinfo_csv") or "").strip()
             cols = [str(c) for c in (columns or []) if str(c).strip()]
 
+            # Always include ambient as a temperature series during runs.
+            ambient_col = "Ambient [°C]"
+            if ambient_col not in cols:
+                cols.append(ambient_col)
+
             try:
                 self._live_monitor.start(csv_path=csv_path, columns=cols)
                 self._live_graph.start(columns=cols)
@@ -1010,6 +1216,12 @@ class MainWindow(QWidget):
             pass
 
         self._apply_live_split_ratio()
+
+    def _on_ambient_csv(self, ambient_csv_path: str) -> None:
+        try:
+            self._live_monitor.set_ambient_csv(str(ambient_csv_path or "").strip())
+        except Exception:
+            pass
 
     def _on_run_finished(self) -> None:
         try:

@@ -71,6 +71,10 @@ class LiveMonitorWidget(QFrame):
         self._last_mtime: Optional[float] = None
         self._last_emit_ts: float = 0.0
 
+        # Optional ambient sidecar CSV written by ambient_logger.py
+        self._ambient_csv_path: str = ""
+        self._ambient_col_name: str = "Ambient [°C]"
+
         self._timer = QTimer(self)
         self._timer.setInterval(200)
         self._timer.timeout.connect(self._tick)
@@ -148,6 +152,10 @@ class LiveMonitorWidget(QFrame):
         self._last_mtime = None
         self._last_emit_ts = 0.0
 
+        # Keep any previously provided ambient CSV path (it may arrive slightly
+        # after start via the runner stdout hook).
+        self._ambient_csv_path = str(getattr(self, "_ambient_csv_path", "") or "").strip()
+
         self._rebuild_rows()
 
         try:
@@ -164,6 +172,13 @@ class LiveMonitorWidget(QFrame):
             pass
 
         self._timer.start()
+
+    def set_ambient_csv(self, path: str) -> None:
+        """Provide ambient logger CSV path for live ambient stats/plotting."""
+        try:
+            self._ambient_csv_path = str(path or "").strip()
+        except Exception:
+            self._ambient_csv_path = ""
 
     def stop(self) -> None:
         try:
@@ -398,6 +413,60 @@ class LiveMonitorWidget(QFrame):
         except Exception:
             return None
 
+    def _read_last_ambient_value(self) -> Optional[float]:
+        p = Path(self._ambient_csv_path)
+        if not self._ambient_csv_path or not p.exists() or not p.is_file():
+            return None
+
+        try:
+            with open(p, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if size <= 0:
+                    return None
+
+                chunk = bytearray()
+                pos = size
+                newlines = 0
+                while pos > 0 and newlines < 3 and len(chunk) < 65536:
+                    step = 4096 if pos >= 4096 else pos
+                    pos -= step
+                    f.seek(pos)
+                    buf = f.read(step)
+                    chunk[:0] = buf
+                    newlines = chunk.count(b"\n")
+
+                text = None
+                for enc in ("utf-8-sig", "utf-8", "cp1252"):
+                    try:
+                        text = bytes(chunk).decode(enc, errors="replace")
+                        break
+                    except Exception:
+                        continue
+                if not text:
+                    return None
+
+                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                if len(lines) < 2:
+                    return None
+
+                last = lines[-1]
+                if last.lower().startswith("timestamp,"):
+                    if len(lines) >= 2:
+                        last = lines[-2]
+
+                row = next(csv.reader([last]))
+                row = [str(x).strip().strip('"') for x in row]
+                if len(row) < 2:
+                    return None
+
+                v = self._parse_float(row[1])
+                if v is None:
+                    return None
+                return float(v)
+        except Exception:
+            return None
+
     def _parse_float(self, s: str) -> Optional[float]:
         try:
             t = str(s).strip()
@@ -491,6 +560,8 @@ class LiveMonitorWidget(QFrame):
             updated_any = False
             sample_vals: dict[str, float] = {}
             for col in self._columns:
+                if col == self._ambient_col_name:
+                    continue
                 idx = self._header_index.get(col)
                 if idx is None or idx >= len(row):
                     continue
@@ -504,6 +575,18 @@ class LiveMonitorWidget(QFrame):
                 stt.push(float(x))
                 sample_vals[col] = float(x)
                 updated_any = True
+
+            # Ambient (sidecar) update
+            if self._ambient_col_name in self._columns and self._ambient_csv_path:
+                amb = self._read_last_ambient_value()
+                if amb is not None:
+                    stt = self._stats.get(self._ambient_col_name)
+                    if stt is None:
+                        stt = _OnlineStats()
+                        self._stats[self._ambient_col_name] = stt
+                    stt.push(float(amb))
+                    sample_vals[self._ambient_col_name] = float(amb)
+                    updated_any = True
 
             if not updated_any:
                 return

@@ -11,6 +11,10 @@ param(
   # HWiNFO continuous log (must already be running)
   [string]$HwinfoCsv = "C:\TempTesting\hwinfo.csv",
 
+  # Ambient sensor logging (TEMPer USB dongle)
+  [switch]$EnableAmbient = $true,
+  [int]$AmbientIntervalMs = 1000,
+
   # tools
   # [string]$FurMarkExe = "C:\Program Files\Geeks3D\FurMark2_x64\furmark.exe",
   # [string]$PrimeExe   = "C:\Users\Intel Testbench\Downloads\Prime_95_v30.3build6\prime95.exe",
@@ -33,6 +37,9 @@ param(
 
   # after run: try to clear master log (may fail if file locked - ok)
   [switch]$ClearHwinfoAfter = $true,
+
+  # after run: try to clear ambient log (temp file) (best-effort)
+  [switch]$ClearAmbientAfter = $true,
 
   # STOP command
   [switch]$StopNow
@@ -65,6 +72,28 @@ function Has-InteractiveConsole {
   } catch {
     return $false
   }
+}
+
+function Resolve-PythonRuntime {
+  # Returns: @{ Exe='python'|'py'|'...path...'; UsePyLauncher=$true/$false }
+  $usePy = $false
+  $exe = $PythonExe
+
+  if (-not (Test-Path $exe)) {
+    $venv = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+    if (Test-Path $venv) {
+      $exe = $venv
+    } elseif (Get-Command python -ErrorAction SilentlyContinue) {
+      $exe = 'python'
+    } elseif (Get-Command py -ErrorAction SilentlyContinue) {
+      $exe = 'py'
+      $usePy = $true
+    } else {
+      return @{ Exe=$null; UsePyLauncher=$false }
+    }
+  }
+
+  return @{ Exe=$exe; UsePyLauncher=$usePy }
 }
 
 function Countdown-OrAbort($seconds, $label) {
@@ -214,6 +243,16 @@ if (-not (Test-Path $HwinfoCsv)) {
 
 Clear-AbortFlag
 
+$repoRoot = Split-Path -Parent $PSScriptRoot
+
+# Resolve Python runtime early (needed for ambient logger as well as plotting).
+$py = Resolve-PythonRuntime
+$PythonExe = $py.Exe
+$UsePyLauncher = [bool]$py.UsePyLauncher
+
+$ambientPid = 0
+$ambientCsv = $null
+
 $furPid = 0
 $prPid  = 0
 $windowStart = $null
@@ -222,6 +261,39 @@ $aborted = $false
 $outDir = $null
 
 try {
+  # Start ambient logging (best-effort). We always slice/merge by windowStart/windowEnd later.
+  if ($EnableAmbient.IsPresent -and $PythonExe) {
+    try {
+      $rand = Get-Random
+      $ambientCsv = Join-Path $env:TEMP ("ThermalBench_ambient_{0}_{1}.csv" -f $PID, $rand)
+      $ambientScript = Join-Path $repoRoot "ambient_logger.py"
+      if (Test-Path $ambientScript) {
+        $intervalSec = [math]::Max(0.1, ([double]$AmbientIntervalMs / 1000.0))
+
+        # Let the GUI know where to read ambient data for live stats/plotting.
+        try { Write-Host ("GUI_AMBIENT_CSV:{0}" -f $ambientCsv) } catch {}
+
+        if ($UsePyLauncher) {
+          $args = @('-3', $ambientScript, '--out', $ambientCsv, '--interval', ("{0}" -f $intervalSec))
+        } else {
+          $args = @($ambientScript, '--out', $ambientCsv, '--interval', ("{0}" -f $intervalSec))
+        }
+
+        Write-Host "Ambient logger: $PythonExe $($args -join ' ')"
+        $p = Start-Process -FilePath $PythonExe -ArgumentList $args -PassThru -WindowStyle Hidden
+        if ($p -and $p.Id) { $ambientPid = [int]$p.Id }
+      } else {
+        Write-Host "Ambient logger script not found: $ambientScript" -ForegroundColor Yellow
+      }
+    } catch {
+      Write-Host "Ambient logger could not be started (continuing)." -ForegroundColor Yellow
+      $ambientPid = 0
+      $ambientCsv = $null
+    }
+  } else {
+    Write-Host "Ambient logging disabled." 
+  }
+
   $stress = Start-StressTools
   $furPid = [int]$stress.FurPid
   $prPid  = [int]$stress.PrimePid
@@ -237,7 +309,6 @@ try {
 
   $runId  = Get-RunName -CaseName $CaseName -WarmupSec $WarmupSec -LogSec $LogSec -StressCPU:$StressCPU -StressGPU:$StressGPU
   # Place run outputs at repository-level `runs/` (one level above this script's folder)
-  $repoRoot = Split-Path -Parent $PSScriptRoot
 
   # Safety net: never reuse an existing output directory (prevents overwriting prior runs)
   $m = [regex]::Match($runId, '^(.*)_V(\d+)$')
@@ -284,6 +355,16 @@ try {
   if ($furPid -ne 0 -or $prPid -ne 0) {
     Stop-StressTools -FurPid $furPid -PrimePid $prPid
   }
+
+  # Stop ambient logger
+  if ($ambientPid -and (Get-Process -Id $ambientPid -ErrorAction SilentlyContinue)) {
+    try { Stop-Process -Id $ambientPid -ErrorAction SilentlyContinue } catch {}
+    Start-Sleep -Milliseconds 400
+    if (Get-Process -Id $ambientPid -ErrorAction SilentlyContinue) {
+      try { Stop-Process -Id $ambientPid -Force -ErrorAction SilentlyContinue } catch {}
+    }
+  }
+
   Clear-AbortFlag
 
   if ($aborted -and $outDir -and (Test-Path $outDir)) {
@@ -306,32 +387,37 @@ Start-Sleep -Seconds 6
 $ws = $windowStart.ToString("yyyy-MM-dd HH:mm:ss.fff")
 $we = $windowEnd.ToString("yyyy-MM-dd HH:mm:ss.fff")
 
-# Resolve Python runtime: prefer .venv, then python, then py
-$UsePyLauncher = $false
-if (-not (Test-Path $PythonExe)) {
-  $venv = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
-  if (Test-Path $venv) {
-    $PythonExe = $venv
-  } elseif (Get-Command python -ErrorAction SilentlyContinue) {
-    $PythonExe = 'python'
-  } elseif (Get-Command py -ErrorAction SilentlyContinue) {
-    $PythonExe = 'py'
-    $UsePyLauncher = $true
-  } else {
-    Write-Host "Python executable not found. Create a virtualenv in $PSScriptRoot (python -m venv .venv) or ensure 'python' or 'py' is on PATH."
-    exit 1
-  }
-} else {
-  $UsePyLauncher = $false
+if (-not $PythonExe) {
+  Write-Host "Python executable not found. Create a virtualenv in $PSScriptRoot (python -m venv .venv) or ensure 'python' or 'py' is on PATH."
+  exit 1
 }
 
 # Invoke the plotter
+$plotArgs = @(
+  $PlotScript,
+  '--csv', $HwinfoCsv,
+  '--out', $outDir,
+  '--patterns'
+)
+
+if ($TempPatterns) {
+  $plotArgs += $TempPatterns
+}
+
+$plotArgs += @(
+  '--window-start', $ws,
+  '--window-end', $we,
+  '--export-window-csv'
+)
+
+if ($ambientCsv -and (Test-Path $ambientCsv)) {
+  $plotArgs += @('--ambient-csv', $ambientCsv)
+}
+
 if ($UsePyLauncher) {
-  & $PythonExe -3 $PlotScript --csv "$HwinfoCsv" --out "$outDir" --patterns $TempPatterns `
-    --window-start "$ws" --window-end "$we" --export-window-csv
+  & $PythonExe -3 @plotArgs
 } else {
-  & $PythonExe $PlotScript --csv "$HwinfoCsv" --out "$outDir" --patterns $TempPatterns `
-    --window-start "$ws" --window-end "$we" --export-window-csv
+  & $PythonExe @plotArgs
 }
 
 $pyExit = $LASTEXITCODE
@@ -349,6 +435,15 @@ if ($ClearHwinfoAfter) {
     Write-Host "HWiNFO master log cleared: $HwinfoCsv"
   } catch {
     Write-Host "Could not clear HWiNFO master log (likely locked). That's fine; run_window.csv is saved." -ForegroundColor Yellow
+  }
+}
+
+if ($ClearAmbientAfter -and $ambientCsv -and (Test-Path $ambientCsv)) {
+  try {
+    Remove-Item -Force -ErrorAction Stop $ambientCsv
+    Write-Host "Ambient temp log removed: $ambientCsv"
+  } catch {
+    Write-Host "Could not remove ambient temp log (likely open): $ambientCsv" -ForegroundColor Yellow
   }
 }
 
