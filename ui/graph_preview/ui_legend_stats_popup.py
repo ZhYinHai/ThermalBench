@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # ui_legend_stats_popup.py
 """Legend and statistics popup dialog for graph preview."""
 

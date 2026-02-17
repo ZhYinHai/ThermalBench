@@ -100,12 +100,31 @@ class LiveGraphWidget(QFrame):
 
     def start(self, *, columns: list[str]) -> None:
         self._columns = [str(c) for c in (columns or []) if str(c).strip()]
-        self._active = set(self._columns)
+        # Default to temperature series only; LiveMonitorWidget can toggle others.
+        self._active = set(self._default_active_columns(self._columns))
 
         self._color_map = build_tab20_color_map(self._columns) if self._columns else {}
         self.setVisible(bool(self._columns))
 
         self.reset_window()
+
+    def _default_active_columns(self, columns: list[str]) -> list[str]:
+        cols = [str(c) for c in (columns or []) if str(c).strip()]
+        if not cols:
+            return []
+
+        temp_cols: list[str] = []
+        try:
+            groups = group_columns_by_unit(cols)
+            for unit, unit_cols in (groups or {}).items():
+                if get_measurement_type_label(unit) == "Temperature":
+                    for c in unit_cols or []:
+                        if c not in temp_cols:
+                            temp_cols.append(str(c))
+        except Exception:
+            temp_cols = []
+
+        return temp_cols if temp_cols else cols
 
     def stop(self) -> None:
         pass

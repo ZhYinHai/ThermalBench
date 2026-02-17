@@ -146,7 +146,8 @@ class LiveMonitorWidget(QFrame):
         self._date_idx = None
         self._time_idx = None
         self._stats = {c: _OnlineStats() for c in self._columns}
-        self._enabled = set(self._columns)
+        # Default to temperature sensors only during runs; user can toggle others on.
+        self._enabled = set(self._default_enabled_columns(self._columns))
         self._items = {}
         self._last_size = None
         self._last_mtime = None
@@ -159,7 +160,8 @@ class LiveMonitorWidget(QFrame):
         self._rebuild_rows()
 
         try:
-            self.active_columns_changed.emit(list(self._enabled))
+            enabled_sorted = [c for c in self._columns if c in self._enabled]
+            self.active_columns_changed.emit(enabled_sorted)
         except Exception:
             pass
 
@@ -172,6 +174,26 @@ class LiveMonitorWidget(QFrame):
             pass
 
         self._timer.start()
+
+    def _default_enabled_columns(self, columns: list[str]) -> list[str]:
+        cols = [str(c) for c in (columns or []) if str(c).strip()]
+        if not cols:
+            return []
+
+        # Use the same unit parsing helpers as the graph/legend.
+        temp_cols: list[str] = []
+        try:
+            groups = group_columns_by_unit(cols)
+            for unit, unit_cols in (groups or {}).items():
+                if get_measurement_type_label(unit) == "Temperature":
+                    for c in unit_cols or []:
+                        if c not in temp_cols:
+                            temp_cols.append(str(c))
+        except Exception:
+            temp_cols = []
+
+        # If we found temperature sensors, default to those; otherwise keep all.
+        return temp_cols if temp_cols else cols
 
     def set_ambient_csv(self, path: str) -> None:
         """Provide ambient logger CSV path for live ambient stats/plotting."""

@@ -1209,6 +1209,18 @@ class BenchmarkController:
             self._append_log("[ERR] " + line)
 
     def on_finished(self, code, status):
+        started_at = None
+        try:
+            started_at = self._run_started_at
+        except Exception:
+            started_at = None
+
+        finished_at = None
+        try:
+            finished_at = datetime.now()
+        except Exception:
+            finished_at = None
+
         self._append_log(f"Finished (exit code {code})")
         self._run_btn.setEnabled(True)
         self._abort_btn.setEnabled(False)
@@ -1217,7 +1229,29 @@ class BenchmarkController:
 
         try:
             if callable(getattr(self, "_on_run_finished", None)):
-                self._on_run_finished()
+                elapsed_sec = None
+                try:
+                    if started_at is not None and finished_at is not None:
+                        elapsed_sec = int((finished_at - started_at).total_seconds())
+                except Exception:
+                    elapsed_sec = None
+
+                case_name = ""
+                try:
+                    case_name = str((self._pending_run_settings or {}).get("case_name") or "").strip()
+                except Exception:
+                    case_name = ""
+
+                result = {
+                    "exit_code": int(code) if code is not None else None,
+                    "run_dir": str(self.last_run_dir or "").strip(),
+                    "case_name": case_name,
+                    "started_at": started_at.isoformat(timespec="seconds") if started_at else None,
+                    "finished_at": finished_at.isoformat(timespec="seconds") if finished_at else None,
+                    "elapsed_sec": elapsed_sec,
+                }
+
+                self._on_run_finished(result)
         except Exception:
             pass
 

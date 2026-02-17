@@ -34,6 +34,7 @@ class SettingsDialog(QDialog):
         *,
         furmark_exe: str,
         prime_exe: str,
+        ntfy_topic: str = "",
         theme: str,
         update_callback=None,
     ):
@@ -112,6 +113,13 @@ class SettingsDialog(QDialog):
         row.setSpacing(10)
         root.addLayout(row)
 
+        # --- Notifications (ntfy) ---
+        root.addWidget(QLabel("Push notifications (ntfy) (optional)"))
+        root.addWidget(QLabel("Topic or URL"))
+        self.ntfy_topic_edit = QLineEdit(str(ntfy_topic or "").strip())
+        self.ntfy_topic_edit.setPlaceholderText("https://ntfy.sh/your-topic")
+        root.addWidget(self.ntfy_topic_edit)
+
 
         # --- Updates ---
         if self._update_callback is not None:
@@ -135,7 +143,7 @@ class SettingsDialog(QDialog):
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
 
-        self.resize(640, 260)
+        self.resize(640, 340)
 
     def _on_check_updates(self) -> None:
         try:
@@ -303,6 +311,12 @@ class SettingsDialog(QDialog):
     def theme(self) -> str:
         t = self.mode_combo.currentText().strip().lower()
         return t if t in ("light", "dark", "device") else "dark"
+
+    def ntfy_topic(self) -> str:
+        try:
+            return self.ntfy_topic_edit.text().strip()
+        except Exception:
+            return ""
 
 
     def showEvent(self, event):

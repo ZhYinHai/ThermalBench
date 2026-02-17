@@ -45,6 +45,8 @@ from .runs_proxy_model import RunsProxyModel
 
 from core.settings_store import get_settings_path, load_json, save_json
 
+from ui.ntfy_notifier import NtfyNotifier
+
 from core.version import __version__
 from core.resources import app_root
 from core.updater import (
@@ -122,6 +124,16 @@ class MainWindow(QWidget):
         self.furmark_exe = ""
         self.prime_exe = ""
         self.theme_mode = "dark"
+
+        # Push notifications (ntfy)
+        # Store either a full topic URL (https://ntfy.sh/<topic>) or just a topic name.
+        self.ntfy_topic = ""
+
+        self._ntfy_notifier = NtfyNotifier(self)
+        try:
+            self._ntfy_notifier.finished.connect(self._on_ntfy_notify_finished)
+        except Exception:
+            pass
 
         # Inputs
         self.case_edit = QLineEdit("TEST")
@@ -1096,6 +1108,7 @@ class MainWindow(QWidget):
             "fur_res_display": res_display,
             "furmark_exe": self.furmark_exe,
             "prime_exe": self.prime_exe,
+            "ntfy_topic": self.ntfy_topic,
             "stress_cpu": bool(getattr(self.sensors, "stress_cpu", True)),
             "stress_gpu": bool(getattr(self.sensors, "stress_gpu", True)),
         }
@@ -1117,6 +1130,9 @@ class MainWindow(QWidget):
 
         self.furmark_exe = str(data.get("furmark_exe", self.furmark_exe or "")).strip()
         self.prime_exe = str(data.get("prime_exe", self.prime_exe or "")).strip()
+
+        self.ntfy_topic = str(data.get("ntfy_topic", self.ntfy_topic or "")).strip()
+
         self.theme_mode = str(data.get("theme", self.theme_mode or "dark")).strip().lower() or "dark"
 
         try:
@@ -1169,6 +1185,7 @@ class MainWindow(QWidget):
             "stress_gpu": bool(self.sensors.stress_gpu),
             "furmark_exe": self.furmark_exe,
             "prime_exe": self.prime_exe,
+            "ntfy_topic": self.ntfy_topic,
             "theme": self.theme_mode,
         }
         save_json(self.settings_path, payload)
@@ -1180,6 +1197,7 @@ class MainWindow(QWidget):
             self,
             furmark_exe=self.furmark_exe,
             prime_exe=self.prime_exe,
+            ntfy_topic=self.ntfy_topic,
             theme=self.theme_mode,
             update_callback=self.check_for_updates,
         )
@@ -1188,6 +1206,10 @@ class MainWindow(QWidget):
 
         self.furmark_exe = dlg.furmark_exe()
         self.prime_exe = dlg.prime_exe()
+        try:
+            self.ntfy_topic = dlg.ntfy_topic()
+        except Exception:
+            pass
         self.theme_mode = dlg.theme()
 
         app = QApplication.instance()
@@ -1241,7 +1263,7 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
-    def _on_run_finished(self) -> None:
+    def _on_run_finished(self, result: dict | None = None) -> None:
         try:
             try:
                 self._live_monitor.stop()
@@ -1249,10 +1271,67 @@ class MainWindow(QWidget):
             except Exception:
                 pass
 
+            # Best-effort: send a push notification if configured.
+            try:
+                self._notify_run_finished_ntfy(result)
+            except Exception:
+                pass
+
             if self._output_stack is not None:
                 self._output_stack.setCurrentIndex(1)
             if self._output_btn_console is not None:
                 self._output_btn_console.setChecked(True)
+        except Exception:
+            pass
+
+    def _notify_run_finished_ntfy(self, result: dict | None = None) -> None:
+        topic = str(getattr(self, "ntfy_topic", "") or "").strip()
+        if not topic:
+            return
+
+        case_name = ""
+        try:
+            case_name = str(self.case_edit.text() or "").strip()
+        except Exception:
+            case_name = ""
+        if isinstance(result, dict):
+            case_name = str(result.get("case_name") or case_name or "").strip()
+
+        ok = True
+        elapsed_sec = None
+        run_dir = ""
+        if isinstance(result, dict):
+            try:
+                ok = int(result.get("exit_code", 0) or 0) == 0
+            except Exception:
+                ok = True
+            try:
+                elapsed_sec = int(result.get("elapsed_sec")) if result.get("elapsed_sec") is not None else None
+            except Exception:
+                elapsed_sec = None
+            run_dir = str(result.get("run_dir") or "").strip()
+
+        status = "SUCCESS" if ok else "FAILED"
+        dur = ""
+        if isinstance(elapsed_sec, int) and elapsed_sec >= 0:
+            mm = elapsed_sec // 60
+            ss = elapsed_sec % 60
+            dur = f" ({mm:02d}:{ss:02d})"
+
+        subject = f"ThermalBench: {case_name or 'Test'} finished - {status}"
+        body = f"Case: {case_name or 'Test'}\nStatus: {status}{dur}\n"
+        if run_dir:
+            body += f"Run folder: {run_dir}\n"
+
+        try:
+            self._ntfy_notifier.send(topic=topic, title=subject, message=body)
+        except Exception:
+            pass
+
+    def _on_ntfy_notify_finished(self, ok: bool, message: str) -> None:
+        try:
+            if not ok:
+                self.append(str(message or "Push notification failed"))
         except Exception:
             pass
 
