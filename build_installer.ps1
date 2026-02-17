@@ -105,10 +105,61 @@ if (-not (Test-Path $spec)) {
 
 Write-Host "Running PyInstaller..." -ForegroundColor Cyan
 & $python -m PyInstaller --noconfirm --clean $spec
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller failed for ThermalBench.spec (exit code $LASTEXITCODE)"
+}
 
 $distExe = Join-Path $PSScriptRoot 'dist\ThermalBench\ThermalBench.exe'
 if (-not (Test-Path $distExe)) {
     throw "Expected PyInstaller output not found: $distExe"
+}
+
+$distInternal = Join-Path $PSScriptRoot 'dist\ThermalBench\_internal'
+if (-not (Test-Path $distInternal)) {
+    throw "PyInstaller output looks incomplete (missing _internal): $distInternal"
+}
+
+# 1b) Build standalone ambient logger (so releases don't depend on a system Python)
+$ambientScript = Join-Path $PSScriptRoot 'ambient_logger.py'
+if (Test-Path $ambientScript) {
+    $ambientName = 'ThermalBench-AmbientLogger'
+    $ambientDistDirTmp = Join-Path $PSScriptRoot 'dist\\_ambient_logger'
+    $ambientDistFinal = Join-Path $PSScriptRoot 'dist\\ThermalBench'
+    $ambientWorkDir = Join-Path $PSScriptRoot 'build\ambient_logger'
+    New-Item -ItemType Directory -Force -Path $ambientWorkDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $ambientDistDirTmp | Out-Null
+
+    Write-Host "Building ambient logger executable..." -ForegroundColor Cyan
+    & $python -m PyInstaller --noconfirm --clean --onefile --console `
+        --name $ambientName `
+        --distpath $ambientDistDirTmp `
+        --workpath $ambientWorkDir `
+        --specpath $ambientWorkDir `
+        $ambientScript
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller failed for ambient_logger.py (exit code $LASTEXITCODE)"
+    }
+
+    $ambientExeTmp = Join-Path $ambientDistDirTmp ("{0}.exe" -f $ambientName)
+    $ambientExeFinal = Join-Path $ambientDistFinal ("{0}.exe" -f $ambientName)
+    if (-not (Test-Path $ambientExeTmp)) {
+        throw "Ambient logger build succeeded but expected output not found: $ambientExeTmp"
+    }
+
+    # Copy into the onedir app folder (avoid building directly into dist\ThermalBench,
+    # which can break PyInstaller's own cleanup on subsequent builds).
+    try {
+        if (Test-Path $ambientExeFinal) {
+            Remove-Item -Force $ambientExeFinal -ErrorAction SilentlyContinue
+        }
+    } catch {}
+    Copy-Item -Force -LiteralPath $ambientExeTmp -Destination $ambientExeFinal
+    if (-not (Test-Path $ambientExeFinal)) {
+        throw "Failed to copy ambient logger into app bundle: $ambientExeFinal"
+    }
+} else {
+    Write-Host "Ambient logger script not found; skipping ambient logger EXE build: $ambientScript" -ForegroundColor Yellow
 }
 
 # 2) Compile Inno Setup installer

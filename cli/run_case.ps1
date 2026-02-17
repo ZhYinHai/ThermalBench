@@ -80,9 +80,15 @@ function Resolve-PythonRuntime {
   $exe = $PythonExe
 
   if (-not (Test-Path $exe)) {
-    $venv = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
-    if (Test-Path $venv) {
-      $exe = $venv
+    # Prefer repo-root venv first (common layout): <repo>\.venv\Scripts\python.exe
+    $repoRootGuess = Split-Path -Parent $PSScriptRoot
+    $venvRepo = Join-Path $repoRootGuess ".venv\Scripts\python.exe"
+    $venvCli  = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+
+    if (Test-Path $venvRepo) {
+      $exe = $venvRepo
+    } elseif (Test-Path $venvCli) {
+      $exe = $venvCli
     } elseif (Get-Command python -ErrorAction SilentlyContinue) {
       $exe = 'python'
     } elseif (Get-Command py -ErrorAction SilentlyContinue) {
@@ -243,7 +249,18 @@ if (-not (Test-Path $HwinfoCsv)) {
 
 Clear-AbortFlag
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
+$scriptDir = $PSScriptRoot
+
+# In a frozen app, this script typically lives at <AppRoot>\_internal\cli\run_case.ps1.
+# In dev, it lives at <RepoRoot>\cli\run_case.ps1.
+# Resolve a stable "root" that points at the app root (frozen) or repo root (dev).
+$repoRoot = Split-Path -Parent $scriptDir
+try {
+  $parentLeaf = Split-Path -Leaf $repoRoot
+  if ($parentLeaf -eq '_internal') {
+    $repoRoot = Split-Path -Parent $repoRoot
+  }
+} catch {}
 
 # Resolve Python runtime early (needed for ambient logger as well as plotting).
 $py = Resolve-PythonRuntime
@@ -262,28 +279,44 @@ $outDir = $null
 
 try {
   # Start ambient logging (best-effort). We always slice/merge by windowStart/windowEnd later.
-  if ($EnableAmbient.IsPresent -and $PythonExe) {
+  # NOTE: The GUI does not pass -EnableAmbient explicitly. Using `.IsPresent` here
+  # makes ambient logging silently OFF even though the parameter default is `$true`.
+  # Treat this as a boolean flag instead.
+  if ($EnableAmbient) {
     try {
       $rand = Get-Random
       $ambientCsv = Join-Path $env:TEMP ("ThermalBench_ambient_{0}_{1}.csv" -f $PID, $rand)
-      $ambientScript = Join-Path $repoRoot "ambient_logger.py"
-      if (Test-Path $ambientScript) {
-        $intervalSec = [math]::Max(0.1, ([double]$AmbientIntervalMs / 1000.0))
+      $intervalSec = [math]::Max(0.1, ([double]$AmbientIntervalMs / 1000.0))
 
-        # Let the GUI know where to read ambient data for live stats/plotting.
-        try { Write-Host ("GUI_AMBIENT_CSV:{0}" -f $ambientCsv) } catch {}
+      # Let the GUI know where to read ambient data for live stats/plotting.
+      try { Write-Host ("GUI_AMBIENT_CSV:{0}" -f $ambientCsv) } catch {}
 
-        if ($UsePyLauncher) {
-          $args = @('-3', $ambientScript, '--out', $ambientCsv, '--interval', ("{0}" -f $intervalSec))
-        } else {
-          $args = @($ambientScript, '--out', $ambientCsv, '--interval', ("{0}" -f $intervalSec))
-        }
-
-        Write-Host "Ambient logger: $PythonExe $($args -join ' ')"
-        $p = Start-Process -FilePath $PythonExe -ArgumentList $args -PassThru -WindowStyle Hidden
+      # Prefer a bundled ambient logger EXE when present (release builds).
+      $ambientExe = Join-Path $repoRoot "ThermalBench-AmbientLogger.exe"
+      if (Test-Path $ambientExe) {
+        $args = @('--out', $ambientCsv, '--interval', ("{0}" -f $intervalSec))
+        Write-Host "Ambient logger (bundled): $ambientExe $($args -join ' ')"
+        $p = Start-Process -FilePath $ambientExe -ArgumentList $args -PassThru -WindowStyle Hidden
         if ($p -and $p.Id) { $ambientPid = [int]$p.Id }
       } else {
-        Write-Host "Ambient logger script not found: $ambientScript" -ForegroundColor Yellow
+        # Fallback: use Python + ambient_logger.py (dev/workspace runs)
+        if (-not $PythonExe) {
+          Write-Host "Ambient logger skipped (Python not found and bundled ambient logger missing)." -ForegroundColor Yellow
+        } else {
+          $ambientScript = Join-Path $repoRoot "ambient_logger.py"
+          if (Test-Path $ambientScript) {
+            if ($UsePyLauncher) {
+              $args = @('-3', $ambientScript, '--out', $ambientCsv, '--interval', ("{0}" -f $intervalSec))
+            } else {
+              $args = @($ambientScript, '--out', $ambientCsv, '--interval', ("{0}" -f $intervalSec))
+            }
+            Write-Host "Ambient logger (python): $PythonExe $($args -join ' ')"
+            $p = Start-Process -FilePath $PythonExe -ArgumentList $args -PassThru -WindowStyle Hidden
+            if ($p -and $p.Id) { $ambientPid = [int]$p.Id }
+          } else {
+            Write-Host "Ambient logger script not found: $ambientScript" -ForegroundColor Yellow
+          }
+        }
       }
     } catch {
       Write-Host "Ambient logger could not be started (continuing)." -ForegroundColor Yellow

@@ -46,6 +46,7 @@ from .runs_proxy_model import RunsProxyModel
 from core.settings_store import get_settings_path, load_json, save_json
 
 from core.version import __version__
+from core.resources import app_root
 from core.updater import (
     ReleaseInfo,
     UpdateError,
@@ -240,7 +241,7 @@ class MainWindow(QWidget):
         )
 
         # Results tree setup
-        runs_root = Path(__file__).parent.parent / "runs"
+        runs_root = app_root() / "runs"
         self._runs_model = QFileSystemModel()
         try:
             self._runs_root = runs_root

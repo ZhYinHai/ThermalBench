@@ -9,6 +9,7 @@ datas = [
     ('cli', 'cli'),
     ('core', 'core'),
     ('ui', 'ui'),
+    ('ambient_logger.py', '.'),
 ]
 binaries = []
 hiddenimports = []

@@ -160,9 +160,7 @@ def add_spd_hub_max(df: pd.DataFrame) -> None:
 
     Definition:
     - Find all columns matching "SPD Hub Temperature [°C]".
-    - Compute the average of each hub over the window.
-    - Pick the single hub with the highest average, and use *that hub's
-      time-series* as the derived "SPD Hub Max [°C]".
+    - Compute the per-timestamp maximum across all hubs.
     """
     spd_cols = [
         c for c in df.columns
@@ -172,13 +170,8 @@ def add_spd_hub_max(df: pd.DataFrame) -> None:
         return
 
     spd_numeric = df[spd_cols].apply(pd.to_numeric, errors="coerce")
-    means = spd_numeric.mean(axis=0, skipna=True)
-    means = means.dropna()
-    if means.empty:
-        return
-
-    best_col = str(means.idxmax())
-    df["SPD Hub Max [°C]"] = spd_numeric[best_col]
+    # True max series: at each timestamp, take the maximum across all SPD hubs.
+    df["SPD Hub Max [°C]"] = spd_numeric.max(axis=1, skipna=True)
 
 
 def is_spd_individual(col: str) -> bool:

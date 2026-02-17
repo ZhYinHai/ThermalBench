@@ -2,6 +2,20 @@ from pathlib import Path
 import sys
 
 
+def app_root() -> Path:
+  """Return the application root folder.
+
+  - Dev: repository root
+  - Frozen (PyInstaller): folder containing the executable
+  """
+  if getattr(sys, "frozen", False):
+    try:
+      return Path(sys.executable).resolve().parent
+    except Exception:
+      return Path.cwd()
+  return Path(__file__).resolve().parent.parent
+
+
 def resource_path(*parts: str) -> Path:
     """Return a Path to a resource file.
 

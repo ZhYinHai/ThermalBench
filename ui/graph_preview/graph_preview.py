@@ -1354,7 +1354,19 @@ class GraphPreview(QObject):
         if not getattr(self, "_temp_delta_mode", False):
             return df_raw
 
-        amb_col = self._find_ambient_col(df_raw)
+        # Ensure we have an ambient series available for delta mode.
+        # Many run_window.csv files may not include ambient unless it was merged
+        # during capture; try to inject it from sidecar files when possible.
+        try:
+            amb_col = self._find_ambient_col(df_raw)
+            if not amb_col:
+                df_with_amb = self._ensure_ambient_series_for_delta(df_raw)
+                if isinstance(df_with_amb, pd.DataFrame):
+                    self._preview_df_all_raw = df_with_amb
+                    df_raw = df_with_amb
+                    amb_col = self._find_ambient_col(df_raw)
+        except Exception:
+            amb_col = self._find_ambient_col(df_raw)
         if not amb_col:
             return df_raw
 
@@ -1400,6 +1412,171 @@ class GraphPreview(QObject):
         temp_idxs = self._temperature_column_indices(df_raw)
         if not temp_idxs:
             return df_raw
+
+        try:
+            # IMPORTANT: df_disp must not share data with df_raw.
+            # Delta mode must preserve the raw baseline so toggling ΔT off returns
+            # absolute temperatures rather than leaving the plot unchanged.
+            df_disp = df_raw.copy(deep=True)
+
+            try:
+                amb_arr = pd.to_numeric(df_raw.iloc[:, amb_idx], errors="coerce").to_numpy(dtype=float, copy=False)
+            except Exception:
+                amb_arr = np.asarray(pd.to_numeric(df_raw.iloc[:, amb_idx], errors="coerce").to_numpy(), dtype=float)
+
+            temp_idxs2 = [int(i) for i in list(temp_idxs) if int(i) != int(amb_idx)]
+            if not temp_idxs2:
+                return df_disp
+
+            # Vectorized delta for all temperature columns at once.
+            try:
+                y_mat = df_raw.iloc[:, temp_idxs2].to_numpy(dtype=float, copy=False)
+            except Exception:
+                # Fallback: per-column numeric coercion, then numpy.
+                cols_temp = [df_raw.columns[int(i)] for i in temp_idxs2]
+                tmp = df_raw.loc[:, cols_temp].apply(lambda s: pd.to_numeric(s, errors="coerce"))
+                y_mat = np.asarray(tmp.to_numpy(), dtype=float)
+
+            try:
+                delta_mat = y_mat - amb_arr.reshape((-1, 1))
+            except Exception:
+                delta_mat = y_mat - amb_arr[:, None]
+
+            # Avoid pandas dtype-incompatible in-place assignment warnings when
+            # temperature columns are int and delta values are float.
+            # Preserve duplicate column names by assigning by positional index.
+            try:
+                delta_mat = np.asarray(delta_mat, dtype=float)
+
+                cols_orig = df_disp.columns
+                df_disp.columns = range(int(df_disp.shape[1]))
+                df_disp.loc[:, temp_idxs2] = delta_mat
+                df_disp.columns = cols_orig
+            except Exception:
+                # Last-resort: assign columns one by one.
+                try:
+                    cols_orig = df_disp.columns
+                    df_disp.columns = range(int(df_disp.shape[1]))
+                    for j, col_i in enumerate(temp_idxs2):
+                        try:
+                            df_disp.loc[:, int(col_i)] = np.asarray(delta_mat[:, int(j)], dtype=float)
+                        except Exception:
+                            continue
+                finally:
+                    try:
+                        df_disp.columns = cols_orig
+                    except Exception:
+                        pass
+
+            return df_disp
+        except Exception:
+            return df_raw
+
+    def _ensure_ambient_series_for_delta(self, df_raw: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Best-effort: add an ambient temperature series to df_raw.
+
+        Sources (in priority order):
+        - ambient_window.csv (timeline, produced by cli/plot_hwinfo.py when ambient logging is enabled)
+        - avg_temperature.json (constant baseline, manual average room temperature)
+        """
+        try:
+            if not isinstance(df_raw, pd.DataFrame) or df_raw.empty:
+                return None
+
+            # If ambient is already present, nothing to do.
+            try:
+                if self._find_ambient_col(df_raw):
+                    return df_raw
+            except Exception:
+                pass
+
+            # Need a datetime index to merge timeline ambient.
+            try:
+                is_dt = (df_raw.index.dtype.kind == "M")
+            except Exception:
+                is_dt = False
+
+            run_dir = None
+            try:
+                p = getattr(self, "_preview_csv_path", None)
+                if p:
+                    run_dir = Path(str(p)).parent
+            except Exception:
+                run_dir = None
+
+            ambient_col_name = "Ambient [°C]"
+
+            # ---- 1) Merge ambient_window.csv timeline ----
+            try:
+                if run_dir is not None:
+                    aw = run_dir / "ambient_window.csv"
+                    if aw.exists() and aw.is_file() and is_dt:
+                        try:
+                            amb_df = pd.read_csv(str(aw), header=0)
+                        except Exception:
+                            amb_df = None
+
+                        if isinstance(amb_df, pd.DataFrame) and (not amb_df.empty):
+                            cols = {str(c).strip().lower(): str(c) for c in list(amb_df.columns)}
+                            dt_col = cols.get("dt") or cols.get("timestamp") or cols.get("time") or cols.get("datetime")
+                            v_col = cols.get("ambient_c") or cols.get("ambient") or cols.get("value")
+                            if dt_col and v_col:
+                                amb_dt = pd.to_datetime(amb_df[dt_col].astype(str), errors="coerce")
+                                amb_val = pd.to_numeric(amb_df[v_col], errors="coerce")
+                                amb2 = pd.DataFrame({"dt": amb_dt, "ambient_c": amb_val}).dropna(subset=["dt"])
+                                amb2 = amb2.sort_values("dt")
+                                if not amb2.empty:
+                                    left = pd.DataFrame({"_row": np.arange(len(df_raw), dtype=int), "dt": pd.to_datetime(df_raw.index)})
+                                    left = left.dropna(subset=["dt"]).sort_values("dt")
+                                    tol = pd.Timedelta(seconds=2)
+                                    merged = pd.merge_asof(
+                                        left,
+                                        amb2[["dt", "ambient_c"]],
+                                        on="dt",
+                                        direction="nearest",
+                                        tolerance=tol,
+                                    )
+
+                                    aligned = pd.Series(index=np.arange(len(df_raw), dtype=int), dtype="float64")
+                                    try:
+                                        aligned.loc[merged["_row"].to_numpy(dtype=int)] = merged["ambient_c"].to_numpy(dtype=float)
+                                    except Exception:
+                                        for _, r in merged.iterrows():
+                                            try:
+                                                aligned.loc[int(r["_row"])] = float(r["ambient_c"]) if pd.notna(r["ambient_c"]) else float("nan")
+                                            except Exception:
+                                                continue
+
+                                    out = df_raw.copy(deep=False)
+                                    out[ambient_col_name] = aligned.to_numpy(dtype=float, copy=False)
+                                    return out
+            except Exception:
+                pass
+
+            # ---- 2) Fallback: avg_temperature.json constant ----
+            try:
+                if run_dir is not None:
+                    aj = run_dir / "avg_temperature.json"
+                    if aj.exists() and aj.is_file():
+                        try:
+                            payload = json.loads(aj.read_text(encoding="utf-8", errors="ignore") or "{}")
+                        except Exception:
+                            payload = {}
+                        try:
+                            t0 = float(payload.get("manual_average_temperature"))
+                        except Exception:
+                            t0 = None
+
+                        if t0 is not None and np.isfinite(t0):
+                            out = df_raw.copy(deep=False)
+                            out[ambient_col_name] = float(t0)
+                            return out
+            except Exception:
+                pass
+
+            return None
+        except Exception:
+            return None
 
         try:
             # Performance: avoid df.astype(float64) on the whole dataframe.
