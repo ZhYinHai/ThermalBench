@@ -219,9 +219,10 @@ def plot_lines_with_glow(
     is_dt: bool,
     color_map: dict[str, str],
 ) -> tuple[dict[str, object], dict[str, np.ndarray], list[str]]:
-    base_lw = 2.6
-    glow_lw = base_lw + 2.0
-    glow_alpha = 0.18
+    # Thinner series lines for readability with many sensors/runs.
+    base_lw = 1.6
+    glow_lw = base_lw + 1.2
+    glow_alpha = 0.16
 
     line_kwargs = dict(
         linewidth=base_lw,

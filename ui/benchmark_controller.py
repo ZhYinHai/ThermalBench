@@ -16,7 +16,9 @@ from PySide6.QtWidgets import QTreeView, QFileSystemModel, QMessageBox
 from core.ps_helpers import RUNMAP_RE, ps_quote, build_ps_array_literal
 
 from core.resources import resource_path
+from core.hwinfo_metadata import load_sensor_map
 from ui.graph_preview.graph_plot_helpers import load_run_csv_dataframe
+from ui.graph_preview.graph_plot_helpers import extract_unit_from_column, get_measurement_type_label
 from ui.graph_preview.legend_popup_helpers import raise_center_and_focus
 from ui.graph_preview.ui_compare_popup import ComparePopup
 from ui.graph_preview.ui_dim_overlay import DimOverlay
@@ -293,14 +295,105 @@ class BenchmarkController:
         try:
             if self._compare_btn is None:
                 return
-            self._compare_btn.setEnabled(len(self._compare_selected_dirs) >= 2)
+
+            # Guard: don't allow comparing already-compared results.
+            # Compare-result folders are created by this app and contain compare_manifest.json.
+            valid = [p for p in (self._compare_selected_dirs or set()) if not self._is_compare_result_dir(p)]
+            self._compare_btn.setEnabled(len(valid) >= 2)
         except Exception:
             pass
+
+    @staticmethod
+    def _is_compare_result_dir(run_dir: Path) -> bool:
+        try:
+            if run_dir is None:
+                return False
+            p = Path(run_dir)
+            if not p.exists() or not p.is_dir():
+                return False
+            mp = p / "compare_manifest.json"
+            return mp.is_file()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _sort_sensors_for_compare(sensors: list[str], group_map: dict[str, str] | None = None) -> list[str]:
+        """Sort sensor column names for compare plotting.
+
+        Ordering:
+        1) Measurement type (Temperature first, then Power/RPM/Voltage/Percentage/Clock/Timing/other)
+        2) Within a type, prioritize CPU -> GPU -> Ambient -> other (using name and/or group_map)
+        3) Finally, stable alphabetical by sensor name
+        """
+
+        gm = dict(group_map or {})
+
+        type_prio = {
+            "Temperature": 0,
+            "Power (W)": 1,
+            "RPM": 2,
+            "Voltage (V)": 3,
+            "Percentage (%)": 4,
+            "Clock (MHz)": 5,
+            "Timing (T)": 6,
+        }
+
+        def _bucket_text(name: str) -> str:
+            # Use both the column name and its HWiNFO group title for better classification.
+            try:
+                grp = str(gm.get(name) or "")
+            except Exception:
+                grp = ""
+            return f"{name} {grp}".lower()
+
+        def _device_subprio(name: str) -> int:
+            t = _bucket_text(name)
+            # CPU-ish
+            if "cpu" in t or "package" in t or "ccd" in t or "tctl" in t:
+                return 0
+            # GPU-ish
+            if "gpu" in t:
+                return 1
+            # Ambient
+            if "ambient" in t or "room" in t:
+                return 2
+            return 3
+
+        def _type_label(name: str) -> str:
+            try:
+                unit = extract_unit_from_column(name)
+                return str(get_measurement_type_label(unit))
+            except Exception:
+                return "[other]"
+
+        def _sort_key(name: str):
+            tl = _type_label(name)
+            return (
+                int(type_prio.get(tl, 99)),
+                int(_device_subprio(name)),
+                str(name).lower(),
+            )
+
+        try:
+            return sorted([str(s) for s in (sensors or []) if str(s).strip()], key=_sort_key)
+        except Exception:
+            return [str(s) for s in (sensors or []) if str(s).strip()]
 
     def toggle_compare_selection_for_index(self, idx) -> None:
         """Double-click handler: toggles a run folder in the compare selection set."""
         run_dir = self._run_folder_from_index(idx)
         if run_dir is None:
+            return
+
+        # Don't allow selecting existing compare-results as inputs.
+        # If one is somehow present from an older version, prune it.
+        if self._is_compare_result_dir(run_dir):
+            try:
+                self._compare_selected_dirs.discard(run_dir)
+            except Exception:
+                pass
+            self._apply_compare_selection_to_view()
+            self._update_compare_btn_state()
             return
 
         try:
@@ -382,6 +475,16 @@ class BenchmarkController:
 
             title = f"Compare ({len(run_dirs)} results)"
 
+            # Best-effort: group sensors by their HWiNFO device group (cached from SM2).
+            # This is the same device grouping used by the sensor picker dialogs.
+            group_map: dict[str, str] = {}
+            try:
+                payload = load_sensor_map(resource_path("resources", "sensor_map.json"))
+                if isinstance(payload, dict) and payload.get("schema") == 1:
+                    group_map = dict(payload.get("mapping") or {})
+            except Exception:
+                group_map = {}
+
             top = self.parent.window() if hasattr(self.parent, "window") else self.parent
             self._set_compare_dimmed(True)
 
@@ -389,6 +492,7 @@ class BenchmarkController:
                 top,
                 title=title,
                 sensors=sorted(common),
+                group_map=group_map,
                 on_close=self._close_compare_popup,
                 on_compare=self._create_compare_result_from_popup,
             )
@@ -416,6 +520,16 @@ class BenchmarkController:
             sensors = [str(s) for s in (sensors or []) if str(s).strip()]
             if not sensors:
                 return
+
+            # Sort sensors so compare plots are consistently ordered.
+            try:
+                group_map: dict[str, str] = {}
+                payload = load_sensor_map(resource_path("resources", "sensor_map.json"))
+                if isinstance(payload, dict) and payload.get("schema") == 1:
+                    group_map = dict(payload.get("mapping") or {})
+                sensors = self._sort_sensors_for_compare(sensors, group_map=group_map)
+            except Exception:
+                sensors = self._sort_sensors_for_compare(sensors)
 
             run_dirs = list(sorted(self._compare_selected_dirs, key=lambda p: p.name))
             if len(run_dirs) < 2:
@@ -520,6 +634,14 @@ class BenchmarkController:
             except Exception:
                 pass
             self._close_compare_popup()
+
+            # Compare is complete; clear compare-input selection so the new compare result
+            # can remain selected/previewable in the results tree.
+            try:
+                self._compare_selected_dirs.clear()
+            except Exception:
+                self._compare_selected_dirs = set()
+            self._update_compare_btn_state()
 
             # Select and preview the new compare run
             try:
@@ -744,6 +866,19 @@ class BenchmarkController:
 
             p = Path(fpath)
             self._last_selected_path = p
+
+            # If the user clicks a compare-result folder, exit compare-selection mode.
+            # Otherwise selection-change logic may restore the previous compare-input
+            # selection and make compare results appear to "not show" when clicked.
+            try:
+                if p.is_dir() and self._is_compare_result_dir(p):
+                    try:
+                        self._compare_selected_dirs.clear()
+                    except Exception:
+                        self._compare_selected_dirs = set()
+                    self._update_compare_btn_state()
+            except Exception:
+                pass
 
             if self._suppress_selection_preview:
                 return

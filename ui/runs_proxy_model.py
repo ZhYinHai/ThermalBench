@@ -8,7 +8,7 @@ _RUN_FOLDER_RE = re.compile(
     r"\d{8}_\d{6}"
     r"|(?:CPU|GPU|CPUGPU)_W\d+_L\d+_V\d+"
     # Compare result folders (created by GUI): "<case> CPU vs <case> CPUGPU" (+ optional suffix)
-    r"|.+\s(?:CPU|GPU|CPUGPU)\svs\s.+\s(?:CPU|GPU|CPUGPU)(?:\s\+\d+)?"
+    r"|.+\s(?:CPU|GPU|CPUGPU)\svs\s.+\s(?:CPU|GPU|CPUGPU)(?:\s*\+\d+)*"
     r")$",
     re.IGNORECASE,
 )

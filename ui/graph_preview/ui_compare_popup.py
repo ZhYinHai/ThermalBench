@@ -6,6 +6,7 @@ Uses the same visual style as the Legend & Stats popup.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from typing import Iterable, Optional, Callable
 
 from PySide6.QtCore import Qt
@@ -32,6 +33,7 @@ class ComparePopup(QDialog):
         *,
         title: str,
         sensors: Iterable[str],
+        group_map: Optional[dict[str, str]] = None,
         on_close: Optional[Callable[[], None]] = None,
         on_compare: Optional[Callable[[list[str]], None]] = None,
     ):
@@ -76,7 +78,8 @@ class ComparePopup(QDialog):
         self.tree = QTreeWidget()
         self.tree.setColumnCount(1)
         self.tree.setHeaderHidden(True)
-        self.tree.setRootIsDecorated(False)
+        # Grouped view (device -> sensors) needs expand/collapse affordance.
+        self.tree.setRootIsDecorated(True)
         self.tree.setUniformRowHeights(True)
         self.tree.setSortingEnabled(False)
         self.tree.setSelectionMode(QAbstractItemView.MultiSelection)
@@ -91,8 +94,45 @@ class ComparePopup(QDialog):
         except Exception:
             pass
 
-        for s in sorted({str(x) for x in (sensors or [])}):
-            QTreeWidgetItem(self.tree, [s])
+        def _display_name(tok: str) -> str:
+            # Match other sensor dialogs: "X #1" -> "X  (#1)"
+            try:
+                t = str(tok)
+                if " #" in t:
+                    return t.replace(" #", "  (#") + ")"
+                return t
+            except Exception:
+                return str(tok)
+
+        gm = dict(group_map or {})
+
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for s in sorted({str(x) for x in (sensors or []) if str(x).strip()}):
+            grp = str(gm.get(s) or "").strip() or "Other"
+            grouped[grp].append(s)
+
+        # Insert groups + items
+        for grp in sorted(grouped.keys(), key=lambda x: str(x).lower()):
+            gitem = QTreeWidgetItem(self.tree, [str(grp)])
+            gitem.setFirstColumnSpanned(True)
+            # Group headers should not be selectable.
+            gitem.setFlags(Qt.ItemIsEnabled)
+            try:
+                f = gitem.font(0)
+                f.setBold(True)
+                gitem.setFont(0, f)
+            except Exception:
+                pass
+
+            for s in sorted(grouped.get(grp, []) or [], key=lambda x: str(x).lower()):
+                it = QTreeWidgetItem(gitem, [_display_name(s)])
+                it.setData(0, Qt.UserRole, str(s))
+                it.setFlags(it.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+
+        try:
+            self.tree.expandAll()
+        except Exception:
+            pass
 
         PAD = 14
         tree_wrap = QVBoxLayout()
@@ -105,6 +145,14 @@ class ComparePopup(QDialog):
         footer.setContentsMargins(0, 0, 0, 0)
         footer.setSpacing(8)
         footer.addStretch(1)
+
+        self.select_all_btn = QPushButton("Select all")
+        self.select_all_btn.setCursor(Qt.PointingHandCursor)
+        try:
+            self.select_all_btn.clicked.connect(self._select_all)
+        except Exception:
+            pass
+        footer.addWidget(self.select_all_btn)
 
         self.compare_btn = QPushButton("Compare")
         self.compare_btn.setCursor(Qt.PointingHandCursor)
@@ -149,11 +197,62 @@ class ComparePopup(QDialog):
         self.setMaximumSize(16777215, 16777215)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
 
+        # Make the popup taller/wider by default so more sensors are visible.
+        # Keep it resizable and allow content to drive larger sizes when needed.
+        try:
+            self.setMinimumSize(640, 480)
+            self.resize(920, 680)
+        except Exception:
+            pass
+
         self._update_compare_btn_state()
+
+    def _select_all(self) -> None:
+        try:
+            self.tree.blockSignals(True)
+
+            def _select_leaf_items(parent: QTreeWidgetItem) -> None:
+                try:
+                    for i in range(parent.childCount()):
+                        ch = parent.child(i)
+                        if ch is None:
+                            continue
+                        if ch.childCount() > 0:
+                            _select_leaf_items(ch)
+                            continue
+                        tok = ch.data(0, Qt.UserRole)
+                        if tok is None:
+                            continue
+                        ch.setSelected(True)
+                except Exception:
+                    pass
+
+            for i in range(self.tree.topLevelItemCount()):
+                top = self.tree.topLevelItem(i)
+                if top is None:
+                    continue
+                _select_leaf_items(top)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.tree.blockSignals(False)
+            except Exception:
+                pass
+            self._update_compare_btn_state()
 
     def selected_sensors(self) -> list[str]:
         try:
-            return [str(it.text(0)) for it in (self.tree.selectedItems() or [])]
+            out: list[str] = []
+            for it in (self.tree.selectedItems() or []):
+                # Only leaf sensor rows have a UserRole token.
+                tok = it.data(0, Qt.UserRole)
+                if tok is None:
+                    continue
+                s = str(tok).strip()
+                if s:
+                    out.append(s)
+            return out
         except Exception:
             return []
 
@@ -167,8 +266,7 @@ class ComparePopup(QDialog):
 
     def _update_compare_btn_state(self) -> None:
         try:
-            any_selected = bool(self.tree.selectedItems())
-            self.compare_btn.setEnabled(any_selected)
+            self.compare_btn.setEnabled(bool(self.selected_sensors()))
         except Exception:
             pass
 

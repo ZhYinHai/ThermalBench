@@ -252,13 +252,13 @@ class LiveGraphWidget(QFrame):
                     pass
             else:
                 try:
-                    ax.set_xlabel("Time (s)")
+                    ax.set_xlabel("Time (s)", color="#EAEAEA")
                 except Exception:
                     pass
 
             try:
                 if unit and unit != "other":
-                    ax.set_ylabel(f"[{unit}]", fontsize=9)
+                    ax.set_ylabel(f"[{unit}]", fontsize=9, color="white")
             except Exception:
                 pass
 
@@ -268,7 +268,7 @@ class LiveGraphWidget(QFrame):
                     (ln,) = ax.plot(
                         [],
                         [],
-                        linewidth=2.6,
+                        linewidth=1.6,
                         alpha=0.98,
                         color=colc,
                         solid_capstyle="round",
@@ -279,7 +279,7 @@ class LiveGraphWidget(QFrame):
                     try:
                         ln.set_path_effects(
                             [
-                                pe.Stroke(linewidth=4.6, foreground=colc, alpha=0.18),
+                                pe.Stroke(linewidth=2.8, foreground=colc, alpha=0.16),
                                 pe.Normal(),
                             ]
                         )
@@ -505,7 +505,7 @@ class LiveGraphWidget(QFrame):
                 except Exception:
                     pass
             try:
-                vis_axes[-1].set_xlabel("Time (s)")
+                vis_axes[-1].set_xlabel("Time (s)", color="#EAEAEA")
             except Exception:
                 pass
         except Exception:

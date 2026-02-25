@@ -41,6 +41,7 @@ from .graph_plot_helpers import (
 
 from .ui_dim_overlay import DimOverlay
 from .ui_legend_stats_popup import LegendStatsPopup
+from .ui_compare_legend_stats_popup import CompareLegendStatsPopup
 from .graph_stats_helpers import stats_from_summary_csv, stats_from_dataframe, infer_stats_title
 from .result_selection_store import (
     apply_saved_or_default_active_cols,
@@ -98,6 +99,7 @@ class GraphPreview(QObject):
 
         # popup + dim overlay
         self._legend_popup: Optional[LegendStatsPopup] = None
+        self._compare_legend_popup: Optional[CompareLegendStatsPopup] = None
         self._dim_overlay: Optional[DimOverlay] = None
 
         # data/series state
@@ -316,6 +318,10 @@ class GraphPreview(QObject):
         self._compare_axis_state = {}
         self._compare_last_canvas_wh = None
         self._compare_last_idx = None
+        self._compare_run_dirs: list[Path] = []
+        self._compare_run_labels: list[str] = []
+        self._compare_run_color_map: dict[str, str] = {}
+        self._compare_manifest_sensors: list[str] = []
 
         # single-mode multi-axis state (for splitting by measurement type)
         self._single_mode_multi_axis = False
@@ -2263,6 +2269,16 @@ class GraphPreview(QObject):
         if not self._is_over_ls_button(qt_x, qt_y):
             return False
 
+        # Compare mode: show per-run stats tables side-by-side.
+        if getattr(self, "_compare_mode", False):
+            if not (getattr(self, "_compare_manifest_sensors", None) or []):
+                return True
+            try:
+                self._open_compare_legend_popup()
+            except Exception:
+                pass
+            return True
+
         if not self._preview_available_cols:
             return True
 
@@ -2279,8 +2295,14 @@ class GraphPreview(QObject):
                 self._legend_popup.close()
         except Exception:
             pass
+        try:
+            if self._compare_legend_popup is not None and self._compare_legend_popup.isVisible():
+                self._compare_legend_popup.close()
+        except Exception:
+            pass
         self._set_dimmed(False)
         self._legend_popup = None
+        self._compare_legend_popup = None
 
     # ---------------------------------------------------------------------
     # Hover / tooltip (single mode)
@@ -2861,6 +2883,111 @@ class GraphPreview(QObject):
 
         QTimer.singleShot(0, _after_show_1)
 
+    def _open_compare_legend_popup(self) -> None:
+        try:
+            if self._compare_legend_popup is not None and self._compare_legend_popup.isVisible():
+                self._compare_legend_popup.close()
+                self._compare_legend_popup = None
+                self._set_dimmed(False)
+                return
+        except Exception:
+            pass
+
+        sensors = list(getattr(self, "_compare_manifest_sensors", None) or [])
+        run_dirs = list(getattr(self, "_compare_run_dirs", None) or [])
+        run_labels = list(getattr(self, "_compare_run_labels", None) or [])
+        run_color_map = dict(getattr(self, "_compare_run_color_map", None) or {})
+
+        if not sensors or len(run_dirs) < 2:
+            return
+
+        def _stats_for_run_dir(rd: Path) -> tuple[dict[str, tuple[float, float, float]], Optional[float]]:
+            try:
+                csvp = rd / "run_window.csv"
+                if not csvp.exists():
+                    return {}, None
+
+                # Absolute stats
+                abs_stats: dict[str, tuple[float, float, float]] = {}
+                try:
+                    abs_stats = stats_from_summary_csv(str(csvp)) or {}
+                except Exception:
+                    abs_stats = {}
+
+                # Load raw dataframe (needed for accurate delta-T when ambient exists).
+                df_all, cols = load_run_csv_dataframe(str(csvp))
+                keep = [c for c in sensors if c in (cols or [])]
+                if not abs_stats:
+                    if keep:
+                        abs_stats = stats_from_dataframe(df_all[keep])
+                    else:
+                        abs_stats = stats_from_dataframe(df_all)
+
+                # Ambient average baseline for ΔT = Avg(temp) - Avg(ambient)
+                ambient_avg: Optional[float] = None
+                try:
+                    ambient_col = self._find_ambient_col(df_all) if isinstance(df_all, pd.DataFrame) else None
+                    if ambient_col and ambient_col in df_all.columns:
+                        amb = pd.to_numeric(df_all[ambient_col], errors="coerce")
+                        if amb.notna().any():
+                            v = float(amb.mean(skipna=True))
+                            if np.isfinite(v):
+                                ambient_avg = v
+                except Exception:
+                    ambient_avg = None
+
+                return abs_stats, ambient_avg
+            except Exception:
+                return {}, None
+
+        run_tables: list[dict] = []
+        for rd, lbl in zip(run_dirs, run_labels):
+            abs_stats, ambient_avg = _stats_for_run_dir(rd)
+
+            test_settings = None
+            try:
+                sp = rd / "test_settings.json"
+                if sp.exists() and sp.is_file():
+                    test_settings = json.loads(sp.read_text(encoding="utf-8"))
+            except Exception:
+                test_settings = None
+
+            run_tables.append(
+                {
+                    "label": str(lbl),
+                    "color": str(run_color_map.get(str(lbl), "#BDBDBD")),
+                    "stats_map": abs_stats,
+                    "ambient_avg": ambient_avg,
+                    "test_settings": test_settings,
+                }
+            )
+
+        top = self.parent.window() if hasattr(self.parent, "window") else self.parent
+
+        self._set_dimmed(True)
+
+        self._compare_legend_popup = CompareLegendStatsPopup(
+            top,
+            title=f"Legend and Stats ({len(run_tables)} results)",
+            sensors=sensors,
+            run_tables=run_tables,
+            on_close=self._on_legend_popup_closed,
+        )
+
+        self._install_outside_click_closer()
+        self._compare_legend_popup.show()
+
+        def _after_show():
+            if self._compare_legend_popup is None:
+                return
+            try:
+                self._ensure_dim_overlay()
+            except Exception:
+                pass
+            raise_center_and_focus(parent=top, dlg=self._compare_legend_popup, dim_overlay=self._dim_overlay)
+
+        QTimer.singleShot(0, _after_show)
+
     def _preview_schedule_set_active_cols(self, cols: list[str]) -> None:
         """Debounce legend toggles so multiple clicks batch into one redraw."""
         try:
@@ -3317,6 +3444,9 @@ class GraphPreview(QObject):
             self._preview_label.clear()
             return
 
+        # Keep manifest sensors for compare Legend & stats popup.
+        self._compare_manifest_sensors = list(sensors)
+
         # manifest lives at: runs/<compare_case>/<compare_run>/compare_manifest.json
         # so runs root is 2 parents up.
         try:
@@ -3377,6 +3507,10 @@ class GraphPreview(QObject):
                 run_labels.append(base if n == 1 else f"{base} #{n}")
             except Exception:
                 run_labels.append(str(rel))
+
+        # Keep compare run metadata for compare Legend & stats popup.
+        self._compare_run_dirs = list(run_dirs)
+        self._compare_run_labels = list(run_labels)
 
         # -----------------------------
         # Load run CSVs (keep only requested sensors)
@@ -3475,6 +3609,7 @@ class GraphPreview(QObject):
         run_color_map: dict[str, str] = {}
         for j, lbl in enumerate(run_labels):
             run_color_map[str(lbl)] = palette[j % len(palette)]
+        self._compare_run_color_map = dict(run_color_map)
 
         # -----------------------------
         # Per-axis Qt tooltip widgets (compare mode shows one per subplot)
@@ -3619,6 +3754,28 @@ class GraphPreview(QObject):
                 )
             except Exception:
                 pass
+
+            # Legend & stats button only on the TOP-most compare subplot.
+            # Keep it flush-right but align its Y anchor to the sensor label Y (y=1.0).
+            if i == 0:
+                try:
+                    self._ls_btn_text = ax.text(
+                        0.995,
+                        1.0,
+                        "≡ Legend & stats",
+                        transform=ax.transAxes,
+                        ha="right",
+                        va="bottom",
+                        fontsize=9,
+                        color="#BDBDBD",
+                        zorder=3000,
+                        clip_on=False,
+                        bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
+                    )
+                    self._ls_btn_bbox = None
+                except Exception:
+                    self._ls_btn_text = None
+                    self._ls_btn_bbox = None
 
             if i == (n - 1):
                 apply_elapsed_time_formatter(ax, is_dt=is_dt, x_vals=x_vals)
@@ -3926,9 +4083,7 @@ class GraphPreview(QObject):
         except Exception:
             pass
 
-        # Disable legend&stats + delta toggle buttons in compare mode
-        self._ls_btn_text = None
-        self._ls_btn_bbox = None
+        # Compare mode uses Legend & stats; keep delta/zero toggles disabled.
         self._delta_btn_text = None
         self._delta_btn_bbox = None
         self._zero_btn_text = None
