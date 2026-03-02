@@ -1,11 +1,12 @@
 # ui/main_window.py
 import os
 import sys
+import json
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QSize, QTimer, QObject, QThread, Signal
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import Qt, QSize, QTimer, QObject, QThread, Signal, QEvent, QItemSelectionModel
+from PySide6.QtGui import QIcon, QPainter, QColor, QPalette
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -26,6 +27,10 @@ from PySide6.QtWidgets import (
     QFrame,
     QMessageBox,
     QProgressDialog,
+    QMenu,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QStyle,
 )
 
 from .widgets.ui_theme import apply_theme, style_combobox_popup
@@ -46,6 +51,9 @@ from .runs_proxy_model import RunsProxyModel
 from core.settings_store import get_settings_path, load_json, save_json
 
 from ui.ntfy_notifier import NtfyNotifier
+
+from ui.graph_preview.ui_dim_overlay import DimOverlay
+from ui.graph_preview.legend_popup_helpers import raise_center_and_focus
 
 from core.version import __version__
 from core.resources import app_root
@@ -106,7 +114,412 @@ class _DownloadInstallerWorker(QObject):
             self.failed.emit(str(e))
 
 
+class _CompareNameDelegate(QStyledItemDelegate):
+    """Paint the selected compare folder name with per-run colors.
+
+    Activates only while RunsProxyModel reports an active compare directory.
+    """
+
+    @staticmethod
+    def _norm_path(p: str) -> str:
+        try:
+            return os.path.normcase(os.path.abspath(str(p)))
+        except Exception:
+            return str(p or "")
+
+    def paint(self, painter: QPainter, option, index):
+        try:
+            model = index.model()
+            get_active = getattr(model, "get_active_compare_dir_norm", None)
+            get_seg_colors = getattr(model, "get_active_compare_segment_colors", None)
+            if not (callable(get_active) and callable(get_seg_colors)):
+                return super().paint(painter, option, index)
+
+            # Determine this index's filesystem path and whether it is a compare-result directory.
+            path = None
+            is_dir = False
+            try:
+                if hasattr(model, "mapToSource") and hasattr(model, "sourceModel"):
+                    sm = model.sourceModel()
+                    src = model.mapToSource(index)
+                    if sm is not None and hasattr(sm, "filePath") and src.isValid():
+                        path = sm.filePath(src)
+                        if hasattr(sm, "isDir"):
+                            is_dir = bool(sm.isDir(src))
+                elif hasattr(model, "filePath"):
+                    path = model.filePath(index)
+                    if hasattr(model, "isDir"):
+                        is_dir = bool(model.isDir(index))
+            except Exception:
+                path = None
+                is_dir = False
+
+            if not path:
+                return super().paint(painter, option, index)
+
+            is_compare_case_dir = False
+            try:
+                is_compare_case_fn = getattr(model, "is_compare_case_dir_path", None)
+                if is_dir and callable(is_compare_case_fn):
+                    is_compare_case_dir = bool(is_compare_case_fn(path))
+            except Exception:
+                is_compare_case_dir = False
+
+            # Compare marker prefix (drawn by delegate so it can be colored).
+            compare_prefix = "↔ "
+            try:
+                get_pref = getattr(model, "get_compare_prefix", None)
+                if callable(get_pref):
+                    compare_prefix = str(get_pref() or compare_prefix)
+            except Exception:
+                pass
+
+            def _symbol_pen_color(opt: QStyleOptionViewItem) -> QColor:
+                try:
+                    # Prefer a subtle "secondary" role if available.
+                    if not (opt.state & QStyle.State_Selected):
+                        try:
+                            link = opt.palette.color(QPalette.Link)
+                            if isinstance(link, QColor) and link.isValid():
+                                c = QColor(link)
+                                c.setAlpha(min(int(c.alpha()), 220))
+                                return c
+                        except Exception:
+                            pass
+                        try:
+                            ph = opt.palette.color(QPalette.PlaceholderText)
+                            if isinstance(ph, QColor) and ph.isValid():
+                                return QColor(ph)
+                        except Exception:
+                            pass
+
+                    base = (
+                        opt.palette.color(QPalette.HighlightedText)
+                        if (opt.state & QStyle.State_Selected)
+                        else opt.palette.color(QPalette.Text)
+                    )
+                    c = QColor(base)
+                    # Nudge toward higher contrast without introducing new theme colors.
+                    if c.lightness() < 128:
+                        c = c.lighter(165)
+                    else:
+                        c = c.darker(165)
+                    return QColor(c)
+                except Exception:
+                    return QColor(opt.palette.text().color())
+
+            def _paint_compare_prefix_and_text(txt: str) -> None:
+                if not txt:
+                    super().paint(painter, option, index)
+                    return
+
+                opt = QStyleOptionViewItem(option)
+                self.initStyleOption(opt, index)
+                opt.text = ""
+                style = opt.widget.style() if opt.widget is not None else QApplication.style()
+                style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+
+                text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, opt.widget)
+                fm = opt.fontMetrics
+                baseline = text_rect.y() + (text_rect.height() + fm.ascent() - fm.descent()) // 2
+
+                painter.save()
+                painter.setClipRect(option.rect)
+
+                x = text_rect.x()
+
+                pref = str(compare_prefix or "")
+                pref_w = fm.horizontalAdvance(pref) if pref else 0
+                avail = max(0, int(text_rect.width() - pref_w))
+                txt_elided = fm.elidedText(txt, Qt.ElideRight, avail)
+
+                if pref:
+                    painter.setPen(_symbol_pen_color(opt))
+                    painter.drawText(x, baseline, pref)
+                    x += pref_w
+
+                txt_pen = (
+                    opt.palette.color(QPalette.HighlightedText)
+                    if (opt.state & QStyle.State_Selected)
+                    else opt.palette.color(QPalette.Text)
+                )
+                painter.setPen(QColor(txt_pen))
+                painter.drawText(x, baseline, txt_elided)
+
+                painter.restore()
+                return
+
+            active_norm = get_active()
+
+            # If this is a compare-result directory but NOT the active compare selection,
+            # draw the compare marker symbol in a subtle color and keep the folder name normal.
+            if is_compare_case_dir and (not active_norm or self._norm_path(path) != str(active_norm)):
+                txt = str(index.data(Qt.DisplayRole) or "")
+                _paint_compare_prefix_and_text(txt)
+                return
+
+            # Active compare selection: keep existing multi-color segment painting.
+            if not active_norm or self._norm_path(path) != str(active_norm):
+                return super().paint(painter, option, index)
+
+            txt = str(index.data(Qt.DisplayRole) or "")
+            seg_colors = list(get_seg_colors() or [])
+            if (not txt) or (" vs " not in txt) or (not seg_colors):
+                # Fallback: still show the compare marker in a consistent color.
+                if is_compare_case_dir:
+                    _paint_compare_prefix_and_text(txt)
+                    return
+                return super().paint(painter, option, index)
+
+            # Backward-compat: if any model still includes the prefix in DisplayRole, strip it.
+            has_prefix = bool(compare_prefix and txt.startswith(compare_prefix))
+            txt_for_split = txt[len(compare_prefix) :] if has_prefix else txt
+
+            # Draw the item (selection/background/etc) but suppress default text.
+            opt = QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            opt.text = ""
+            style = opt.widget.style() if opt.widget is not None else QApplication.style()
+            style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+
+            # Paint colored segments inside the text rect.
+            text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, opt.widget)
+            fm = opt.fontMetrics
+            baseline = text_rect.y() + (text_rect.height() + fm.ascent() - fm.descent()) // 2
+
+            painter.save()
+            painter.setClipRect(option.rect)
+
+            x = text_rect.x()
+
+            # Only show the compare marker on the parent compare *case* folder, not the compare
+            # run folder that contains the manifest.
+            pref = str(compare_prefix or "")
+            if is_compare_case_dir and pref:
+                painter.setPen(_symbol_pen_color(opt))
+                painter.drawText(x, baseline, pref)
+                x += fm.horizontalAdvance(pref)
+
+            parts = txt_for_split.split(" vs ")
+            for i, part in enumerate(parts):
+                color = seg_colors[i] if i < len(seg_colors) else opt.palette.text().color()
+
+                painter.setPen(QColor(color))
+                painter.drawText(x, baseline, part)
+                x += fm.horizontalAdvance(part)
+
+                if i != (len(parts) - 1):
+                    sep = " vs "
+                    painter.setPen(opt.palette.text().color())
+                    painter.drawText(x, baseline, sep)
+                    x += fm.horizontalAdvance(sep)
+
+            painter.restore()
+            return
+        except Exception:
+            return super().paint(painter, option, index)
+
+
 class MainWindow(QWidget):
+    def _update_compare_manifests_for_case_rename(self, *, old_case: str, new_case: str) -> None:
+        """Rewrite compare manifests so compare results survive case-folder renames.
+
+        Compare manifests store run paths relative to the runs root like:
+          "runs": ["<case>/<run>", ...]
+
+        If the case folder is renamed, those references break. This method scans all
+        compare result folders and rewrites any run path whose first segment equals
+        old_case to use new_case.
+        """
+        try:
+            old_case = str(old_case or "").strip()
+            new_case = str(new_case or "").strip()
+            if not old_case or not new_case or old_case == new_case:
+                return
+
+            runs_root = Path(getattr(self, "_runs_root", "") or "")
+            if not runs_root.exists() or not runs_root.is_dir():
+                return
+
+            try:
+                runs_root_r = runs_root.resolve()
+            except Exception:
+                runs_root_r = runs_root
+
+            def _rewrite_run_ref(ref: str) -> str:
+                s = str(ref or "").strip()
+                if not s:
+                    return s
+
+                # Try to interpret as absolute path first.
+                try:
+                    p = Path(s)
+                    if p.is_absolute():
+                        try:
+                            rel = p.resolve().relative_to(runs_root_r)
+                            parts = list(rel.parts)
+                            if parts and parts[0] == old_case:
+                                parts[0] = new_case
+                                return "/".join(parts)
+                            return "/".join(parts)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # Relative path: normalize separators.
+                parts = [p for p in s.replace("\\", "/").split("/") if p]
+                if parts and parts[0] == old_case:
+                    parts[0] = new_case
+                    return "/".join(parts)
+                return "/".join(parts)
+
+            # Scan: runs/<case>/<run>/compare_manifest.json
+            for case_ent in os.scandir(str(runs_root)):
+                if not case_ent.is_dir():
+                    continue
+                try:
+                    for run_ent in os.scandir(case_ent.path):
+                        if not run_ent.is_dir():
+                            continue
+                        mp = Path(run_ent.path) / "compare_manifest.json"
+                        if not mp.is_file():
+                            continue
+                        try:
+                            m = json.loads(mp.read_text(encoding="utf-8"))
+                        except Exception:
+                            m = {}
+
+                        runs_list = m.get("runs")
+                        if not isinstance(runs_list, list) or not runs_list:
+                            continue
+
+                        new_runs = []
+                        changed = False
+                        for r in runs_list:
+                            nr = _rewrite_run_ref(str(r))
+                            if nr != str(r):
+                                changed = True
+                            new_runs.append(nr)
+
+                        if not changed:
+                            continue
+
+                        m["runs"] = new_runs
+                        try:
+                            mp.write_text(json.dumps(m, indent=2), encoding="utf-8")
+                        except Exception:
+                            # best-effort; ignore individual failures
+                            pass
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _rename_compare_folders_for_case_rename(self, *, old_case: str, new_case: str) -> None:
+        """Rename compare-result directories whose names include a renamed case.
+
+        This keeps the *folder names* in the Results tree consistent after a case rename.
+
+        We only operate on folders that are confirmed compare results (contain a
+        compare_manifest.json with type == "compare").
+        """
+        try:
+            old_case = str(old_case or "").strip()
+            new_case = str(new_case or "").strip()
+            if not old_case or not new_case or old_case == new_case:
+                return
+
+            runs_root = Path(getattr(self, "_runs_root", "") or "")
+            if not runs_root.exists() or not runs_root.is_dir():
+                return
+
+            # Collect compare run dirs first (don't rename while scanning).
+            compare_run_dirs: list[Path] = []
+            try:
+                for case_ent in os.scandir(str(runs_root)):
+                    if not case_ent.is_dir():
+                        continue
+                    try:
+                        for run_ent in os.scandir(case_ent.path):
+                            if not run_ent.is_dir():
+                                continue
+                            rd = Path(run_ent.path)
+                            mp = rd / "compare_manifest.json"
+                            if not mp.is_file():
+                                continue
+                            try:
+                                m = json.loads(mp.read_text(encoding="utf-8"))
+                            except Exception:
+                                m = {}
+                            if str(m.get("type") or "").strip().lower() != "compare":
+                                continue
+                            compare_run_dirs.append(rd)
+                    except Exception:
+                        continue
+            except Exception:
+                compare_run_dirs = []
+
+            # First rename parent compare case dirs (so children move once).
+            # Map: old_case_dir -> desired_case_dir
+            case_dir_moves: dict[Path, Path] = {}
+            for rd in compare_run_dirs:
+                try:
+                    cd = rd.parent
+                    if cd is None:
+                        continue
+                    desired_name = str(cd.name).replace(old_case, new_case)
+                    if desired_name and desired_name != cd.name:
+                        dest = cd.parent / desired_name
+                        case_dir_moves[cd] = dest
+                except Exception:
+                    continue
+
+            for src, dest in list(case_dir_moves.items()):
+                try:
+                    if not src.exists() or not src.is_dir():
+                        continue
+                    if dest.exists():
+                        # Avoid collisions; keep existing name rather than inventing one.
+                        continue
+                    src.rename(dest)
+                except Exception:
+                    continue
+
+            # Then rename compare run dirs (some may have moved with their parent).
+            for rd in compare_run_dirs:
+                try:
+                    # Re-resolve current location if parent moved.
+                    mp = rd / "compare_manifest.json"
+                    if not mp.is_file():
+                        # Try to find moved folder by walking parent moves.
+                        try:
+                            cd = rd.parent
+                            if cd in case_dir_moves:
+                                rd2 = case_dir_moves[cd] / rd.name
+                                rd = rd2
+                                mp = rd / "compare_manifest.json"
+                        except Exception:
+                            pass
+
+                    if not rd.exists() or not rd.is_dir():
+                        continue
+                    if not mp.is_file():
+                        continue
+
+                    desired_run_name = str(rd.name).replace(old_case, new_case)
+                    if not desired_run_name or desired_run_name == rd.name:
+                        continue
+                    dest = rd.parent / desired_run_name
+                    if dest.exists():
+                        continue
+                    rd.rename(dest)
+                except Exception:
+                    continue
+
+        except Exception:
+            pass
+
     def __init__(self):
         super().__init__()
 
@@ -269,6 +682,20 @@ class MainWindow(QWidget):
             self._runs_tree.setExpandsOnDoubleClick(False)
         except Exception:
             pass
+
+        # Right-click context menu for case folders (runs/<case>)
+        try:
+            self._runs_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+            self._runs_tree.customContextMenuRequested.connect(self._on_runs_tree_context_menu)
+        except Exception:
+            pass
+
+        # Track last mouse button so right-click does not trigger left-click behavior.
+        try:
+            self._runs_tree.setProperty("_tb_last_button", int(Qt.LeftButton))
+            self._runs_tree.viewport().installEventFilter(self)
+        except Exception:
+            pass
         self._runs_tree.setStyleSheet("""
             QTreeView {
                 border: none;
@@ -282,9 +709,8 @@ class MainWindow(QWidget):
         self.compare_btn.setEnabled(False)
         self.compare_btn.setCursor(Qt.PointingHandCursor)
 
-        self.remove_result_btn = QPushButton("Remove Selected")
-        self.remove_result_btn.setEnabled(False)
-        self.remove_result_btn.setCursor(Qt.PointingHandCursor)
+        # Removed: bottom "Remove Selected" button (deletion is available via right-click menu).
+        self.remove_result_btn = None
 
         # Use proxy model if present
         self._runs_proxy = None
@@ -303,11 +729,25 @@ class MainWindow(QWidget):
             except Exception:
                 pass
 
+        # Multi-colored compare folder name when a compare result is selected.
+        try:
+            self._runs_tree_compare_delegate = _CompareNameDelegate(self._runs_tree)
+            self._runs_tree.setItemDelegate(self._runs_tree_compare_delegate)
+        except Exception:
+            self._runs_tree_compare_delegate = None
+
         for c in range(1, 4):
             try:
                 self._runs_tree.hideColumn(c)
             except Exception:
                 pass
+
+        # Enable sorting so compare cases can be grouped at the bottom.
+        try:
+            self._runs_tree.setSortingEnabled(True)
+            self._runs_tree.sortByColumn(0, Qt.AscendingOrder)
+        except Exception:
+            pass
 
         # Enable single-click to expand/collapse folders
         self._runs_tree.clicked.connect(self._toggle_tree_item)
@@ -321,7 +761,7 @@ class MainWindow(QWidget):
             abort_btn=self.abort_btn,
             open_btn=self.open_btn,
             live_timer=self.live_timer,
-            remove_btn=self.remove_result_btn,
+            remove_btn=None,
             compare_btn=self.compare_btn,
             runs_tree=self._runs_tree,
             runs_model=self._runs_tree.model(),        # proxy or source (whatever the tree uses)
@@ -346,7 +786,7 @@ class MainWindow(QWidget):
         self.abort_btn.clicked.connect(self.benchmark.abort)
         self.open_btn.clicked.connect(self.benchmark.open_run_folder)
         self.compare_btn.clicked.connect(self.benchmark.compare_selected_results)
-        self.remove_result_btn.clicked.connect(self.benchmark.remove_selected_result)
+        # Removed: bottom delete button
 
         try:
             self._runs_tree.doubleClicked.connect(self.benchmark.toggle_compare_selection_for_index)
@@ -628,11 +1068,24 @@ class MainWindow(QWidget):
         results_layout.setSpacing(8)
 
         splitter = QSplitter(Qt.Horizontal)
-        # Results page splitter: keep the folder tree around ~20% of window width by default.
+        # Results page splitter: keep the folder tree around ~45% of window width by default.
         # If the user drags the splitter, we remember their ratio and preserve it on resize.
         self._results_split = splitter
-        self._results_split_ratio = (0.15, 0.85)
+        self._results_split_ratio = (0.45, 0.55)
         self._results_split_user_set = False
+        # Splitter drag smoothness: avoid heavy redraws (matplotlib) on every pixel.
+        try:
+            splitter.setOpaqueResize(False)
+        except Exception:
+            pass
+
+        self._results_split_dragging = False
+        self._results_split_drag_timer = QTimer(self)
+        try:
+            self._results_split_drag_timer.setSingleShot(True)
+            self._results_split_drag_timer.timeout.connect(self._on_results_split_drag_finished)
+        except Exception:
+            pass
         try:
             splitter.splitterMoved.connect(self._on_results_splitter_moved)
         except Exception:
@@ -652,7 +1105,7 @@ class MainWindow(QWidget):
         tree_footer.setContentsMargins(10, 0, 10, 5)
         tree_footer.setSpacing(4)
         tree_footer.addWidget(self.compare_btn)
-        tree_footer.addWidget(self.remove_result_btn)
+        # Removed: bottom delete button
         tree_panel_layout.addLayout(tree_footer)
 
         splitter.addWidget(tree_panel)
@@ -672,7 +1125,7 @@ class MainWindow(QWidget):
             splitter.setCollapsible(0, False)
             splitter.setCollapsible(1, False)
             total = self.width() or DEFAULT_W
-            left = max(120, int(total * 0.20))
+            left = max(220, int(total * 0.45))
             right = max(400, total - left)
             splitter.setSizes([left, right])
         except Exception:
@@ -1361,10 +1814,348 @@ class MainWindow(QWidget):
 
     def _toggle_tree_item(self, index):
         """Toggle expand/collapse state of tree item on single click."""
+        # Ignore right-click: it should open context menu only.
+        try:
+            btn = self._runs_tree.property("_tb_last_button")
+            if btn is not None and int(btn) == int(Qt.RightButton):
+                return
+        except Exception:
+            pass
+
+        try:
+            # Special-case: top-level case folders under runs root.
+            # Clicking a case folder should expand it (so the newest run we auto-select is visible)
+            # but should not collapse it on the same click.
+            if index is not None and (not hasattr(index, "isValid") or index.isValid()):
+                try:
+                    root_idx = self._runs_tree.rootIndex()
+                except Exception:
+                    root_idx = None
+
+                try:
+                    parent = index.parent()
+                except Exception:
+                    parent = None
+
+                is_case_top = False
+                try:
+                    if root_idx is not None and parent is not None:
+                        is_case_top = (
+                            parent.isValid()
+                            and root_idx.isValid()
+                            and parent == root_idx
+                        )
+                except Exception:
+                    is_case_top = False
+
+                if is_case_top:
+                    try:
+                        self._runs_tree.expand(index)
+                    except Exception:
+                        pass
+                    return
+        except Exception:
+            pass
+
         if self._runs_tree.isExpanded(index):
             self._runs_tree.collapse(index)
         else:
             self._runs_tree.expand(index)
+
+    def eventFilter(self, obj, event):
+        """Track mouse button used in the results tree.
+
+        We use this to ensure right-click does not trigger the same behavior as left-click
+        (auto-expand/select/preview).
+        """
+        try:
+            if getattr(self, "_runs_tree", None) is not None and obj is self._runs_tree.viewport():
+                if event is not None and event.type() == QEvent.MouseButtonPress:
+                    try:
+                        self._runs_tree.setProperty("_tb_last_button", int(event.button()))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return super().eventFilter(obj, event)
+
+    def _runs_tree_index_to_path(self, idx) -> str:
+        try:
+            if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
+                return ""
+            # Tree model can be proxy; always map to QFileSystemModel for the file path.
+            if getattr(self, "_runs_proxy", None) is not None and hasattr(self._runs_proxy, "mapToSource"):
+                src = self._runs_proxy.mapToSource(idx)
+                return self._runs_model.filePath(src)
+            return self._runs_model.filePath(idx)
+        except Exception:
+            return ""
+
+    def _is_case_folder(self, p: Path) -> bool:
+        try:
+            if p is None:
+                return False
+            p = Path(p)
+            if not p.exists() or not p.is_dir():
+                return False
+            rr = getattr(self, "_runs_root", None)
+            if rr is None:
+                return False
+            try:
+                return p.resolve().parent == Path(rr).resolve()
+            except Exception:
+                return p.parent == rr
+        except Exception:
+            return False
+
+    def _on_runs_tree_context_menu(self, pos) -> None:
+        """Right-click context menu for files/folders in the Results tree."""
+        try:
+            if getattr(self, "_runs_tree", None) is None:
+                return
+
+            idx = self._runs_tree.indexAt(pos)
+            if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
+                return
+
+            # If the right-clicked row isn't selected, select it so actions apply to it.
+            try:
+                sm = self._runs_tree.selectionModel()
+                if sm is not None and (not sm.isSelected(idx)):
+                    sm.setCurrentIndex(
+                        idx,
+                        QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                    )
+            except Exception:
+                pass
+
+            fpath = self._runs_tree_index_to_path(idx)
+            if not fpath:
+                return
+
+            target = Path(fpath)
+            is_case = self._is_case_folder(target)
+
+            menu = QMenu(self)
+            # Add a visible hover effect for menu items (dark theme friendly).
+            try:
+                menu.setStyleSheet(
+                    """
+                    QMenu {
+                        background-color: #1E1E1E;
+                        border: 1px solid rgba(128, 128, 128, 0.3);
+                        padding: 4px;
+                    }
+                    QMenu::item {
+                        padding: 6px 22px;
+                        color: #EAEAEA;
+                    }
+                    QMenu::item:selected {
+                        background-color: rgba(255,255,255,0.06);
+                    }
+                    """
+                )
+            except Exception:
+                pass
+
+            act_rename = None
+            if is_case:
+                act_rename = menu.addAction("Rename…")
+            act_remove = menu.addAction("Remove")
+
+            chosen = menu.exec(self._runs_tree.viewport().mapToGlobal(pos))
+            if chosen is None:
+                return
+
+            if chosen == act_remove:
+                try:
+                    if hasattr(self, "benchmark") and hasattr(self.benchmark, "remove_selected_tree_items"):
+                        self.benchmark.remove_selected_tree_items()
+                    elif hasattr(self, "benchmark") and hasattr(self.benchmark, "remove_selected_results"):
+                        self.benchmark.remove_selected_results()
+                except Exception:
+                    pass
+                return
+
+            if act_rename is not None and chosen == act_rename:
+                case_dir = target
+                cur_name = case_dir.name
+                new_name = ""
+                ok = False
+                try:
+                    # Custom frameless rename dialog (no native white header/title bar).
+                    dlg = QDialog(self)
+                    try:
+                        dlg.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+                    except Exception:
+                        pass
+                    dlg.setModal(True)
+
+                    # Dim the main window while the dialog is open.
+                    top = self.window() if hasattr(self, "window") else self
+                    dim = None
+                    try:
+                        dim = DimOverlay(top, on_click=lambda: dlg.reject())
+                        try:
+                            dim.setGeometry(top.rect())
+                        except Exception:
+                            pass
+                        dim.show()
+                    except Exception:
+                        dim = None
+
+                    root = QVBoxLayout(dlg)
+                    root.setContentsMargins(16, 14, 16, 14)
+                    root.setSpacing(10)
+
+                    lab = QLabel("New name:")
+                    edit = QLineEdit()
+                    edit.setText(cur_name)
+                    try:
+                        edit.selectAll()
+                    except Exception:
+                        pass
+
+                    btn_row = QHBoxLayout()
+                    btn_row.setContentsMargins(0, 4, 0, 0)
+                    btn_row.setSpacing(8)
+                    btn_row.addStretch(1)
+
+                    ok_btn = QPushButton("OK")
+                    cancel_btn = QPushButton("Cancel")
+                    ok_btn.setDefault(True)
+                    try:
+                        ok_btn.clicked.connect(dlg.accept)
+                        cancel_btn.clicked.connect(dlg.reject)
+                    except Exception:
+                        pass
+                    btn_row.addWidget(ok_btn)
+                    btn_row.addWidget(cancel_btn)
+
+                    root.addWidget(lab)
+                    root.addWidget(edit)
+                    root.addLayout(btn_row)
+
+                    # Dark styling to match the app; include hover for buttons.
+                    try:
+                        dlg.setStyleSheet(
+                            """
+                            QDialog {
+                                background-color: #151515;
+                                border: 1px solid rgba(128, 128, 128, 0.35);
+                                border-radius: 10px;
+                            }
+                            QLabel { color: #EAEAEA; }
+                            QLineEdit {
+                                background-color: #0F0F0F;
+                                color: #EAEAEA;
+                                border: 1px solid rgba(128, 128, 128, 0.35);
+                                border-radius: 8px;
+                                padding: 8px 10px;
+                            }
+                            QPushButton {
+                                background: #252525;
+                                border: 1px solid rgba(128, 128, 128, 0.35);
+                                color: #EAEAEA;
+                                padding: 6px 16px;
+                                border-radius: 8px;
+                            }
+                            QPushButton:hover { background: #2E2E2E; }
+                            QPushButton:pressed { background: #1F1F1F; }
+                            """
+                        )
+                    except Exception:
+                        pass
+
+                    # Make it wide enough for long names.
+                    try:
+                        dlg.setMinimumWidth(760)
+                    except Exception:
+                        pass
+
+                    # Focus the textbox.
+                    try:
+                        edit.setFocus()
+                    except Exception:
+                        pass
+
+                    try:
+                        QTimer.singleShot(0, lambda: raise_center_and_focus(parent=top, dlg=dlg, dim_overlay=dim))
+                    except Exception:
+                        pass
+
+                    ok = dlg.exec() == QDialog.Accepted
+                    if ok:
+                        new_name = str(edit.text() or "")
+
+                    try:
+                        if dim is not None:
+                            dim.hide()
+                            dim.deleteLater()
+                    except Exception:
+                        pass
+                except Exception:
+                    ok = False
+
+                if not ok:
+                    return
+
+                new_name = str(new_name or "").strip()
+                if not new_name or new_name == cur_name:
+                    return
+                if any(sep in new_name for sep in ("/", "\\")):
+                    QMessageBox.warning(self, "Rename Folder", "Folder name cannot contain path separators.")
+                    return
+
+                dest = case_dir.parent / new_name
+                try:
+                    if dest.exists():
+                        QMessageBox.warning(self, "Rename Folder", f"A folder named '{new_name}' already exists.")
+                        return
+                except Exception:
+                    pass
+
+                try:
+                    case_dir.rename(dest)
+                except Exception as e:
+                    QMessageBox.warning(self, "Rename Folder", f"Rename failed: {e}")
+                    return
+
+                # Keep compare results working by rewriting stored run references.
+                try:
+                    self._update_compare_manifests_for_case_rename(old_case=cur_name, new_case=new_name)
+                except Exception:
+                    pass
+
+                # Keep compare folder names consistent (tree labels).
+                try:
+                    self._rename_compare_folders_for_case_rename(old_case=cur_name, new_case=new_name)
+                except Exception:
+                    pass
+
+                # Re-select renamed folder (best-effort; model updates async).
+                def _reselect():
+                    try:
+                        src_idx = self._runs_model.index(str(dest))
+                        if not src_idx.isValid():
+                            return
+                        view_idx = self._runs_proxy.mapFromSource(src_idx) if self._runs_proxy is not None else src_idx
+                        if view_idx is None or (hasattr(view_idx, "isValid") and not view_idx.isValid()):
+                            return
+                        self._runs_tree.setCurrentIndex(view_idx)
+                        try:
+                            self._runs_tree.scrollTo(view_idx)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                QTimer.singleShot(150, _reselect)
+                return
+
+        except Exception:
+            pass
 
     def _apply_live_split_ratio(self) -> None:
         try:
@@ -1405,6 +2196,61 @@ class MainWindow(QWidget):
             a = float(max(0.05, min(0.95, float(sizes[0]) / total)))
             self._results_split_ratio = (a, 1.0 - a)
             self._results_split_user_set = True
+
+            # Debounce graph canvas redraw until dragging stops.
+            self._on_results_split_drag_moved()
+        except Exception:
+            pass
+
+    def _set_results_preview_updates_enabled(self, enabled: bool) -> None:
+        try:
+            gp = getattr(self, "graph", None)
+            if gp is None or not hasattr(gp, "get_canvas"):
+                return
+            canvas = gp.get_canvas()
+            if canvas is None:
+                return
+            try:
+                canvas.setUpdatesEnabled(bool(enabled))
+            except Exception:
+                pass
+
+            if enabled:
+                try:
+                    canvas.update()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_results_split_drag_moved(self) -> None:
+        try:
+            if not bool(getattr(self, "_results_split_dragging", False)):
+                self._results_split_dragging = True
+                self._set_results_preview_updates_enabled(False)
+            t = getattr(self, "_results_split_drag_timer", None)
+            if t is not None:
+                # Consider drag "finished" after a short pause.
+                t.start(120)
+        except Exception:
+            pass
+
+    def _on_results_split_drag_finished(self) -> None:
+        try:
+            if not bool(getattr(self, "_results_split_dragging", False)):
+                return
+            self._results_split_dragging = False
+            self._set_results_preview_updates_enabled(True)
+
+            # Trigger a single redraw after the final size settles.
+            try:
+                gp = getattr(self, "graph", None)
+                if gp is not None and hasattr(gp, "get_canvas"):
+                    canvas = gp.get_canvas()
+                    if canvas is not None and hasattr(canvas, "draw_idle"):
+                        canvas.draw_idle()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1423,8 +2269,8 @@ class MainWindow(QWidget):
                 pass
 
             w = max(1, sp.width())
-            a, _b = getattr(self, "_results_split_ratio", (0.20, 0.80))
-            left = max(120, int(w * float(a)))
+            a, _b = getattr(self, "_results_split_ratio", (0.45, 0.55))
+            left = max(220, int(w * float(a)))
             right = max(1, w - left)
 
             sp.blockSignals(True)

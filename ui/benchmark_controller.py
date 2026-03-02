@@ -11,7 +11,18 @@ from datetime import datetime
 from typing import Optional
 
 from PySide6.QtCore import QProcess, QTimer, QItemSelectionModel, Qt
-from PySide6.QtWidgets import QTreeView, QFileSystemModel, QMessageBox
+from PySide6.QtWidgets import (
+    QTreeView,
+    QFileSystemModel,
+    QMessageBox,
+    QAbstractItemView,
+    QDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QTextEdit,
+)
 
 from core.ps_helpers import RUNMAP_RE, ps_quote, build_ps_array_literal
 
@@ -855,10 +866,386 @@ class BenchmarkController:
     # -------------------------------------------------------------------------
     # Results Browser
     # -------------------------------------------------------------------------
+    def _collect_run_rel_paths_for_targets(self, targets: list[Path]) -> set[str]:
+        """Return run paths relative to runs_root that would be affected by deleting targets."""
+        out: set[str] = set()
+        try:
+            root = self._runs_root
+            if root is None:
+                return set()
+            try:
+                root_r = root.resolve()
+            except Exception:
+                root_r = root
+
+            for p in targets:
+                try:
+                    if p is None:
+                        continue
+                    p = Path(p)
+                except Exception:
+                    continue
+
+                if not p.exists():
+                    continue
+
+                try:
+                    pr = p.resolve()
+                except Exception:
+                    pr = p
+
+                # If user selected a run folder directly.
+                try:
+                    if pr.is_dir() and _RUN_FOLDER_RE.match(pr.name):
+                        rel = str(pr.relative_to(root_r)).replace("\\", "/")
+                        out.add(rel)
+                        continue
+                except Exception:
+                    pass
+
+                # If user selected a top-level case folder, include its run children.
+                try:
+                    if pr.is_dir() and pr.parent is not None and pr.parent.resolve() == root_r:
+                        try:
+                            for ent in os.scandir(str(pr)):
+                                if not ent.is_dir():
+                                    continue
+                                rd = Path(ent.path)
+                                if not _RUN_FOLDER_RE.match(rd.name):
+                                    continue
+                                try:
+                                    rel = str(rd.resolve().relative_to(root_r)).replace("\\", "/")
+                                except Exception:
+                                    rel = str(rd.relative_to(root_r)).replace("\\", "/")
+                                out.add(rel)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        except Exception:
+            return set()
+        return out
+
+    def _find_compare_results_referencing_runs(self, run_rel_paths: set[str]) -> list[str]:
+        """Return compare result folders (relative to runs_root) that reference any run in run_rel_paths."""
+        try:
+            if not run_rel_paths:
+                return []
+            root = self._runs_root
+            if root is None or (not root.exists()):
+                return []
+            try:
+                root_r = root.resolve()
+            except Exception:
+                root_r = root
+
+            hits: list[str] = []
+            seen: set[str] = set()
+            for mp in root_r.rglob("compare_manifest.json"):
+                try:
+                    if not mp.is_file():
+                        continue
+                    try:
+                        m = json.loads(mp.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if (m or {}).get("type") != "compare":
+                        continue
+                    runs = [str(r).replace("\\", "/") for r in ((m or {}).get("runs") or [])]
+                    if not any(r in run_rel_paths for r in runs):
+                        continue
+                    try:
+                        rel_compare = str(mp.parent.resolve().relative_to(root_r)).replace("\\", "/")
+                    except Exception:
+                        rel_compare = str(mp.parent).replace("\\", "/")
+                    if rel_compare not in seen:
+                        seen.add(rel_compare)
+                        hits.append(rel_compare)
+                except Exception:
+                    continue
+
+            hits.sort()
+            return hits
+        except Exception:
+            return []
+
+    def _confirm_delete_dialog(
+        self,
+        *,
+        title: str,
+        prompt_text: str,
+        details_text: str = "",
+        confirm_text: str = "Delete",
+        cancel_text: str = "Cancel",
+    ) -> bool:
+        """Frameless dark confirmation dialog (matches rename styling) + dim overlay."""
+        try:
+            dlg = QDialog(self.parent)
+            try:
+                dlg.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+            except Exception:
+                pass
+            dlg.setModal(True)
+
+            top = None
+            try:
+                top = self.parent.window() if hasattr(self.parent, "window") else self.parent
+            except Exception:
+                top = self.parent
+
+            dim = None
+            try:
+                dim = DimOverlay(top, on_click=lambda: dlg.reject())
+                try:
+                    dim.setGeometry(top.rect())
+                except Exception:
+                    pass
+                dim.show()
+            except Exception:
+                dim = None
+
+            root = QVBoxLayout(dlg)
+            root.setContentsMargins(16, 14, 16, 14)
+            root.setSpacing(10)
+
+            lab_title = QLabel(str(title or ""))
+            try:
+                lab_title.setStyleSheet("font-weight: 600;")
+            except Exception:
+                pass
+
+            lab = QLabel(str(prompt_text or ""))
+            try:
+                lab.setWordWrap(True)
+            except Exception:
+                pass
+
+            root.addWidget(lab_title)
+            root.addWidget(lab)
+
+            if details_text:
+                box = QTextEdit()
+                box.setReadOnly(True)
+                box.setPlainText(str(details_text))
+                try:
+                    box.setMinimumHeight(140)
+                except Exception:
+                    pass
+                root.addWidget(box)
+
+            btn_row = QHBoxLayout()
+            btn_row.setContentsMargins(0, 4, 0, 0)
+            btn_row.setSpacing(8)
+            btn_row.addStretch(1)
+
+            cancel_btn = QPushButton(str(cancel_text or "Cancel"))
+            confirm_btn = QPushButton(str(confirm_text or "Delete"))
+            try:
+                cancel_btn.setDefault(True)
+            except Exception:
+                pass
+            try:
+                cancel_btn.clicked.connect(dlg.reject)
+                confirm_btn.clicked.connect(dlg.accept)
+            except Exception:
+                pass
+
+            btn_row.addWidget(confirm_btn)
+            btn_row.addWidget(cancel_btn)
+            root.addLayout(btn_row)
+
+            try:
+                dlg.setStyleSheet(
+                    """
+                    QDialog {
+                        background-color: #151515;
+                        border: 1px solid rgba(128, 128, 128, 0.35);
+                        border-radius: 10px;
+                    }
+                    QLabel { color: #EAEAEA; }
+                    QTextEdit {
+                        background-color: #0F0F0F;
+                        color: #EAEAEA;
+                        border: 1px solid rgba(128, 128, 128, 0.35);
+                        border-radius: 8px;
+                        padding: 8px 10px;
+                    }
+                    QPushButton {
+                        background: #252525;
+                        border: 1px solid rgba(128, 128, 128, 0.35);
+                        color: #EAEAEA;
+                        padding: 6px 16px;
+                        border-radius: 8px;
+                    }
+                    QPushButton:hover { background: #2E2E2E; }
+                    QPushButton:pressed { background: #1F1F1F; }
+                    """
+                )
+            except Exception:
+                pass
+
+            try:
+                dlg.setMinimumWidth(760)
+            except Exception:
+                pass
+
+            try:
+                QTimer.singleShot(0, lambda: raise_center_and_focus(parent=top, dlg=dlg, dim_overlay=dim))
+            except Exception:
+                pass
+
+            ok = dlg.exec() == QDialog.Accepted
+
+            try:
+                if dim is not None:
+                    dim.hide()
+                    dim.deleteLater()
+            except Exception:
+                pass
+            return bool(ok)
+        except Exception:
+            return False
+
+    def _build_delete_details_text(self, targets: list[Path]) -> str:
+        """Build a detailed, human-readable list of selected delete targets.
+
+        For directory deletes, list only what the folder tree would show directly
+        *under that folder* (immediate children only; no recursion).
+
+        Special case: run folders are treated as leaf nodes in the tree, so we do
+        not list their contents.
+        """
+        try:
+            lines: list[str] = []
+
+            def _is_run_folder(p: Path) -> bool:
+                try:
+                    return bool(p is not None and p.is_dir() and _RUN_FOLDER_RE.match(p.name))
+                except Exception:
+                    return False
+
+            def _list_tree_children(dir_path: Path) -> list[str]:
+                """Return immediate child names as shown in the tree."""
+                try:
+                    if _is_run_folder(dir_path):
+                        return []
+                    out: list[str] = []
+                    with os.scandir(str(dir_path)) as it:
+                        for ent in it:
+                            try:
+                                out.append(str(ent.name))
+                            except Exception:
+                                pass
+                    out.sort(key=lambda s: s.lower())
+                    return out
+                except Exception:
+                    return []
+
+            for p in (targets or []):
+                try:
+                    p = Path(p)
+                except Exception:
+                    continue
+
+                if not p.exists():
+                    continue
+
+                if p.is_dir():
+                    lines.append(f"{p.name}")
+
+                    children = _list_tree_children(p)
+                    if not children:
+                        # Mirror tree semantics: empty (or run folder leaf)
+                        lines.append("  (empty)")
+                    else:
+                        for name in children:
+                            lines.append(f"  {name}")
+                else:
+                    # For single-file deletes, show only the file name (no contents).
+                    lines.append(str(p.name))
+
+            return "\n".join(lines).strip()
+        except Exception:
+            return ""
+
+    def _ensure_compare_source_runs_visible(self, compare_dir: Path) -> None:
+        """Expand parent folders so compare source run folders are visible."""
+        try:
+            if compare_dir is None or (not compare_dir.exists()) or (not compare_dir.is_dir()):
+                return
+            mp = compare_dir / "compare_manifest.json"
+            if not mp.is_file():
+                return
+
+            try:
+                m = json.loads(mp.read_text(encoding="utf-8"))
+            except Exception:
+                m = {}
+
+            runs_rel = [str(r) for r in (m.get("runs") or []) if str(r).strip()]
+            if not runs_rel:
+                return
+
+            root = self._runs_root
+            if root is None:
+                return
+
+            indices_to_scroll = []
+            for rel in runs_rel:
+                rel_norm = str(rel).replace("\\", "/")
+                parts = [p for p in rel_norm.split("/") if p]
+                if len(parts) < 2:
+                    continue
+
+                abs_run = root.joinpath(*parts)
+                idx = self._path_to_proxy_index(str(abs_run))
+                if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
+                    continue
+
+                # Expand ancestors (at least the case folder) so this run becomes visible.
+                try:
+                    parent = idx.parent()
+                    while parent.isValid():
+                        try:
+                            self._runs_tree.expand(parent)
+                        except Exception:
+                            pass
+                        parent = parent.parent()
+                except Exception:
+                    pass
+
+                indices_to_scroll.append(idx)
+
+            # Make at least one highlighted item visible.
+            if indices_to_scroll:
+                try:
+                    self._runs_tree.scrollTo(indices_to_scroll[0], QAbstractItemView.EnsureVisible)
+                except Exception:
+                    try:
+                        self._runs_tree.scrollTo(indices_to_scroll[0])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def _on_runs_current_changed(self, current, previous) -> None:
         try:
             if current is None or (hasattr(current, "isValid") and not current.isValid()):
+                try:
+                    if hasattr(self._runs_model, "clear_compare_highlights"):
+                        self._runs_model.clear_compare_highlights()
+                except Exception:
+                    pass
                 return
+
+            # Right-click should not behave like left-click (no auto-select/preview).
+            try:
+                btn = self._runs_tree.property("_tb_last_button")
+                if btn is not None and int(btn) == int(Qt.RightButton):
+                    return
+            except Exception:
+                pass
 
             fpath = self._idx_to_path(current)
             if not fpath:
@@ -866,6 +1253,22 @@ class BenchmarkController:
 
             p = Path(fpath)
             self._last_selected_path = p
+
+            # Compare-selection highlighting: only active while a compare result folder is selected.
+            try:
+                if p.is_dir() and self._is_compare_result_dir(p):
+                    if hasattr(self._runs_model, "set_compare_highlights"):
+                        self._runs_model.set_compare_highlights(
+                            compare_dir=str(p),
+                            runs_root=str(self._runs_root),
+                        )
+                    # Ensure referenced source runs are actually visible in the tree.
+                    self._ensure_compare_source_runs_visible(p)
+                else:
+                    if hasattr(self._runs_model, "clear_compare_highlights"):
+                        self._runs_model.clear_compare_highlights()
+            except Exception:
+                pass
 
             # If the user clicks a compare-result folder, exit compare-selection mode.
             # Otherwise selection-change logic may restore the previous compare-input
@@ -884,6 +1287,122 @@ class BenchmarkController:
                 return
 
             if p.is_dir():
+                # If the user clicks a case folder (runs/<case>), auto-select the newest
+                # run folder under it and preview that (case folders contain only results).
+                try:
+                    root = self._runs_root
+                    if root is not None and root.exists():
+                        try:
+                            root_r = root.resolve()
+                            p_r = p.resolve()
+                        except Exception:
+                            root_r = root
+                            p_r = p
+
+                        is_case_dir = False
+                        try:
+                            is_case_dir = (
+                                p_r.is_dir()
+                                and p_r.parent is not None
+                                and p_r.parent.resolve() == root_r
+                                and (not _RUN_FOLDER_RE.match(p_r.name))
+                            )
+                        except Exception:
+                            # best-effort fallback
+                            is_case_dir = (
+                                p.is_dir()
+                                and p.parent == root
+                                and (not _RUN_FOLDER_RE.match(p.name))
+                            )
+
+                        if is_case_dir:
+                            # Always expand the case folder on click.
+                            try:
+                                self._runs_tree.expand(current)
+                            except Exception:
+                                pass
+
+                            # Find newest run folder inside this case.
+                            best_run = None
+                            best_mtime = -1.0
+                            try:
+                                for ent in os.scandir(str(p_r)):
+                                    if not ent.is_dir():
+                                        continue
+                                    cand = Path(ent.path)
+                                    if not _RUN_FOLDER_RE.match(cand.name):
+                                        continue
+
+                                    # Prefer "run_window.csv" mtime, else ALL_SELECTED.png, else folder mtime.
+                                    mt = -1.0
+                                    try:
+                                        csvp = cand / "run_window.csv"
+                                        if csvp.is_file():
+                                            mt = float(csvp.stat().st_mtime)
+                                        else:
+                                            pngp = cand / "ALL_SELECTED.png"
+                                            if pngp.is_file():
+                                                mt = float(pngp.stat().st_mtime)
+                                            else:
+                                                mt = float(cand.stat().st_mtime)
+                                    except Exception:
+                                        mt = -1.0
+
+                                    if mt > best_mtime:
+                                        best_mtime = mt
+                                        best_run = cand
+                            except Exception:
+                                best_run = None
+
+                            if best_run is None:
+                                # Nothing to preview under this case folder.
+                                return
+
+                            idx = self._path_to_proxy_index(str(best_run))
+                            if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
+                                return
+
+                            sm = self._runs_tree.selectionModel()
+                            if sm is None:
+                                return
+
+                            # Programmatic selection: prevent intermediate preview churn.
+                            self._suppress_selection_preview = True
+                            try:
+                                try:
+                                    self._runs_tree.setCurrentIndex(idx)
+                                except Exception:
+                                    pass
+
+                                try:
+                                    sm.select(
+                                        idx,
+                                        QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                                    )
+                                except Exception:
+                                    try:
+                                        sm.setCurrentIndex(
+                                            idx,
+                                            QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                                        )
+                                    except Exception:
+                                        pass
+
+                                try:
+                                    self._runs_tree.scrollTo(idx)
+                                except Exception:
+                                    pass
+                            finally:
+                                self._suppress_selection_preview = False
+
+                            # Preview the selected run folder.
+                            self._schedule_preview_target(fpath=str(best_run), is_dir=True)
+                            return
+
+                except Exception:
+                    # Fall back to normal directory preview.
+                    pass
+
                 self._schedule_preview_target(fpath=str(p), is_dir=True)
                 return
 
@@ -909,6 +1428,168 @@ class BenchmarkController:
         """Backward-compatible entrypoint: removes all selected results."""
         self.remove_selected_results()
 
+    def remove_selected_tree_items(self) -> None:
+        """Delete selected files/folders from the Results tree.
+
+        This is used by the right-click context menu and is intentionally scoped
+        to items under runs_root to avoid accidental deletes elsewhere.
+        """
+        try:
+            sm = self._runs_tree.selectionModel() if self._runs_tree is not None else None
+            if sm is None:
+                return
+
+            rows = []
+            try:
+                rows = sm.selectedRows(0)
+            except Exception:
+                rows = [i for i in sm.selectedIndexes() if getattr(i, "column", lambda: 0)() == 0]
+
+            targets: list[Path] = []
+            for idx in rows:
+                fpath = self._idx_to_path(idx)
+                if not fpath:
+                    continue
+                try:
+                    p = Path(fpath)
+                except Exception:
+                    continue
+                if not p.exists():
+                    continue
+                targets.append(p)
+
+            if not targets:
+                return
+
+            # Constrain to runs_root.
+            try:
+                root = self._runs_root.resolve()
+            except Exception:
+                root = self._runs_root
+            if root is None:
+                return
+
+            normalized: list[Path] = []
+            for p in targets:
+                try:
+                    pr = p.resolve()
+                except Exception:
+                    pr = p
+
+                try:
+                    pr.relative_to(root)
+                except Exception:
+                    continue
+                normalized.append(pr)
+
+            if not normalized:
+                return
+
+            # De-duplicate and drop children when parent already selected.
+            uniq = list(dict.fromkeys(normalized))
+            uniq.sort(key=lambda x: len(str(x)))
+            final: list[Path] = []
+            for p in uniq:
+                if any(str(p).startswith(str(parent) + os.sep) for parent in final):
+                    continue
+                final.append(p)
+
+            n = len(final)
+            name_block = self._build_delete_details_text(final)
+
+            # Warn if any run folders being deleted are referenced by compare results.
+            warn_block = ""
+            try:
+                run_rel = self._collect_run_rel_paths_for_targets(final)
+                refs = self._find_compare_results_referencing_runs(run_rel)
+                if refs:
+                    preview_refs = refs[:6]
+                    more_refs = "" if len(refs) <= 6 else f"\n(+{len(refs) - 6} more)"
+                    warn_block = (
+                        "\n\nWARNING: One or more selected run(s) are used by compare result(s).\n"
+                        "Deleting them may break those compare results.\n\n"
+                        + "\n".join(preview_refs)
+                        + more_refs
+                    )
+            except Exception:
+                warn_block = ""
+
+            prompt = f"Delete {n} item(s)?\nThis action cannot be undone."
+            details = f"{name_block}{warn_block}".strip()
+            if not self._confirm_delete_dialog(
+                title="Remove",
+                prompt_text=prompt,
+                details_text=details,
+                confirm_text="Delete",
+                cancel_text="Cancel",
+            ):
+                return
+
+            def _is_empty_dir(p: Path) -> bool:
+                try:
+                    if not p.exists() or not p.is_dir():
+                        return False
+                    with os.scandir(str(p)) as it:
+                        for _ in it:
+                            return False
+                    return True
+                except Exception:
+                    return False
+
+            def _cleanup_empty_parents(p: Path) -> None:
+                """Remove empty parent folders up to runs_root (exclusive)."""
+                cur = None
+                try:
+                    cur = p.resolve()
+                except Exception:
+                    cur = p
+
+                try:
+                    cur.relative_to(root)
+                except Exception:
+                    return
+
+                while True:
+                    parent = cur.parent
+                    if parent is None:
+                        return
+                    # Stop at runs_root.
+                    try:
+                        if parent.resolve() == root:
+                            return
+                    except Exception:
+                        if parent == root:
+                            return
+
+                    if _is_empty_dir(parent):
+                        try:
+                            parent.rmdir()
+                        except Exception:
+                            return
+                        cur = parent
+                        continue
+                    return
+
+            # Execute deletes.
+            for p in final:
+                try:
+                    if p.is_dir():
+                        shutil.rmtree(str(p), ignore_errors=False)
+                        _cleanup_empty_parents(p)
+                    else:
+                        p.unlink(missing_ok=True)
+                        _cleanup_empty_parents(p)
+                except Exception:
+                    # Best-effort: keep going.
+                    pass
+
+            try:
+                self._update_remove_btn_state()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def remove_selected_results(self) -> None:
         """Delete all selected result folders from disk (bulk)."""
         # Prefer what the user actually selected in the tree.
@@ -929,18 +1610,43 @@ class BenchmarkController:
             return
 
         n = len(run_dirs)
-        preview_names = [p.name for p in run_dirs[:5]]
-        more = "" if n <= 5 else f"\n(+{n - 5} more)"
-        name_block = "\n".join(preview_names) + more
+        name_block = self._build_delete_details_text(run_dirs)
 
-        confirm = QMessageBox.question(
-            self.parent,
-            "Remove Results",
-            f"Delete {n} result folder(s)?\nThis action cannot be undone.\n\n{name_block}",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if confirm != QMessageBox.Yes:
+        warn_block = ""
+        try:
+            # These are run folders; warn if referenced by compare results.
+            try:
+                root = self._runs_root.resolve()
+            except Exception:
+                root = self._runs_root
+            run_rel = set()
+            for rd in run_dirs:
+                try:
+                    run_rel.add(str(rd.resolve().relative_to(root)).replace("\\", "/"))
+                except Exception:
+                    pass
+            refs = self._find_compare_results_referencing_runs(run_rel)
+            if refs:
+                preview_refs = refs[:6]
+                more_refs = "" if len(refs) <= 6 else f"\n(+{len(refs) - 6} more)"
+                warn_block = (
+                    "\n\nWARNING: One or more selected run(s) are used by compare result(s).\n"
+                    "Deleting them may break those compare results.\n\n"
+                    + "\n".join(preview_refs)
+                    + more_refs
+                )
+        except Exception:
+            warn_block = ""
+
+        prompt = f"Delete {n} result folder(s)?\nThis action cannot be undone."
+        details = f"{name_block}{warn_block}".strip()
+        if not self._confirm_delete_dialog(
+            title="Remove Results",
+            prompt_text=prompt,
+            details_text=details,
+            confirm_text="Delete",
+            cancel_text="Cancel",
+        ):
             return
 
         def _is_empty_dir(p: Path) -> bool:

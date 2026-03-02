@@ -322,6 +322,7 @@ class GraphPreview(QObject):
         self._compare_run_labels: list[str] = []
         self._compare_run_color_map: dict[str, str] = {}
         self._compare_manifest_sensors: list[str] = []
+        self._compare_manifest_path: Optional[Path] = None
 
         # single-mode multi-axis state (for splitting by measurement type)
         self._single_mode_multi_axis = False
@@ -727,6 +728,18 @@ class GraphPreview(QObject):
             self._compare_axis_state = {}
             self._compare_last_canvas_wh = None
             self._compare_last_idx = None
+            self._compare_manifest_path = None
+        except Exception:
+            pass
+
+        # Clear button handles so hit-testing doesn't use stale artists.
+        try:
+            self._ls_btn_text = None
+            self._ls_btn_bbox = None
+            self._delta_btn_text = None
+            self._delta_btn_bbox = None
+            self._zero_btn_text = None
+            self._zero_btn_bbox = None
         except Exception:
             pass
 
@@ -1915,6 +1928,23 @@ class GraphPreview(QObject):
                 self._hide_preview_hover(hard=True)
             except Exception:
                 pass
+            try:
+                if getattr(self, "_compare_mode", False):
+                    self._hide_compare_hover_all()
+            except Exception:
+                pass
+
+            # Compare mode: rebuild compare plots using the active manifest so ΔT works.
+            try:
+                if getattr(self, "_compare_mode", False):
+                    mp = getattr(self, "_compare_manifest_path", None)
+                    if mp is not None:
+                        mp2 = Path(str(mp))
+                        if mp2.exists() and mp2.is_file():
+                            self._plot_compare_manifest(mp2)
+                            return True
+            except Exception:
+                pass
 
             # Fast path: update plotted values in-place (no full replot).
             try:
@@ -2237,13 +2267,14 @@ class GraphPreview(QObject):
                         if not (np.isfinite(ymin) and np.isfinite(ymax)):
                             continue
 
+                        # Match single-mode ZeroY behavior exactly.
                         if zero_mode:
                             ymin0 = float(min(ymin, 0.0))
                             ymax0 = float(max(ymax, 0.0))
-                            span = float(ymax0 - ymin0)
-                            pad = 1.0 if span == 0.0 else 0.06 * span
-                            low = 0.0 if ymin >= 0.0 else (ymin0 - pad)
-                            high = 0.0 if ymax <= 0.0 else (ymax0 + pad)
+                            span0 = float(ymax0 - ymin0)
+                            pad0 = 1.0 if span0 == 0.0 else 0.06 * span0
+                            low = 0.0 if ymin >= 0.0 else (ymin0 - pad0)
+                            high = 0.0 if ymax <= 0.0 else (ymax0 + pad0)
                             ax.set_ylim(low, high)
                         else:
                             pad = 1.0 if ymin == ymax else 0.06 * (ymax - ymin)
@@ -2251,7 +2282,27 @@ class GraphPreview(QObject):
                     except Exception:
                         continue
 
-                self._preview_canvas.draw_idle()
+                # Compare mode uses cached backgrounds for fast hover blitting.
+                # Any y-limits change invalidates those backgrounds; refresh them so the
+                # plot doesn't appear to "shift" when hover updates occur.
+                try:
+                    for ax in list(self._compare_axes or []):
+                        st = (self._compare_axis_state or {}).get(ax)
+                        if st is not None:
+                            st["bg"] = None
+                except Exception:
+                    pass
+
+                try:
+                    self._preview_invalidate_interaction_cache()
+                except Exception:
+                    pass
+
+                try:
+                    self._preview_canvas.draw()
+                    self._refresh_compare_backgrounds()
+                except Exception:
+                    self._preview_canvas.draw_idle()
                 return
 
             # Standard single-axis.
@@ -3430,6 +3481,11 @@ class GraphPreview(QObject):
         self._exit_compare_mode()
         self._hide_qt_tooltip()
 
+        try:
+            self._compare_manifest_path = Path(manifest_path)
+        except Exception:
+            self._compare_manifest_path = None
+
         # -----------------------------
         # Load manifest
         # -----------------------------
@@ -3440,11 +3496,29 @@ class GraphPreview(QObject):
 
         sensors = [str(s) for s in (m.get("sensors") or []) if str(s).strip()]
         runs_rel = [str(r) for r in (m.get("runs") or []) if str(r).strip()]
+
+        def _is_ambient_sensor_name(name: str) -> bool:
+            try:
+                s = str(name).strip().lower()
+            except Exception:
+                return False
+            if not s:
+                return False
+            # Common formats: "Ambient [°C]", "Ambient Temp [°C]", etc.
+            return (s == "ambient [°c]") or ("ambient" in s)
+
+        # ΔT mode: ambient(t) - ambient(t) == 0, so hide the ambient subplot entirely.
+        try:
+            if bool(getattr(self, "_temp_delta_mode", False)) and sensors:
+                sensors = [s for s in sensors if not _is_ambient_sensor_name(s)]
+        except Exception:
+            pass
+
         if not sensors or len(runs_rel) < 2:
             self._preview_label.clear()
             return
 
-        # Keep manifest sensors for compare Legend & stats popup.
+        # Keep manifest sensors for compare Legend & stats popup (match what we display).
         self._compare_manifest_sensors = list(sensors)
 
         # manifest lives at: runs/<compare_case>/<compare_run>/compare_manifest.json
@@ -3516,16 +3590,31 @@ class GraphPreview(QObject):
         # Load run CSVs (keep only requested sensors)
         # -----------------------------
         run_dfs: list[pd.DataFrame] = []
+        run_amb_dfs: list[pd.DataFrame] = []
         for rd in run_dirs:
             csvp = rd / "run_window.csv"
             if not csvp.exists():
                 run_dfs.append(pd.DataFrame())
+                run_amb_dfs.append(pd.DataFrame())
                 continue
             try:
                 df_all, cols = load_run_csv_dataframe(str(csvp))
                 available = set(cols or [])
                 keep = [s for s in sensors if s in available]
                 df_keep = df_all[keep].copy() if keep else pd.DataFrame(index=df_all.index)
+
+                # Keep ambient available for ΔT mode (even if it's not in the compare sensor list).
+                try:
+                    amb_col = self._find_ambient_col(df_all)
+                except Exception:
+                    amb_col = None
+                if amb_col and amb_col in df_all.columns:
+                    try:
+                        run_amb_dfs.append(df_all[[amb_col]].copy())
+                    except Exception:
+                        run_amb_dfs.append(pd.DataFrame(index=df_all.index))
+                else:
+                    run_amb_dfs.append(pd.DataFrame(index=df_all.index))
 
                 # Ensure all sensors exist as columns (fill missing with NaN)
                 for s in sensors:
@@ -3535,8 +3624,10 @@ class GraphPreview(QObject):
                 run_dfs.append(df_keep)
             except Exception:
                 run_dfs.append(pd.DataFrame())
+                run_amb_dfs.append(pd.DataFrame())
 
         run_dfs = trim_dataframes_to_shortest_duration(run_dfs)
+        run_amb_dfs = trim_dataframes_to_shortest_duration(run_amb_dfs)
         non_empty = [df for df in run_dfs if df is not None and not df.empty]
         if not non_empty:
             self._preview_label.clear()
@@ -3573,6 +3664,27 @@ class GraphPreview(QObject):
             except Exception:
                 run_elapsed_axes.append(np.arange(len(df), dtype=float))
 
+        # If ΔT mode is enabled, precompute ambient interpolation per run (to common_elapsed).
+        amb_interp_by_run: list[np.ndarray] = [np.full(shape=(min_len,), fill_value=np.nan, dtype=float) for _ in run_dfs]
+        try:
+            if bool(getattr(self, "_temp_delta_mode", False)):
+                for j, (df_amb, x_run) in enumerate(zip(run_amb_dfs, run_elapsed_axes)):
+                    try:
+                        if df_amb is None or df_amb.empty or x_run.size < 2:
+                            continue
+                        amb_col = str(df_amb.columns[0]) if len(df_amb.columns) else ""
+                        if not amb_col:
+                            continue
+                        y_amb = pd.to_numeric(df_amb[amb_col], errors="coerce").to_numpy(dtype=float)
+                        mask = np.isfinite(y_amb) & np.isfinite(x_run)
+                        if int(mask.sum()) < 2:
+                            continue
+                        amb_interp_by_run[j] = np.interp(common_elapsed, x_run[mask], y_amb[mask], left=np.nan, right=np.nan)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
         # -----------------------------
         # Build subplots: one per sensor
         # -----------------------------
@@ -3586,6 +3698,11 @@ class GraphPreview(QObject):
 
         self._compare_mode = True
         self._compare_axes = axes
+        # Use the top axis for shared draw helpers (button bbox caching, etc.).
+        try:
+            self._preview_ax = axes[0] if axes else self._preview_ax
+        except Exception:
+            pass
         self._compare_axis_state = {}
         self._compare_last_idx = None
 
@@ -3652,6 +3769,17 @@ class GraphPreview(QObject):
         for i, sensor in enumerate(sensors):
             ax = axes[i]
 
+            # Temperature sensor? (used for ΔT mode)
+            try:
+                unit = extract_unit_from_column(str(sensor))
+                is_temp_sensor = (get_measurement_type_label(unit) == "Temperature")
+            except Exception:
+                is_temp_sensor = False
+            try:
+                is_ambient_sensor = ("ambient" in str(sensor).lower())
+            except Exception:
+                is_ambient_sensor = False
+
             apply_dark_axes_style(
                 self._preview_fig,
                 ax,
@@ -3667,7 +3795,7 @@ class GraphPreview(QObject):
 
             # Build per-sensor dataframe: columns are runs (labels), index is common_index
             df_sensor = pd.DataFrame(index=common_index)
-            for lbl, df_run, x_run in zip(run_labels, run_dfs, run_elapsed_axes):
+            for j, (lbl, df_run, x_run) in enumerate(zip(run_labels, run_dfs, run_elapsed_axes)):
                 if df_run is None or df_run.empty or sensor not in df_run.columns or x_run.size < 2:
                     df_sensor[str(lbl)] = np.full(shape=(min_len,), fill_value=np.nan, dtype=float)
                     continue
@@ -3681,6 +3809,15 @@ class GraphPreview(QObject):
                     y_i = np.interp(common_elapsed, x_run[mask], y[mask], left=np.nan, right=np.nan)
                 except Exception:
                     y_i = np.full(shape=(min_len,), fill_value=np.nan, dtype=float)
+
+                # ΔT mode: for temperature sensors, subtract ambient (if available).
+                try:
+                    if bool(getattr(self, "_temp_delta_mode", False)) and bool(is_temp_sensor) and (not bool(is_ambient_sensor)):
+                        amb_i = amb_interp_by_run[j] if j < len(amb_interp_by_run) else None
+                        if amb_i is not None:
+                            y_i = y_i - np.asarray(amb_i, dtype=float)
+                except Exception:
+                    pass
 
                 df_sensor[str(lbl)] = y_i
 
@@ -3717,18 +3854,18 @@ class GraphPreview(QObject):
                     except Exception:
                         zero_mode = False
 
-                    if zero_mode and np.isfinite(ymin) and np.isfinite(ymax):
-                        ymin0 = float(min(ymin, 0.0))
-                        ymax0 = float(max(ymax, 0.0))
-                        span = float(ymax0 - ymin0)
-                        pad = 1.0 if span == 0.0 else 0.06 * span
-
-                        low = 0.0 if ymin >= 0.0 else (ymin0 - pad)
-                        high = 0.0 if ymax <= 0.0 else (ymax0 + pad)
-                        ax.set_ylim(low, high)
-                    else:
-                        pad = 1.0 if ymin == ymax else 0.06 * (ymax - ymin)
-                        ax.set_ylim(ymin - pad, ymax + pad)
+                    if np.isfinite(ymin) and np.isfinite(ymax):
+                        if zero_mode:
+                            ymin0 = float(min(ymin, 0.0))
+                            ymax0 = float(max(ymax, 0.0))
+                            span0 = float(ymax0 - ymin0)
+                            pad0 = 1.0 if span0 == 0.0 else 0.06 * span0
+                            low = 0.0 if ymin >= 0.0 else (ymin0 - pad0)
+                            high = 0.0 if ymax <= 0.0 else (ymax0 + pad0)
+                            ax.set_ylim(low, high)
+                        else:
+                            pad = 1.0 if ymin == ymax else 0.06 * (ymax - ymin)
+                            ax.set_ylim(ymin - pad, ymax + pad)
             except Exception:
                 pass
 
@@ -3776,6 +3913,31 @@ class GraphPreview(QObject):
                 except Exception:
                     self._ls_btn_text = None
                     self._ls_btn_bbox = None
+
+                # Add the same buttons as single mode: 0Y and ΔT.
+                try:
+                    self._delta_btn_text = ax.text(
+                        0.90,
+                        1.0,
+                        "ΔT" if getattr(self, "_temp_delta_mode", False) else "T",
+                        transform=ax.transAxes,
+                        ha="right",
+                        va="bottom",
+                        fontsize=9,
+                        color="#BDBDBD",
+                        zorder=3000,
+                        clip_on=False,
+                        bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
+                    )
+                    self._update_delta_button_visual()
+                    self._delta_btn_bbox = None
+                except Exception:
+                    self._delta_btn_text = None
+                    self._delta_btn_bbox = None
+
+                # Compare mode: temporarily hide/remove 0Y toggle.
+                self._zero_btn_text = None
+                self._zero_btn_bbox = None
 
             if i == (n - 1):
                 apply_elapsed_time_formatter(ax, is_dt=is_dt, x_vals=x_vals)
@@ -3869,6 +4031,24 @@ class GraphPreview(QObject):
             try:
                 if self._preview_canvas is None or not self._compare_mode:
                     return
+
+                # Button hover: match single-mode cursor behavior and avoid showing tooltips.
+                try:
+                    if (
+                        self._is_over_delta_button(ev.pos().x(), ev.pos().y())
+                        or self._is_over_ls_button(ev.pos().x(), ev.pos().y())
+                    ):
+                        if not self._hovering_ls_btn:
+                            self._hovering_ls_btn = True
+                            self._preview_canvas.setCursor(Qt.PointingHandCursor)
+                        self._hide_compare_hover_all()
+                        return
+                    else:
+                        if self._hovering_ls_btn:
+                            self._hovering_ls_btn = False
+                            self._preview_canvas.setCursor(Qt.ArrowCursor)
+                except Exception:
+                    pass
 
                 wh = (int(self._preview_canvas.width()), int(self._preview_canvas.height()))
                 try:
@@ -4082,12 +4262,6 @@ class GraphPreview(QObject):
             self._preview_canvas.mouseMoveEvent = _compare_mouse_move
         except Exception:
             pass
-
-        # Compare mode uses Legend & stats; keep delta/zero toggles disabled.
-        self._delta_btn_text = None
-        self._delta_btn_bbox = None
-        self._zero_btn_text = None
-        self._zero_btn_bbox = None
 
         # (Relayout already applied above; no delayed resize pass needed.)
 
