@@ -683,17 +683,56 @@ def preview_build_tooltip_for_cols(gp: Any, cols: list[str]) -> None:
         dpi = float(getattr(gp._preview_fig, "dpi", 100) or 100)
         sep_pts = 5.0 * 72.0 / dpi
 
+        theme = dict(getattr(gp, "_preview_theme", {}) or {})
+        tooltip_text = str(theme.get("tooltip_text", "#FFFFFF"))
+        tooltip_bg = theme.get("tooltip_bg")
+        tooltip_border = theme.get("tooltip_border")
+
+        if isinstance(tooltip_bg, str) and tooltip_bg.startswith("rgba("):
+            try:
+                parts = [p.strip() for p in tooltip_bg[5:-1].split(",")]
+                if len(parts) == 4:
+                    bg_rgba = (
+                        float(parts[0]) / 255.0,
+                        float(parts[1]) / 255.0,
+                        float(parts[2]) / 255.0,
+                        float(parts[3]) / 255.0,
+                    )
+                else:
+                    bg_rgba = (0, 0, 0, 0.28)
+            except Exception:
+                bg_rgba = (0, 0, 0, 0.28)
+        else:
+            bg_rgba = (0, 0, 0, 0.28)
+
+        if isinstance(tooltip_border, str) and tooltip_border.startswith("rgba("):
+            try:
+                parts = [p.strip() for p in tooltip_border[5:-1].split(",")]
+                if len(parts) == 4:
+                    border_rgba = (
+                        float(parts[0]) / 255.0,
+                        float(parts[1]) / 255.0,
+                        float(parts[2]) / 255.0,
+                        float(parts[3]) / 255.0,
+                    )
+                else:
+                    border_rgba = (1, 1, 1, 0.06)
+            except Exception:
+                border_rgba = (1, 1, 1, 0.06)
+        else:
+            border_rgba = (1, 1, 1, 0.06)
+
         gp._preview_collective_time = TextArea(
             "",
-            textprops=dict(color="#FFFFFF", family="DejaVu Sans Mono", fontsize=10, weight="bold"),
+            textprops=dict(color=tooltip_text, family="DejaVu Sans Mono", fontsize=10, weight="bold"),
         )
 
         gp._preview_name_areas = [
-            TextArea("", textprops=dict(color="#FFFFFF", family="DejaVu Sans Mono", fontsize=10))
+            TextArea("", textprops=dict(color=tooltip_text, family="DejaVu Sans Mono", fontsize=10))
             for _ in cols
         ]
         gp._preview_value_areas = [
-            TextArea("", textprops=dict(color="#FFFFFF", family="DejaVu Sans Mono", fontsize=10))
+            TextArea("", textprops=dict(color=tooltip_text, family="DejaVu Sans Mono", fontsize=10))
             for _ in cols
         ]
 
@@ -712,8 +751,8 @@ def preview_build_tooltip_for_cols(gp: Any, cols: list[str]) -> None:
             frameon=True,
             bboxprops=dict(
                 boxstyle="round,pad=0.55",
-                fc=(0, 0, 0, 0.28),
-                ec=(1, 1, 1, 0.06),
+                fc=bg_rgba,
+                ec=border_rgba,
                 linewidth=1.0,
             ),
             zorder=1003,

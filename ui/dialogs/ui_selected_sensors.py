@@ -5,6 +5,7 @@ from collections import defaultdict
 
 from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QWidget,
     QVBoxLayout,
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
 
 from ..widgets.ui_titlebar import TitleBar
 from ..widgets.ui_rounding import apply_rounded_corners
+from ..widgets.ui_theme import resolve_effective_theme_mode
 from ..graph_preview.ui_dim_overlay import DimOverlay
 from ..widgets.ui_full_row_tree import FullRowHoverTree
 from .ui_sensor_picker import SPD_MAX_TOKEN
@@ -27,11 +29,15 @@ class SelectedSensorsDialog(QDialog):
         selected_tokens: list[str],
         group_map: dict[str, str],
         has_spd: bool,
+        theme_mode: str = "device",
     ):
         super().__init__(parent)
 
         self._dim_overlay: DimOverlay | None = None
         self._overlay_filter: QObject | None = None
+        self._theme_mode = resolve_effective_theme_mode(theme_mode, QApplication.instance())
+        self._theme_is_dark = self._theme_mode == "dark"
+        self._theme = self._build_theme_palette()
 
         self.corner_radius = 12
         apply_rounded_corners(self, self.corner_radius)
@@ -55,7 +61,10 @@ class SelectedSensorsDialog(QDialog):
         root.setSpacing(10)
         outer.addLayout(root)
 
-        self.tree = FullRowHoverTree(hover_rgba=(255, 255, 255, 15), selected_rgba=(255, 255, 255, 18))
+        self.tree = FullRowHoverTree(
+            hover_rgba=self._theme["tree_hover_rgba"],
+            selected_rgba=self._theme["tree_selected_rgba"],
+        )
         self.tree.setHeaderHidden(True)
         self.tree.setUniformRowHeights(True)
         self.tree.setSelectionMode(QAbstractItemView.NoSelection)
@@ -106,35 +115,63 @@ class SelectedSensorsDialog(QDialog):
 
         # Match Legend & Stats popup look
         self.setObjectName("SelectedSensorsDialog")
-        self.setStyleSheet(
-            """
-            QDialog#SelectedSensorsDialog { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 10px; }
-            QWidget#TitleBar { background: #151515; }
+        self.setStyleSheet(self._dialog_stylesheet())
 
-            QTreeWidget { background: transparent; border: none; color: #EAEAEA; outline: none; }
-            QTreeWidget::item { padding: 6px 6px; background: transparent; }
-            /* Full row hover is painted by FullRowHoverTree (covers left gutter too) */
-            QTreeWidget::item:hover { background: transparent; }
-            QTreeWidget::item:selected, QTreeWidget::item:selected:hover { background: transparent; }
+        self.resize(900, 600)
 
-            /* Prevent branch-area selection tint ("blue bar") */
-            QTreeView::branch:selected { background: transparent; }
-            QTreeView::branch:hover { background: transparent; }
+    def _build_theme_palette(self) -> dict[str, object]:
+        if self._theme_is_dark:
+            return {
+                "dialog_bg": "#1A1A1A",
+                "dialog_border": "#2A2A2A",
+                "titlebar_bg": "#151515",
+                "text": "#EAEAEA",
+                "button_bg": "#2A2A2A",
+                "button_border": "#3A3A3A",
+                "button_hover_bg": "#333333",
+                "button_hover_border": "#4A4A4A",
+                "button_pressed_bg": "#252525",
+                "tree_hover_rgba": (255, 255, 255, 15),
+                "tree_selected_rgba": (255, 255, 255, 18),
+            }
+        return {
+            "dialog_bg": "#F7F7F7",
+            "dialog_border": "#D4D4D4",
+            "titlebar_bg": "#ECECEC",
+            "text": "#111111",
+            "button_bg": "#FFFFFF",
+            "button_border": "#CFCFCF",
+            "button_hover_bg": "#F0F0F0",
+            "button_hover_border": "#BDBDBD",
+            "button_pressed_bg": "#E8E8E8",
+            "tree_hover_rgba": (0, 0, 0, 12),
+            "tree_selected_rgba": (0, 0, 0, 16),
+        }
 
-            QDialogButtonBox QPushButton {
-                background: #2A2A2A;
-                color: #EAEAEA;
-                border: 1px solid #3A3A3A;
+    def _dialog_stylesheet(self) -> str:
+        return f"""
+            QDialog#SelectedSensorsDialog {{ background: {self._theme['dialog_bg']}; border: 1px solid {self._theme['dialog_border']}; border-radius: 10px; }}
+            QWidget#TitleBar {{ background: {self._theme['titlebar_bg']}; }}
+
+            QTreeWidget {{ background: transparent; border: none; color: {self._theme['text']}; outline: none; }}
+            QTreeWidget::item {{ padding: 6px 6px; background: transparent; }}
+            QTreeWidget::item:hover {{ background: transparent; }}
+            QTreeWidget::item:selected, QTreeWidget::item:selected:hover {{ background: transparent; }}
+
+            QTreeView::branch:selected {{ background: transparent; }}
+            QTreeView::branch:hover {{ background: transparent; }}
+
+            QDialogButtonBox QPushButton {{
+                background: {self._theme['button_bg']};
+                color: {self._theme['text']};
+                border: 1px solid {self._theme['button_border']};
                 border-radius: 8px;
                 padding: 6px 12px;
                 min-width: 88px;
-            }
-            QDialogButtonBox QPushButton:hover { background: #333333; border-color: #4A4A4A; }
-            QDialogButtonBox QPushButton:pressed { background: #252525; }
-            """
-        )
-
-        self.resize(900, 600)
+            }}
+            QDialogButtonBox QPushButton:hover {{ background: {self._theme['button_hover_bg']}; border-color: {self._theme['button_hover_border']}; }}
+            QDialogButtonBox QPushButton:pressed {{ background: {self._theme['button_pressed_bg']}; }}
+        """
 
     def _top_window(self) -> QWidget | None:
         try:

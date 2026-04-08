@@ -27,6 +27,7 @@ import matplotlib.dates as mdates
 
 from .graph_plot_helpers import (
     apply_dark_axes_style,
+    apply_light_axes_style,
     apply_elapsed_time_formatter,
     build_tab20_color_map,
     compute_x_vals,
@@ -38,6 +39,7 @@ from .graph_plot_helpers import (
     group_columns_by_unit,
     get_measurement_type_label,
 )
+from ..widgets.ui_theme import resolve_effective_theme_mode
 
 from .ui_dim_overlay import DimOverlay
 from .ui_legend_stats_popup import LegendStatsPopup
@@ -110,6 +112,9 @@ class GraphPreview(QObject):
         self._preview_series_data = {} # col -> np.ndarray
         self._preview_color_map = {}   # col -> color hex
         self._preview_csv_path: str | None = None
+        self._theme_mode: str = "dark"
+        self._theme_is_dark: bool = True
+        self._preview_theme: dict[str, object] = {}
 
         # Legend&Stats button drawn inside the axes
         self._ls_btn_text = None
@@ -236,6 +241,7 @@ class GraphPreview(QObject):
 
             self._preview_grid_color = "#3A3A3A"
             self._preview_dot_dashes = (0, (1.2, 3.2))
+            self._update_preview_theme_palette()
 
             def _qc(ev):
                 try:
@@ -331,6 +337,155 @@ class GraphPreview(QObject):
         self._single_axis_vlines = {}
         self._single_last_canvas_wh = None
         self._single_last_idx = None
+
+    def set_theme_mode(self, mode: str) -> None:
+        try:
+            self._theme_mode = str(mode or "dark").strip().lower() or "dark"
+            self._update_preview_theme_palette()
+            self._refresh_current_preview_theme()
+        except Exception:
+            pass
+
+    def _update_preview_theme_palette(self) -> None:
+        try:
+            effective_mode = resolve_effective_theme_mode(getattr(self, "_theme_mode", "dark"))
+            self._theme_is_dark = (effective_mode != "light")
+
+            if self._theme_is_dark:
+                self._preview_theme = {
+                    "figure_bg": "#121212",
+                    "grid": "#3A3A3A",
+                    "label": "#EAEAEA",
+                    "secondary_text": "#BDBDBD",
+                    "tooltip_bg": "rgba(24,24,24,160)",
+                    "tooltip_border": "rgba(255,255,255,18)",
+                    "tooltip_text": "#FFFFFF",
+                    "button_active_fill": (0.25, 0.25, 0.25, 0.35),
+                    "button_active_border": (0.55, 0.55, 0.55, 0.85),
+                    "button_active_text": (1.0, 1.0, 1.0, 0.98),
+                }
+            else:
+                self._preview_theme = {
+                    "figure_bg": "#FFFFFF",
+                    "grid": "#DADADA",
+                    "label": "#1A1A1A",
+                    "secondary_text": "#5A5A5A",
+                    "tooltip_bg": "rgba(255,255,255,235)",
+                    "tooltip_border": "rgba(0,0,0,35)",
+                    "tooltip_text": "#1A1A1A",
+                    "button_active_fill": (0.83, 0.83, 0.83, 0.75),
+                    "button_active_border": (0.58, 0.58, 0.58, 0.95),
+                    "button_active_text": (0.05, 0.05, 0.05, 0.98),
+                }
+
+            self._preview_grid_color = str(self._preview_theme.get("grid", "#3A3A3A"))
+            self._preview_dot_dashes = (0, (1.2, 3.2))
+
+            try:
+                if getattr(self, "_preview_fig", None) is not None:
+                    self._preview_fig.set_facecolor(str(self._preview_theme.get("figure_bg", "#121212")))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _preview_tooltip_stylesheet(self) -> str:
+        theme = dict(getattr(self, "_preview_theme", {}) or {})
+        bg = str(theme.get("tooltip_bg", "rgba(24,24,24,160)"))
+        border = str(theme.get("tooltip_border", "rgba(255,255,255,18)"))
+        text = str(theme.get("tooltip_text", "#FFFFFF"))
+        return (
+            "QLabel {"
+            f" background-color: {bg};"
+            f" border: 1px solid {border};"
+            " border-radius: 8px;"
+            " padding: 8px 10px;"
+            f" color: {text};"
+            "}"
+        )
+
+    def _preview_label_color(self) -> str:
+        try:
+            return str(self._preview_theme.get("label", "#EAEAEA"))
+        except Exception:
+            return "#EAEAEA"
+
+    def _preview_secondary_text_color(self) -> str:
+        try:
+            return str(self._preview_theme.get("secondary_text", "#BDBDBD"))
+        except Exception:
+            return "#BDBDBD"
+
+    def _apply_preview_axes_style(self, ax) -> None:
+        try:
+            if bool(getattr(self, "_theme_is_dark", True)):
+                apply_dark_axes_style(
+                    self._preview_fig,
+                    ax,
+                    grid_color=self._preview_grid_color,
+                    dot_dashes=self._preview_dot_dashes,
+                )
+            else:
+                apply_light_axes_style(
+                    self._preview_fig,
+                    ax,
+                    grid_color=self._preview_grid_color,
+                    dot_dashes=self._preview_dot_dashes,
+                )
+        except Exception:
+            pass
+
+    def _refresh_current_preview_theme(self) -> None:
+        try:
+            try:
+                if self._qt_tt is not None:
+                    self._qt_tt.setStyleSheet(self._preview_tooltip_stylesheet())
+            except Exception:
+                pass
+
+            try:
+                for st in list((self._compare_axis_state or {}).values()):
+                    tt = (st or {}).get("qt_tt") if isinstance(st, dict) else None
+                    if tt is not None:
+                        tt.setStyleSheet(self._preview_tooltip_stylesheet())
+            except Exception:
+                pass
+
+            try:
+                for st in list((self._single_axis_state or {}).values()):
+                    tt = (st or {}).get("qt_tt") if isinstance(st, dict) else None
+                    if tt is not None:
+                        tt.setStyleSheet(self._preview_tooltip_stylesheet())
+            except Exception:
+                pass
+
+            mp = getattr(self, "_compare_manifest_path", None)
+            if mp is not None:
+                try:
+                    mp2 = Path(str(mp))
+                    if mp2.exists() and mp2.is_file():
+                        self._plot_compare_manifest(mp2)
+                        return
+                except Exception:
+                    pass
+
+            csvp = getattr(self, "_preview_csv_path", None)
+            if csvp:
+                try:
+                    cp = Path(str(csvp))
+                    if cp.exists() and cp.is_file():
+                        self._plot_run_csv(str(cp))
+                        return
+                except Exception:
+                    pass
+
+            try:
+                if getattr(self, "_preview_canvas", None) is not None:
+                    self._preview_canvas.draw_idle()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     # ---------------------------------------------------------------------
     # Qt tooltip animation helpers (per-widget)
@@ -474,15 +629,7 @@ class GraphPreview(QObject):
             tt.setFont(f)
 
             # Match the existing tooltip style closely (semi-transparent dark background + subtle border)
-            tt.setStyleSheet(
-                "QLabel#PreviewTooltipOverlay {"
-                " background-color: rgba(24,24,24,160);"
-                " border: 1px solid rgba(255,255,255,18);"
-                " border-radius: 8px;"
-                " padding: 8px 10px;"
-                " color: #FFFFFF;"
-                "}"
-            )
+            tt.setStyleSheet(self._preview_tooltip_stylesheet())
             tt.hide()
             self._qt_tt = tt
             return tt
@@ -531,10 +678,11 @@ class GraphPreview(QObject):
                 val_w = max(val_w, len(v))
 
             header_e = self._html_escape(header)
+            header_color = str((getattr(self, "_preview_theme", {}) or {}).get("tooltip_text", "#FFFFFF"))
 
             lines = []
             # header
-            lines.append(f"<span style='font-weight:700;color:#FFFFFF'>{header_e}</span>")
+            lines.append(f"<span style='font-weight:700;color:{header_color}'>{header_e}</span>")
 
             # content lines aligned using pre-like whitespace
             for n, v, col in zip(n2, v2, c2):
@@ -554,7 +702,8 @@ class GraphPreview(QObject):
             body = "\n".join(lines)
             return "<div style=\"white-space:pre;\">" + body + "</div>"
         except Exception:
-            return f"<div style='white-space:pre;'><b>{self._html_escape(header)}</b></div>"
+            header_color = str((getattr(self, "_preview_theme", {}) or {}).get("tooltip_text", "#FFFFFF"))
+            return f"<div style='white-space:pre;color:{header_color};'><b>{self._html_escape(header)}</b></div>"
 
     @staticmethod
     def _nearest_index_sorted(x_sorted: np.ndarray, x: float) -> int:
@@ -1739,14 +1888,13 @@ class GraphPreview(QObject):
                 if is_on:
                     # High-contrast, obvious "active" state.
                     # Subtle gray highlight (requested): slightly gray border + semi-transparent gray fill.
-                    fc = (0.25, 0.25, 0.25, 0.35)
-                    ec = (0.55, 0.55, 0.55, 0.85)
+                    fc = self._preview_theme.get("button_active_fill", (0.25, 0.25, 0.25, 0.35))
+                    ec = self._preview_theme.get("button_active_border", (0.55, 0.55, 0.55, 0.85))
                     self._delta_btn_text.set_bbox(
                         dict(boxstyle="round,pad=0.45", fc=fc, ec=ec, lw=1.6)
                     )
                     try:
-                        # White text reads well against the darker gray fill.
-                        self._delta_btn_text.set_color((1, 1, 1, 0.98))
+                        self._delta_btn_text.set_color(self._preview_theme.get("button_active_text", (1, 1, 1, 0.98)))
                         self._delta_btn_text.set_fontweight("bold")
                     except Exception:
                         pass
@@ -1791,11 +1939,11 @@ class GraphPreview(QObject):
 
             try:
                 if is_on:
-                    fc = (0.25, 0.25, 0.25, 0.35)
-                    ec = (0.55, 0.55, 0.55, 0.85)
+                    fc = self._preview_theme.get("button_active_fill", (0.25, 0.25, 0.25, 0.35))
+                    ec = self._preview_theme.get("button_active_border", (0.55, 0.55, 0.55, 0.85))
                     self._zero_btn_text.set_bbox(dict(boxstyle="round,pad=0.45", fc=fc, ec=ec, lw=1.6))
                     try:
-                        self._zero_btn_text.set_color((1, 1, 1, 0.98))
+                        self._zero_btn_text.set_color(self._preview_theme.get("button_active_text", (1, 1, 1, 0.98)))
                         self._zero_btn_text.set_fontweight("bold")
                     except Exception:
                         pass
@@ -2907,6 +3055,7 @@ class GraphPreview(QObject):
             stats_map=stats_map,
             room_temperature=room_temp,
             test_settings=test_settings,
+            theme_mode=getattr(self, "_theme_mode", "dark"),
             on_close=self._on_legend_popup_closed,
         )
 
@@ -3022,6 +3171,7 @@ class GraphPreview(QObject):
             title=f"Legend and Stats ({len(run_tables)} results)",
             sensors=sensors,
             run_tables=run_tables,
+            theme_mode=getattr(self, "_theme_mode", "dark"),
             on_close=self._on_legend_popup_closed,
         )
 
@@ -3749,15 +3899,7 @@ class GraphPreview(QObject):
                 w.setFont(f)
 
                 # Match single-mode style
-                w.setStyleSheet(
-                    "QLabel {"
-                    " background-color: rgba(24,24,24,160);"
-                    " border: 1px solid rgba(255,255,255,18);"
-                    " border-radius: 8px;"
-                    " padding: 8px 10px;"
-                    " color: #FFFFFF;"
-                    "}"
-                )
+                w.setStyleSheet(self._preview_tooltip_stylesheet())
                 w.hide()
                 return w
             except Exception:
@@ -3780,12 +3922,7 @@ class GraphPreview(QObject):
             except Exception:
                 is_ambient_sensor = False
 
-            apply_dark_axes_style(
-                self._preview_fig,
-                ax,
-                grid_color=self._preview_grid_color,
-                dot_dashes=self._preview_dot_dashes,
-            )
+            self._apply_preview_axes_style(ax)
 
             try:
                 ax.spines["top"].set_visible(False)
@@ -3885,7 +4022,7 @@ class GraphPreview(QObject):
                     ha="left",
                     va="bottom",
                     fontsize=9,
-                    color="#EAEAEA",
+                    color=self._preview_label_color(),
                     zorder=2500,
                     clip_on=False,
                 )
@@ -3904,7 +4041,7 @@ class GraphPreview(QObject):
                         ha="right",
                         va="bottom",
                         fontsize=9,
-                        color="#BDBDBD",
+                        color=self._preview_secondary_text_color(),
                         zorder=3000,
                         clip_on=False,
                         bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
@@ -3924,7 +4061,7 @@ class GraphPreview(QObject):
                         ha="right",
                         va="bottom",
                         fontsize=9,
-                        color="#BDBDBD",
+                        color=self._preview_secondary_text_color(),
                         zorder=3000,
                         clip_on=False,
                         bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
@@ -4385,12 +4522,7 @@ class GraphPreview(QObject):
         # The dataframe passed into this function is the DISPLAY dataframe.
         self._preview_df_all = df_data
 
-        apply_dark_axes_style(
-            self._preview_fig,
-            self._preview_ax,
-            grid_color=self._preview_grid_color,
-            dot_dashes=self._preview_dot_dashes,
-        )
+        self._apply_preview_axes_style(self._preview_ax)
 
         cols_plot = [str(c) for c in (cols or [])]
 
@@ -4457,7 +4589,7 @@ class GraphPreview(QObject):
                 transform=self._preview_ax.transAxes,
                 ha="right", va="top",
                 fontsize=9,
-                color="#BDBDBD",
+                color=self._preview_secondary_text_color(),
                 zorder=3000,
                 bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
             )
@@ -4475,7 +4607,7 @@ class GraphPreview(QObject):
                 ha="right",
                 va="top",
                 fontsize=9,
-                color="#BDBDBD",
+                color=self._preview_secondary_text_color(),
                 zorder=3000,
                 bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
             )
@@ -4494,7 +4626,7 @@ class GraphPreview(QObject):
                 ha="right",
                 va="top",
                 fontsize=9,
-                color="#BDBDBD",
+                color=self._preview_secondary_text_color(),
                 zorder=3000,
                 bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
             )
@@ -4628,15 +4760,7 @@ class GraphPreview(QObject):
                 f.setPointSize(10)
                 w.setFont(f)
 
-                w.setStyleSheet(
-                    "QLabel {"
-                    " background-color: rgba(24,24,24,160);"
-                    " border: 1px solid rgba(255,255,255,18);"
-                    " border-radius: 8px;"
-                    " padding: 8px 10px;"
-                    " color: #FFFFFF;"
-                    "}"
-                )
+                w.setStyleSheet(self._preview_tooltip_stylesheet())
                 w.hide()
                 return w
             except Exception:
@@ -4655,12 +4779,7 @@ class GraphPreview(QObject):
             ax = axes[idx]
             measurement_label = get_measurement_type_label(unit)
 
-            apply_dark_axes_style(
-                self._preview_fig,
-                ax,
-                grid_color=self._preview_grid_color,
-                dot_dashes=self._preview_dot_dashes,
-            )
+            self._apply_preview_axes_style(ax)
 
             try:
                 ax.spines["top"].set_visible(False)
@@ -4755,7 +4874,7 @@ class GraphPreview(QObject):
                     ha="left",
                     va="bottom",
                     fontsize=11,
-                    color="#EAEAEA",
+                    color=self._preview_label_color(),
                     zorder=2600,
                     clip_on=False,
                 )
@@ -4773,7 +4892,7 @@ class GraphPreview(QObject):
                         ha="right",
                         va="bottom",
                         fontsize=9,
-                        color="#BDBDBD",
+                        color=self._preview_secondary_text_color(),
                         zorder=3000,
                         clip_on=False,
                         bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
@@ -4793,7 +4912,7 @@ class GraphPreview(QObject):
                         ha="right",
                         va="bottom",
                         fontsize=9,
-                        color="#BDBDBD",
+                        color=self._preview_secondary_text_color(),
                         zorder=3000,
                         clip_on=False,
                         bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
@@ -4814,7 +4933,7 @@ class GraphPreview(QObject):
                         ha="right",
                         va="bottom",
                         fontsize=9,
-                        color="#BDBDBD",
+                        color=self._preview_secondary_text_color(),
                         zorder=3000,
                         clip_on=False,
                         bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),

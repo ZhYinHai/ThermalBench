@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.graph_preview.graph_plot_helpers import group_columns_by_unit, get_measurement_type_label
+from ui.widgets.ui_theme import resolve_effective_theme_mode
 
 
 def _last_visible_row_bottom(tree: QTreeWidget) -> int:
@@ -129,6 +130,7 @@ class CompareLegendStatsPopup(QDialog):
         title: str,
         sensors: list[str],
         run_tables: list[dict],
+        theme_mode: Optional[str] = None,
         on_close=None,
     ):
         super().__init__(parent)
@@ -147,6 +149,9 @@ class CompareLegendStatsPopup(QDialog):
         # Keep a small per-cell padding so separators don't hug values.
         # (Also used when calculating the fixed dialog width.)
         self._cell_pad_x = 2
+        self._theme_mode = resolve_effective_theme_mode(theme_mode or "device", QApplication.instance())
+        self._theme_is_dark = self._theme_mode == "dark"
+        self._theme = self._build_theme_palette()
         self._apply_fixed_dialog_size()
 
         root = QVBoxLayout(self)
@@ -159,7 +164,9 @@ class CompareLegendStatsPopup(QDialog):
         title_row.setContentsMargins(0, 0, 0, 0)
 
         title_area = QLabel(str(title or "Legend & stats"))
-        title_area.setStyleSheet("color:#EAEAEA; font-weight:600; font-size:13px;")
+        title_area.setStyleSheet(
+            f"color:{self._theme['text']}; font-weight:600; font-size:13px;"
+        )
         title_area.setMinimumWidth(0)
         title_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -167,12 +174,7 @@ class CompareLegendStatsPopup(QDialog):
         close_btn.setText("✕")
         close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.clicked.connect(self.close)
-        close_btn.setStyleSheet(
-            """
-            QToolButton { color:#9A9A9A; background: transparent; border: none; padding: 4px 6px; }
-            QToolButton:hover { color:#EAEAEA; background: rgba(255,255,255,0.06); border-radius: 6px; }
-            """
-        )
+        close_btn.setStyleSheet(self._close_button_stylesheet())
 
         title_row.addWidget(title_area)
         title_row.addStretch(1)
@@ -188,29 +190,7 @@ class CompareLegendStatsPopup(QDialog):
         settings_btn.setCheckable(True)
         settings_btn.setChecked(False)
         settings_btn.clicked.connect(self._toggle_settings_panel)
-        settings_btn.setStyleSheet(
-            """
-            QPushButton {
-                background: #2A2A2A;
-                color: #EAEAEA;
-                border: 1px solid #3A3A3A;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background: #333333;
-                border-color: #4A4A4A;
-            }
-            QPushButton:pressed {
-                background: #252525;
-            }
-            QPushButton:checked {
-                background: #1F2B1F;
-                border-color: #2E4A2E;
-            }
-            """
-        )
+        settings_btn.setStyleSheet(self._button_stylesheet(checkable=True))
 
         btn_row.addStretch(1)
         btn_row.addWidget(settings_btn)
@@ -220,53 +200,13 @@ class CompareLegendStatsPopup(QDialog):
         dt_btn.setCheckable(True)
         dt_btn.setChecked(False)
         dt_btn.clicked.connect(self._toggle_dt_only_mode)
-        dt_btn.setStyleSheet(
-            """
-            QPushButton {
-                background: #2A2A2A;
-                color: #EAEAEA;
-                border: 1px solid #3A3A3A;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background: #333333;
-                border-color: #4A4A4A;
-            }
-            QPushButton:pressed {
-                background: #252525;
-            }
-            QPushButton:checked {
-                background: #1F2B1F;
-                border-color: #2E4A2E;
-            }
-            """
-        )
+        dt_btn.setStyleSheet(self._button_stylesheet(checkable=True))
         btn_row.addWidget(dt_btn)
 
         copy_btn = QPushButton("Copy Table")
         copy_btn.setCursor(Qt.PointingHandCursor)
         copy_btn.clicked.connect(self._copy_table_to_clipboard)
-        copy_btn.setStyleSheet(
-            """
-            QPushButton {
-                background: #2A2A2A;
-                color: #EAEAEA;
-                border: 1px solid #3A3A3A;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background: #333333;
-                border-color: #4A4A4A;
-            }
-            QPushButton:pressed {
-                background: #252525;
-            }
-            """
-        )
+        copy_btn.setStyleSheet(self._button_stylesheet())
 
         btn_row.addWidget(copy_btn)
         root.addLayout(btn_row)
@@ -335,13 +275,17 @@ class CompareLegendStatsPopup(QDialog):
         sp_root.setSpacing(6)
 
         sp_title = QLabel("Test Settings")
-        sp_title.setStyleSheet("color:#9A9A9A; font-weight:600; font-size:11px;")
+        sp_title.setStyleSheet(
+            f"color:{self._theme['secondary_text']}; font-weight:600; font-size:11px;"
+        )
         sp_root.addWidget(sp_title)
 
         self._settings_label = QLabel()
         self._settings_label.setTextFormat(Qt.RichText)
         self._settings_label.setWordWrap(True)
-        self._settings_label.setStyleSheet("color:#EAEAEA; font-size:11px;")
+        self._settings_label.setStyleSheet(
+            f"color:{self._theme['text']}; font-size:11px;"
+        )
 
         # Wrap the label in a scroll area for long multi-run settings.
         sp_sc = QScrollArea()
@@ -411,50 +355,7 @@ class CompareLegendStatsPopup(QDialog):
         except Exception:
             pass
 
-        self.setStyleSheet(
-            """
-            QDialog { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 10px; }
-            QLabel { background: transparent; }
-
-            QFrame#SettingsPanel { background: #151515; border: 1px solid #2A2A2A; border-radius: 10px; }
-
-            QTreeWidget { background: transparent; border: none; color: #EAEAEA; outline: none; }
-
-            QTreeWidget::item {
-                padding: 6px 4px;
-                border-radius: 0px;
-                background: transparent;
-            }
-
-            QTreeWidget::item:hover {
-                background: rgba(255,255,255,0.06);
-            }
-
-            QTreeWidget::item:selected,
-            QTreeWidget::item:selected:hover {
-                background: transparent;
-            }
-
-            QHeaderView::section {
-                background: transparent;
-                color: #9A9A9A;
-                font-weight: 600;
-                padding: 6px 8px;
-                border: none;
-            }
-
-            QHeaderView {
-                background: #151515;
-            }
-
-            QHeaderView::viewport {
-                background: #151515;
-                margin: 0px;
-                padding: 0px;
-                border: none;
-            }
-            """
-        )
+        self.setStyleSheet(self._dialog_stylesheet())
 
         self.setSizeGripEnabled(False)
         # Fixed-size dialog (same for all result counts).
@@ -472,6 +373,129 @@ class CompareLegendStatsPopup(QDialog):
         except Exception:
             pass
         super().closeEvent(event)
+
+    def _build_theme_palette(self) -> dict[str, str]:
+        if self._theme_is_dark:
+            return {
+                "text": "#EAEAEA",
+                "secondary_text": "#9A9A9A",
+                "dialog_bg": "#1A1A1A",
+                "dialog_border": "#2A2A2A",
+                "panel_bg": "#151515",
+                "header_bg": "#151515",
+                "hover_bg": "rgba(255,255,255,0.06)",
+                "separator": "rgba(255,255,255,0.10)",
+                "divider": "rgba(255,255,255,0.08)",
+                "button_bg": "#2A2A2A",
+                "button_border": "#3A3A3A",
+                "button_hover_bg": "#333333",
+                "button_hover_border": "#4A4A4A",
+                "button_pressed_bg": "#252525",
+                "button_checked_bg": "#1F2B1F",
+                "button_checked_border": "#2E4A2E",
+                "empty_text": "#9A9A9A",
+            }
+        return {
+            "text": "#111111",
+            "secondary_text": "#5E5E5E",
+            "dialog_bg": "#F7F7F7",
+            "dialog_border": "#D4D4D4",
+            "panel_bg": "#ECECEC",
+            "header_bg": "#ECECEC",
+            "hover_bg": "rgba(0,0,0,0.06)",
+            "separator": "rgba(0,0,0,0.10)",
+            "divider": "rgba(0,0,0,0.08)",
+            "button_bg": "#FFFFFF",
+            "button_border": "#CFCFCF",
+            "button_hover_bg": "#F0F0F0",
+            "button_hover_border": "#BDBDBD",
+            "button_pressed_bg": "#E8E8E8",
+            "button_checked_bg": "#DCE9DC",
+            "button_checked_border": "#AFC6AF",
+            "empty_text": "#6B6B6B",
+        }
+
+    def _close_button_stylesheet(self) -> str:
+        return (
+            "QToolButton { "
+            f"color:{self._theme['secondary_text']}; background: transparent; border: none; padding: 4px 6px;"
+            " }"
+            "QToolButton:hover { "
+            f"color:{self._theme['text']}; background: {self._theme['hover_bg']}; border-radius: 6px;"
+            " }"
+        )
+
+    def _button_stylesheet(self, *, checkable: bool = False) -> str:
+        checked = ""
+        if checkable:
+            checked = (
+                "QPushButton:checked { "
+                f"background: {self._theme['button_checked_bg']}; border-color: {self._theme['button_checked_border']};"
+                " }"
+            )
+        return (
+            "QPushButton { "
+            f"background: {self._theme['button_bg']}; color: {self._theme['text']}; border: 1px solid {self._theme['button_border']};"
+            " border-radius: 6px; padding: 6px 14px; font-size: 12px;"
+            " }"
+            "QPushButton:hover { "
+            f"background: {self._theme['button_hover_bg']}; border-color: {self._theme['button_hover_border']};"
+            " }"
+            "QPushButton:pressed { "
+            f"background: {self._theme['button_pressed_bg']};"
+            " }"
+            f"{checked}"
+        )
+
+    def _dialog_stylesheet(self) -> str:
+        return f"""
+            QDialog {{ background: {self._theme['dialog_bg']}; border: 1px solid {self._theme['dialog_border']}; border-radius: 10px; }}
+            QLabel {{ background: transparent; }}
+
+            QFrame#SettingsPanel {{ background: {self._theme['panel_bg']}; border: 1px solid {self._theme['dialog_border']}; border-radius: 10px; }}
+
+            QTreeWidget {{ background: transparent; border: none; color: {self._theme['text']}; outline: none; }}
+
+            QTreeWidget::item {{
+                padding: 6px 4px;
+                border-radius: 0px;
+                background: transparent;
+            }}
+
+            QTreeWidget::item:hover {{
+                background: {self._theme['hover_bg']};
+            }}
+
+            QTreeWidget::item:selected,
+            QTreeWidget::item:selected:hover {{
+                background: transparent;
+            }}
+
+            QHeaderView::section {{
+                background: transparent;
+                color: {self._theme['secondary_text']};
+                font-weight: 600;
+                padding: 6px 8px;
+                border: none;
+            }}
+
+            QHeaderView {{
+                background: {self._theme['header_bg']};
+            }}
+
+            QHeaderView::viewport {{
+                background: {self._theme['header_bg']};
+                margin: 0px;
+                padding: 0px;
+                border: none;
+            }}
+        """
+
+    def _empty_settings_html(self, message: str) -> str:
+        return f"<span style='color:{self._theme['empty_text']};'>{message}</span>"
+
+    def _divider_html(self, *, margin: str) -> str:
+        return f"<div style='height:1px; background: {self._theme['divider']}; margin: {margin};'></div>"
 
     # ---------- Copy table to clipboard ----------
     def _copy_table_to_clipboard(self) -> None:
@@ -981,7 +1005,7 @@ class CompareLegendStatsPopup(QDialog):
             while len(self._table_sep_lines) < int(desired):
                 ln = QFrame(cont)
                 ln.setFrameShape(QFrame.NoFrame)
-                ln.setStyleSheet("background: rgba(255,255,255,0.10);")
+                ln.setStyleSheet(f"background: {self._theme['separator']};")
                 try:
                     ln.setAttribute(Qt.WA_TransparentForMouseEvents, True)
                 except Exception:
@@ -1598,11 +1622,30 @@ class CompareLegendStatsPopup(QDialog):
                     except Exception:
                         return default
 
+                def gb(key: str) -> bool | None:
+                    try:
+                        if key not in s:
+                            return None
+                        value = s.get(key)
+                        if isinstance(value, bool):
+                            return value
+                        text = str(value).strip().lower()
+                        if text in {"1", "true", "yes", "on"}:
+                            return True
+                        if text in {"0", "false", "no", "off"}:
+                            return False
+                    except Exception:
+                        pass
+                    return None
+
                 warm = g("warmup_display") or g("warmup_total_sec")
                 logt = g("log_display") or g("log_total_sec")
                 stress = g("stress_mode")
                 demo = g("furmark_demo")
                 res = g("furmark_resolution_display") or g("furmark_resolution")
+                stress_gpu = gb("stress_gpu")
+                if stress_gpu is None:
+                    stress_gpu = "gpu" in stress.lower()
 
                 lines: list[str] = []
                 if warm:
@@ -1611,9 +1654,9 @@ class CompareLegendStatsPopup(QDialog):
                     lines.append(f"Log time: {logt}")
                 if stress:
                     lines.append(f"Stresstest: {stress}")
-                if demo:
+                if stress_gpu and demo:
                     lines.append(f"FurMark demo: {demo}")
-                if res:
+                if stress_gpu and res:
                     lines.append(f"FurMark resolution: {res}")
                 return lines
 
@@ -1623,7 +1666,7 @@ class CompareLegendStatsPopup(QDialog):
             # grey "border" separation as subsequent run blocks.
             try:
                 if self._run_tables:
-                    blocks.append("<div style='height:1px; background: rgba(255,255,255,0.08); margin: 4px 0 10px 0;'></div>")
+                    blocks.append(self._divider_html(margin="4px 0 10px 0"))
             except Exception:
                 pass
 
@@ -1633,7 +1676,7 @@ class CompareLegendStatsPopup(QDialog):
 
                 col = str(rt.get("color") or "").strip()
                 if not col.startswith("#"):
-                    col = "#EAEAEA"
+                    col = self._theme["text"]
 
                 safe_lbl = html.escape(lbl)
 
@@ -1643,18 +1686,18 @@ class CompareLegendStatsPopup(QDialog):
                     "</div>"
                 )
                 if not isinstance(ts, dict) or not ts:
-                    blocks.append("<div style='margin-bottom:10px; color:#9A9A9A;'>No settings recorded for this run.</div>")
+                    blocks.append(f"<div style='margin-bottom:10px; color:{self._theme['empty_text']};'>No settings recorded for this run.</div>")
                     continue
 
                 lines = _render_one_settings(ts)
                 if not lines:
-                    blocks.append("<div style='margin-bottom:10px; color:#9A9A9A;'>No settings recorded for this run.</div>")
+                    blocks.append(f"<div style='margin-bottom:10px; color:{self._theme['empty_text']};'>No settings recorded for this run.</div>")
                     continue
 
                 blocks.append("<div style='margin-bottom:10px;'>" + "<br>".join(lines) + "</div>")
 
                 # Divider between runs (subtle)
-                blocks.append("<div style='height:1px; background: rgba(255,255,255,0.08); margin: 8px 0 10px 0;'></div>")
+                blocks.append(self._divider_html(margin="8px 0 10px 0"))
 
             # Remove trailing divider if present
             try:
@@ -1664,13 +1707,13 @@ class CompareLegendStatsPopup(QDialog):
                 pass
 
             if not blocks:
-                lab.setText("<span style='color:#9A9A9A;'>No settings recorded for these runs.</span>")
+                lab.setText(self._empty_settings_html("No settings recorded for these runs."))
                 return
 
             lab.setText("".join(blocks))
         except Exception:
             try:
-                self._settings_label.setText("<span style='color:#9A9A9A;'>No settings recorded for these runs.</span>")
+                self._settings_label.setText(self._empty_settings_html("No settings recorded for these runs."))
             except Exception:
                 pass
 
@@ -1833,25 +1876,27 @@ class CompareLegendStatsPopup(QDialog):
         def _mk_lbl(
             text: str,
             *,
-            color: str = "#9A9A9A",
+            color: str = "",
             bold: bool = True,
             align=Qt.AlignCenter,
             pad_l: int = 6,
             pad_r: int = 6,
         ) -> QLabel:
+            if not color:
+                color = self._theme["secondary_text"]
             lab = QLabel(text)
             lab.setAlignment(align)
             lab.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             fw = 600 if bold else 400
             lab.setStyleSheet(
-                f"background:#151515; color:{color}; font-weight:{fw}; padding:6px {int(pad_r)}px 6px {int(pad_l)}px; border:none;"
+                f"background:{self._theme['header_bg']}; color:{color}; font-weight:{fw}; padding:6px {int(pad_r)}px 6px {int(pad_l)}px; border:none;"
             )
             return lab
 
         # Measurement header spans both rows (rowSpan=2).
         self._hdr_measurement_lbl = _mk_lbl(
             "Measurement",
-            color="#9A9A9A",
+            color=self._theme["secondary_text"],
             bold=True,
             align=Qt.AlignLeft | Qt.AlignVCenter,
         )
@@ -1863,7 +1908,7 @@ class CompareLegendStatsPopup(QDialog):
         # Run name headers (row 0) + stat headers (row 1)
         for run_idx, rt in enumerate(run_tables):
             run_label = str(rt.get("label") or "")
-            run_color = str(rt.get("color") or "#EAEAEA")
+            run_color = str(rt.get("color") or self._theme["text"])
             start_col = 1 + (4 * int(run_idx))
 
             run_lab = _mk_lbl(
@@ -1884,7 +1929,7 @@ class CompareLegendStatsPopup(QDialog):
                 # Right-align to better match right-aligned numeric values.
                 stat_lab = _mk_lbl(
                     stat_name,
-                    color="#9A9A9A",
+                    color=self._theme["secondary_text"],
                     bold=True,
                     align=Qt.AlignRight | Qt.AlignVCenter,
                     pad_l=6 + int(pad_extra),

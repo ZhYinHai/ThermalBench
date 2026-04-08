@@ -194,6 +194,41 @@ def apply_dark_axes_style(fig, ax, *, grid_color: str, dot_dashes) -> None:
         pass
 
 
+def apply_light_axes_style(fig, ax, *, grid_color: str, dot_dashes) -> None:
+    try:
+        fig.set_facecolor("#FFFFFF")
+    except Exception:
+        pass
+
+    try:
+        ax.set_facecolor("#FFFFFF")
+        for side in ("left", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("top", "bottom"):
+            sp = ax.spines[side]
+            sp.set_visible(True)
+            sp.set_color(grid_color)
+            sp.set_linewidth(0.9)
+            sp.set_linestyle(dot_dashes)
+            sp.set_alpha(0.95)
+
+        ax.tick_params(axis="both", length=0)
+        ax.tick_params(axis="x", colors="#666666")
+        ax.tick_params(axis="y", colors="#666666")
+        ax.xaxis.label.set_color("#1A1A1A")
+        ax.yaxis.label.set_color("#1A1A1A")
+    except Exception:
+        pass
+
+    try:
+        ax.grid(True, which="major", axis="y", color=grid_color, linewidth=0.9)
+        for gl in ax.get_ygridlines():
+            gl.set_linestyle(dot_dashes)
+            gl.set_alpha(0.95)
+    except Exception:
+        pass
+
+
 def build_tab20_color_map(cols: list[str]) -> dict[str, str]:
     cmap = cm.get_cmap("tab20")
     color_map: dict[str, str] = {}

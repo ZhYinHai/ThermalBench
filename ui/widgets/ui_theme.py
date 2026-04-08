@@ -1,8 +1,66 @@
 # ui_theme.py
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QComboBox
 from PySide6.QtGui import QPalette, QColor
 from pathlib import Path as _Path
 from core.resources import resource_path
+
+
+def detect_system_theme_mode(app: QApplication | None = None) -> str:
+    """Best-effort OS theme detection using Qt's native color-scheme API."""
+    try:
+        app = app if app is not None else QApplication.instance()
+    except Exception:
+        app = None
+
+    try:
+        if app is not None:
+            style_hints = app.styleHints()
+            scheme = style_hints.colorScheme()
+            if scheme == Qt.ColorScheme.Dark:
+                return "dark"
+            if scheme == Qt.ColorScheme.Light:
+                return "light"
+    except Exception:
+        pass
+
+    try:
+        if app is not None:
+            bg = app.palette().color(QPalette.ColorRole.Window)
+            return "dark" if bg.lightness() < 128 else "light"
+    except Exception:
+        pass
+
+    return "dark"
+
+
+def resolve_effective_theme_mode(mode: str, app: QApplication | None = None) -> str:
+    """Resolve a requested theme to the effective 'light' or 'dark' mode.
+
+    For 'device', prefer the app-level resolved theme property when available so
+    all widgets follow the same interpretation after the global stylesheet is applied.
+    """
+    requested = (mode or "dark").strip().lower()
+    if requested not in ("dark", "light", "device"):
+        requested = "dark"
+
+    if requested != "device":
+        return "light" if requested == "light" else "dark"
+
+    try:
+        app = app if app is not None else QApplication.instance()
+    except Exception:
+        app = None
+
+    try:
+        if app is not None:
+            effective = str(app.property("_tb_effective_theme_mode") or "").strip().lower()
+            if effective in ("light", "dark"):
+                return effective
+    except Exception:
+        pass
+
+    return detect_system_theme_mode(app)
 
 def apply_theme(app: QApplication, mode: str) -> None:
     mode = (mode or "dark").strip().lower()
@@ -12,12 +70,12 @@ def apply_theme(app: QApplication, mode: str) -> None:
     app.setStyle("Fusion")
 
     if mode == "device":
-        # Clear any custom stylesheet so palette reflects OS defaults
-        app.setStyleSheet("")
-        pal = app.palette()
-        bg = pal.color(QPalette.Window)
-        # lightness(): 0 (black) -> 255 (white)
-        mode = "dark" if bg.lightness() < 128 else "light"
+        mode = detect_system_theme_mode(app)
+
+    try:
+        app.setProperty("_tb_effective_theme_mode", mode)
+    except Exception:
+        pass
 
     if mode == "dark":
         app.setStyleSheet(
@@ -268,14 +326,7 @@ def style_combobox_popup(combo: QComboBox, mode: str, arrow_path: str | None = N
     """Apply arrow icon and popup colors to a QComboBox so its dropdown matches the requested theme.
     `mode` may be "light", "dark", or "device" (device resolves from app palette).
     """
-    mode = (mode or "dark").strip().lower()
-    if mode == "device":
-        try:
-            from PySide6.QtWidgets import QApplication
-            pal = QApplication.instance().palette()
-            mode = "dark" if pal.color(QPalette.Window).lightness() < 128 else "light"
-        except Exception:
-            mode = "dark"
+    mode = resolve_effective_theme_mode(mode)
 
     if mode == "light":
         popup_bg = "#FFFFFF"

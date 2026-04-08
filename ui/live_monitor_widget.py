@@ -10,11 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QBrush, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
+    QApplication,
     QTreeWidget,
     QTreeWidgetItem,
     QHeaderView,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
 from core.hwinfo_csv import read_hwinfo_headers, sensor_leafs_from_header, make_unique
 from ui.graph_preview.graph_plot_helpers import group_columns_by_unit, get_measurement_type_label
 from ui.graph_preview.graph_plot_helpers import build_tab20_color_map
+from ui.widgets.ui_theme import resolve_effective_theme_mode
 
 
 @dataclass
@@ -54,6 +56,11 @@ class LiveMonitorWidget(QFrame):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+
+        self._theme_is_dark = True
+        self._theme_colors: dict[str, str] = {}
+        self._theme_mode: str = "dark"
+        self._applying_theme = False
 
         self._csv_path: str = ""
         self._columns: list[str] = []
@@ -117,25 +124,7 @@ class LiveMonitorWidget(QFrame):
 
         # Match Legend & Stats popup look
         self.setObjectName("LiveMonitor")
-        self.setStyleSheet(
-            """
-            QFrame#LiveMonitor { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 10px; }
-            QTreeWidget { background: transparent; border: none; color: #EAEAEA; outline: none; }
-            QTreeWidget::item { padding: 6px 6px; background: transparent; }
-            QTreeWidget::item:hover { background: rgba(255,255,255,0.06); }
-            QTreeWidget::item:selected, QTreeWidget::item:selected:hover { background: transparent; }
-
-            QHeaderView { background: #151515; }
-            QHeaderView::section {
-                background: transparent;
-                color: #9A9A9A;
-                font-weight: 600;
-                padding: 6px 10px;
-                border: none;
-            }
-            QHeaderView::viewport { background: #151515; margin: 0px; padding: 0px; border: none; }
-            """
-        )
+        self._apply_theme()
 
     def start(self, *, csv_path: str, columns: list[str]) -> None:
         self._csv_path = str(csv_path or "").strip()
@@ -223,6 +212,37 @@ class LiveMonitorWidget(QFrame):
         except Exception:
             pass
 
+    def ingest_sample(self, values: dict[str, object], ts: datetime | None = None) -> None:
+        """Push a synthetic or externally sourced sample through the normal live-update path."""
+        try:
+            if not isinstance(values, dict) or not values:
+                return
+
+            updated_any = False
+            sample_vals: dict[str, float] = {}
+            for col in self._columns:
+                raw = values.get(col)
+                if raw is None:
+                    continue
+                x = self._parse_float(str(raw)) if not isinstance(raw, (int, float)) else float(raw)
+                if x is None:
+                    continue
+
+                stt = self._stats.get(col)
+                if stt is None:
+                    stt = _OnlineStats()
+                    self._stats[col] = stt
+                stt.push(float(x))
+                sample_vals[col] = float(x)
+                updated_any = True
+
+            if not updated_any:
+                return
+
+            self._publish_sample(sample_vals, ts_obj=ts, force=True)
+        except Exception:
+            pass
+
     def _rebuild_rows(self) -> None:
         self._is_rebuilding = True
         try:
@@ -245,7 +265,7 @@ class LiveMonitorWidget(QFrame):
             ordered_units = list(groups.keys())
             ordered_units.sort(key=lambda u: (_prio.get(get_measurement_type_label(u), 99), get_measurement_type_label(u)))
 
-            header_color = "#9A9A9A"
+            header_color = self._theme_colors.get("header_text", "#9A9A9A")
             for unit in ordered_units:
                 cols = list(groups.get(unit, []) or [])
                 if not cols:
@@ -260,7 +280,7 @@ class LiveMonitorWidget(QFrame):
                     f = hdr.font(0)
                     f.setBold(True)
                     hdr.setFont(0, f)
-                    hdr.setForeground(0, header_color)
+                    hdr.setForeground(0, QColor(header_color))
                 except Exception:
                     pass
 
@@ -301,7 +321,7 @@ class LiveMonitorWidget(QFrame):
 
             # Keep label text white; show color via a swatch icon.
             try:
-                item.setForeground(0, QBrush(QColor("#EAEAEA")))
+                item.setForeground(0, QBrush(QColor(self._theme_colors.get("text", "#EAEAEA"))))
             except Exception:
                 pass
 
@@ -323,6 +343,115 @@ class LiveMonitorWidget(QFrame):
                 pass
         except Exception:
             pass
+
+    def changeEvent(self, event) -> None:
+        try:
+            super().changeEvent(event)
+        except Exception:
+            pass
+
+        try:
+            if self._applying_theme:
+                return
+            if self._theme_mode == "device" and event.type() in (QEvent.PaletteChange, QEvent.ApplicationPaletteChange):
+                self._apply_theme()
+        except Exception:
+            pass
+
+    def showEvent(self, event) -> None:
+        try:
+            super().showEvent(event)
+        except Exception:
+            pass
+
+        try:
+            self._apply_theme()
+            self.tree.viewport().update()
+            self.tree.header().viewport().update()
+            self.update()
+        except Exception:
+            pass
+
+    def set_theme_mode(self, mode: str) -> None:
+        try:
+            self._theme_mode = str(mode or "dark").strip().lower() or "dark"
+            self._apply_theme()
+        except Exception:
+            pass
+
+    def _apply_theme(self) -> None:
+        if self._applying_theme:
+            return
+        self._applying_theme = True
+        try:
+            mode = str(getattr(self, "_theme_mode", "dark") or "dark").strip().lower()
+            resolved_mode = resolve_effective_theme_mode(mode, QApplication.instance())
+            self._theme_is_dark = (resolved_mode != "light")
+
+            if self._theme_is_dark:
+                self._theme_colors = {
+                    "panel_bg": "#1A1A1A",
+                    "panel_border": "#2A2A2A",
+                    "header_bg": "#151515",
+                    "text": "#EAEAEA",
+                    "header_text": "#9A9A9A",
+                    "hover": "rgba(255,255,255,0.06)",
+                }
+            else:
+                self._theme_colors = {
+                    "panel_bg": "#FFFFFF",
+                    "panel_border": "#D0D0D0",
+                    "header_bg": "#F3F3F3",
+                    "text": "#1A1A1A",
+                    "header_text": "#666666",
+                    "hover": "rgba(0,0,0,0.05)",
+                }
+
+            colors = self._theme_colors
+            self.setStyleSheet(
+                f"""
+                QFrame#LiveMonitor {{ background: {colors['panel_bg']}; border: 1px solid {colors['panel_border']}; border-radius: 10px; }}
+                QTreeWidget {{ background: transparent; border: none; color: {colors['text']}; outline: none; }}
+                QTreeWidget::item {{ padding: 6px 6px; background: transparent; }}
+                QTreeWidget::item:hover {{ background: {colors['hover']}; }}
+                QTreeWidget::item:selected, QTreeWidget::item:selected:hover {{ background: transparent; }}
+
+                QHeaderView {{ background: {colors['header_bg']}; }}
+                QHeaderView::section {{
+                    background: transparent;
+                    color: {colors['header_text']};
+                    font-weight: 600;
+                    padding: 6px 10px;
+                    border: none;
+                }}
+                QHeaderView::viewport {{ background: {colors['header_bg']}; margin: 0px; padding: 0px; border: none; }}
+                """
+            )
+
+            try:
+                self.style().unpolish(self)
+                self.style().polish(self)
+                self.tree.style().unpolish(self.tree)
+                self.tree.style().polish(self.tree)
+                self.tree.header().style().unpolish(self.tree.header())
+                self.tree.header().style().polish(self.tree.header())
+            except Exception:
+                pass
+
+            try:
+                for item in self._items.values():
+                    self._apply_item_color(item, str(item.text(0) or ""))
+            except Exception:
+                pass
+
+            try:
+                self.tree.viewport().update()
+                self.tree.header().viewport().update()
+                self.update()
+            except Exception:
+                pass
+        finally:
+            self._applying_theme = False
 
         try:
             self.tree.resizeColumnToContents(1)
@@ -613,13 +742,20 @@ class LiveMonitorWidget(QFrame):
             if not updated_any:
                 return
 
-            # Update UI (throttle slightly to avoid overpainting)
+            self._publish_sample(sample_vals, ts_obj=ts_obj)
+        except Exception:
+            pass
+
+    def _publish_sample(self, sample_vals: dict[str, float], *, ts_obj: datetime | None = None, force: bool = False) -> None:
+        try:
+            if not sample_vals:
+                return
+
             now = time.time()
-            if (now - self._last_emit_ts) < 0.08:
+            if not force and (now - self._last_emit_ts) < 0.08:
                 return
             self._last_emit_ts = now
 
-            # Emit sample for live graph (timestamp may be None)
             try:
                 self.sample_updated.emit({"ts": ts_obj, "values": sample_vals})
             except Exception:

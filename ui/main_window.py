@@ -3,12 +3,11 @@ import json
 # ui/main_window.py
 import os
 import sys
-import json
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt, QSize, QTimer, QObject, QThread, Signal, QEvent, QItemSelectionModel
-from PySide6.QtGui import QIcon, QPainter, QColor, QPalette
+from PySide6.QtGui import QIcon, QPainter, QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -33,14 +32,14 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QStyle,
+    QGraphicsOpacityEffect,
 )
 
-from .widgets.ui_theme import apply_theme, style_combobox_popup
+from .widgets.ui_theme import apply_theme, resolve_effective_theme_mode, style_combobox_popup
 from .widgets.ui_widgets import CustomComboBox
-from .dialogs import SettingsDialog
+from .dialogs import HelpDialog, SettingsDialog
 from .widgets.ui_titlebar import TitleBar
 from .widgets.ui_time_spin import make_time_spin
-
 from .graph_preview import GraphPreview
 from .sensor_manager import SensorManager
 from .benchmark_controller import BenchmarkController
@@ -50,16 +49,16 @@ from .live_graph_widget import LiveGraphWidget
 # keep if you have it
 from .runs_proxy_model import RunsProxyModel
 
-from core.settings_store import get_settings_path, load_json, save_json
+from ui.ntfy_notifier import NtfyNotifier
+
 from ui.graph_preview.graph_plot_helpers import load_run_csv_dataframe
 from ui.graph_preview.graph_stats_helpers import infer_stats_title, stats_from_dataframe, stats_from_summary_csv
 from ui.graph_preview.ui_legend_stats_popup import LegendStatsPopup
 
-from ui.ntfy_notifier import NtfyNotifier
-
 from ui.graph_preview.ui_dim_overlay import DimOverlay
 from ui.graph_preview.legend_popup_helpers import raise_center_and_focus
 
+from core.settings_store import get_settings_path, load_json, save_json
 from core.version import __version__
 from core.resources import app_root
 from core.updater import (
@@ -634,6 +633,8 @@ class MainWindow(QWidget):
         # Live monitor table (shown during runs)
         self._live_monitor = LiveMonitorWidget(self)
         self._live_graph = LiveGraphWidget(self)
+        self._live_monitor.set_theme_mode(self.theme_mode)
+        self._live_graph.set_theme_mode(self.theme_mode)
         self._output_stack = None
         self._output_btn_live = None
         self._output_btn_console = None
@@ -669,6 +670,7 @@ class MainWindow(QWidget):
             preview_label=self._preview_label,
             build_selected_columns_callback=self.sensors.build_selected_columns,
         )
+        self.graph.set_theme_mode(self.theme_mode)
 
         # Results tree setup
         runs_root = app_root() / "runs"
@@ -701,14 +703,7 @@ class MainWindow(QWidget):
             self._runs_tree.viewport().installEventFilter(self)
         except Exception:
             pass
-        self._runs_tree.setStyleSheet("""
-            QTreeView {
-                border: none;
-                border-right: 1px solid rgba(128, 128, 128, 0.3);
-                border-radius: 0px;
-                color: #B0B0B0;
-            }
-        """)
+        self._apply_results_tree_theme()
 
         self.compare_btn = QPushButton("Compare")
         self.compare_btn.setEnabled(False)
@@ -791,6 +786,7 @@ class MainWindow(QWidget):
         self.abort_btn.clicked.connect(self.benchmark.abort)
         self.open_btn.clicked.connect(self.benchmark.open_run_folder)
         self.compare_btn.clicked.connect(self.benchmark.compare_selected_results)
+        self.gpu_btn.toggled.connect(lambda *_: self._sync_furmark_gpu_controls())
         # Removed: bottom delete button
 
         try:
@@ -833,9 +829,11 @@ class MainWindow(QWidget):
         nav_layout.setContentsMargins(0, 0, 0, 8)
         nav_layout.setSpacing(0)
 
-        # Icon-only buttons (ASCII placeholders)
+        # Icon-only buttons
         self._btn_run_page = QToolButton()
-        self._btn_run_page.setText(">")
+        self._rail_icon_size = QSize(18, 18)
+        self._run_icon_path = Path(__file__).parent.parent / "resources" / "icons" / "play_arrow_24dp_FFFFFF_FILL0_wght400_GRAD0_opsz24.svg"
+        self._btn_run_page.setIconSize(self._rail_icon_size)
         self._btn_run_page.setToolTip("Run Benchmark")
         self._btn_run_page.setCheckable(True)
         self._btn_run_page.setAutoExclusive(True)
@@ -843,45 +841,36 @@ class MainWindow(QWidget):
         self._btn_run_page.setFixedSize(40, 40)
 
         self._btn_results_page = QToolButton()
-        self._btn_results_page.setText("#")
+        self._results_icon_path = Path(__file__).parent.parent / "resources" / "icons" / "graph_1_24dp_FFFFFF_FILL0_wght400_GRAD0_opsz24.svg"
+        self._btn_results_page.setIconSize(self._rail_icon_size)
         self._btn_results_page.setToolTip("Results")
         self._btn_results_page.setCheckable(True)
         self._btn_results_page.setAutoExclusive(True)
         self._btn_results_page.setCursor(Qt.PointingHandCursor)
         self._btn_results_page.setFixedSize(40, 40)
 
+        self._btn_help = QToolButton()
+        self._help_icon_path = Path(__file__).parent.parent / "resources" / "icons" / "help_24dp_FFFFFF_FILL0_wght400_GRAD0_opsz24.svg"
+        self._btn_help.setIconSize(self._rail_icon_size)
+        self._btn_help.setToolTip("How to use ThermalBench")
+        self._btn_help.setCursor(Qt.PointingHandCursor)
+        self._btn_help.setFixedSize(40, 40)
+        self._btn_help.clicked.connect(self.open_help)
+
         self._btn_settings = QToolButton()
-        settings_icon_path = Path(__file__).parent.parent / "resources" / "icons" / "settings.svg"
-        self._btn_settings.setIcon(QIcon(str(settings_icon_path)))
-        self._btn_settings.setIconSize(QSize(18, 18))
+        self._settings_icon_path = Path(__file__).parent.parent / "resources" / "icons" / "settings_24dp_FFFFFF_FILL0_wght400_GRAD0_opsz24.svg"
+        self._btn_settings.setIconSize(self._rail_icon_size)
         self._btn_settings.setToolTip("Settings")
         self._btn_settings.setCursor(Qt.PointingHandCursor)
         self._btn_settings.setFixedSize(40, 40)
         self._btn_settings.clicked.connect(self.open_settings)
 
-        rail_style = """
-        QWidget {
-            border-right: 1px solid rgba(128, 128, 128, 0.3);
-        }
-        QToolButton {
-            border: none;
-            border-radius: 0px;
-            font-size: 18px;
-            color: #D0D0D0;
-            background: transparent;
-        }
-        QToolButton:hover {
-            background: rgba(255,255,255,0.06);
-        }
-        QToolButton:checked {
-            background: rgba(255,255,255,0.10);
-        }
-        """
-        self._nav.setStyleSheet(rail_style)
+        self._apply_left_rail_theme()
 
         nav_layout.addWidget(self._btn_run_page)
         nav_layout.addWidget(self._btn_results_page)
         nav_layout.addStretch(1)
+        nav_layout.addWidget(self._btn_help)
         nav_layout.addWidget(self._btn_settings)
 
         # Page stack (replaces QTabWidget)
@@ -959,12 +948,14 @@ class MainWindow(QWidget):
 
         demo_col = QVBoxLayout()
         demo_col.setSpacing(6)
-        demo_col.addWidget(self._bold_label("FurMark Demo"))
+        self._fur_demo_label = self._bold_label("FurMark Demo")
+        demo_col.addWidget(self._fur_demo_label)
         demo_col.addWidget(self.fur_demo_combo)
 
         res_col = QVBoxLayout()
         res_col.setSpacing(6)
-        res_col.addWidget(self._bold_label("FurMark Resolution"))
+        self._fur_res_label = self._bold_label("FurMark Resolution")
+        res_col.addWidget(self._fur_res_label)
         res_col.addWidget(self.fur_res_combo)
 
         fur_row.addLayout(demo_col)
@@ -994,27 +985,13 @@ class MainWindow(QWidget):
             b = QPushButton(text)
             b.setCursor(Qt.PointingHandCursor)
             b.setCheckable(True)
-            b.setStyleSheet(
-                """
-                QPushButton {
-                    background: #2A2A2A;
-                    color: #EAEAEA;
-                    border: 1px solid #3A3A3A;
-                    border-radius: 6px;
-                    padding: 6px 12px;
-                    font-size: 12px;
-                }
-                QPushButton:hover { background: #333333; border-color: #4A4A4A; }
-                QPushButton:pressed { background: #252525; }
-                QPushButton:checked { background: #1F2B1F; border-color: #2E4A2E; }
-                """
-            )
             return b
 
         self._output_btn_live = _mk_out_btn("Live")
         self._output_btn_console = _mk_out_btn("Console")
         self._output_btn_live.setAutoExclusive(True)
         self._output_btn_console.setAutoExclusive(True)
+        self._apply_output_toggle_theme()
 
         out_hdr.addWidget(self._output_btn_live)
         out_hdr.addWidget(self._output_btn_console)
@@ -1027,14 +1004,14 @@ class MainWindow(QWidget):
         live_layout.setSpacing(0)
 
         self._live_split = QSplitter(Qt.Horizontal)
+        self._live_split.addWidget(self._live_monitor)
+        self._live_split.addWidget(self._live_graph)
+
         try:
             self._live_split.setCollapsible(0, False)
             self._live_split.setCollapsible(1, False)
         except Exception:
             pass
-
-        self._live_split.addWidget(self._live_monitor)
-        self._live_split.addWidget(self._live_graph)
 
         # Keep this run-layout ratio (table : graph)
         self._live_split_ratio = (0.34, 0.66)  # tweak to match your screenshot exactly
@@ -1059,8 +1036,8 @@ class MainWindow(QWidget):
         self._output_stack.setCurrentIndex(1)
         self._output_btn_console.setChecked(True)
 
-        self._output_btn_live.clicked.connect(lambda *_: self._output_stack.setCurrentIndex(0))
-        self._output_btn_console.clicked.connect(lambda *_: self._output_stack.setCurrentIndex(1))
+        self._output_btn_live.clicked.connect(self._show_live_output)
+        self._output_btn_console.clicked.connect(self._show_console_output)
 
         root.addWidget(self._output_stack, 1)
 
@@ -1150,6 +1127,7 @@ class MainWindow(QWidget):
         # Default page
         self._btn_run_page.setChecked(True)
         self._stack.setCurrentIndex(self._page_run_index)
+        self._refresh_left_rail_icons()
 
         self.resize(DEFAULT_W, DEFAULT_H)
 
@@ -1161,6 +1139,7 @@ class MainWindow(QWidget):
 
         # Load settings and initialize state
         self.load_settings()
+        self._sync_furmark_gpu_controls()
         self.sensors.refresh_sensors_summary()
         self._update_run_button_state()
 
@@ -1265,10 +1244,200 @@ class MainWindow(QWidget):
     # ---------- rail/page switching ----------
     def _on_page_changed(self, index: int) -> None:
         try:
+            self._refresh_left_rail_icons()
             if index == getattr(self, "_page_results_index", -1):
                 # Let the UI finish switching tabs first, then select/plot.
                 QTimer.singleShot(0, self.benchmark.select_latest_result)
                 QTimer.singleShot(0, self._apply_results_split_ratio)
+        except Exception:
+            pass
+
+    def _set_widget_dimmed(self, widget: QWidget, dimmed: bool) -> None:
+        try:
+            effect = widget.graphicsEffect()
+            if not isinstance(effect, QGraphicsOpacityEffect):
+                effect = QGraphicsOpacityEffect(widget)
+                widget.setGraphicsEffect(effect)
+            effect.setOpacity(0.45 if dimmed else 1.0)
+        except Exception:
+            pass
+
+    def _sync_furmark_gpu_controls(self) -> None:
+        try:
+            gpu_enabled = bool(self.gpu_btn.isChecked())
+
+            self.fur_demo_combo.setEnabled(gpu_enabled)
+            self.fur_res_combo.setEnabled(gpu_enabled)
+
+            self._set_widget_dimmed(self._fur_demo_label, not gpu_enabled)
+            self._set_widget_dimmed(self.fur_demo_combo, not gpu_enabled)
+            self._set_widget_dimmed(self._fur_res_label, not gpu_enabled)
+            self._set_widget_dimmed(self.fur_res_combo, not gpu_enabled)
+        except Exception:
+            pass
+
+    def _apply_left_rail_theme(self) -> None:
+        try:
+            effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+            if effective_mode == "light":
+                hover_bg = "rgba(0,0,0,0.06)"
+                checked_bg = "rgba(0,0,0,0.12)"
+            else:
+                hover_bg = "rgba(255,255,255,0.06)"
+                checked_bg = "rgba(255,255,255,0.10)"
+
+            rail_style = f"""
+            QWidget {{
+                border-right: 1px solid rgba(128, 128, 128, 0.3);
+            }}
+            QToolButton {{
+                border: none;
+                border-radius: 0px;
+                font-size: 18px;
+                color: #D0D0D0;
+                background: transparent;
+            }}
+            QToolButton:hover {{
+                background: {hover_bg};
+            }}
+            QToolButton:checked {{
+                background: {checked_bg};
+            }}
+            """
+            self._nav.setStyleSheet(rail_style)
+        except Exception:
+            pass
+
+    def _apply_results_tree_theme(self) -> None:
+        try:
+            effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+            if effective_mode == "light":
+                tree_text = "#000000"
+                selection_bg = "#D9E9FF"
+                hover_bg = "#ECECEC"
+            else:
+                tree_text = "#B0B0B0"
+                selection_bg = "#2A2A2A"
+                hover_bg = "#242424"
+
+            self._runs_tree.setStyleSheet(
+                f"""
+                QTreeView {{
+                    border: none;
+                    border-right: 1px solid rgba(128, 128, 128, 0.3);
+                    border-radius: 0px;
+                    color: {tree_text};
+                }}
+                QTreeView::item:selected {{
+                    background-color: {selection_bg};
+                    color: {tree_text};
+                    outline: none;
+                    border: none;
+                }}
+                QTreeView::item:hover {{
+                    background-color: {hover_bg};
+                }}
+                QTreeView::item:focus {{
+                    outline: none;
+                    border: none;
+                }}
+                """
+            )
+
+            try:
+                self._runs_tree.viewport().update()
+                self._runs_tree.update()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _apply_output_toggle_theme(self) -> None:
+        try:
+            mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+            if mode == "light":
+                button_css = """
+                QPushButton {
+                    background: #FFFFFF;
+                    color: #1A1A1A;
+                    border: 1px solid #D0D0D0;
+                    border-radius: 6px;
+                    padding: 6px 12px;
+                    font-size: 12px;
+                }
+                QPushButton:hover { background: #F0F0F0; border-color: #C2C2C2; }
+                QPushButton:pressed { background: #E6E6E6; }
+                QPushButton:checked {
+                    background: #E3F1E5;
+                    color: #16341A;
+                    border-color: #8CB994;
+                }
+                """
+            else:
+                button_css = """
+                QPushButton {
+                    background: #2A2A2A;
+                    color: #EAEAEA;
+                    border: 1px solid #3A3A3A;
+                    border-radius: 6px;
+                    padding: 6px 12px;
+                    font-size: 12px;
+                }
+                QPushButton:hover { background: #333333; border-color: #4A4A4A; }
+                QPushButton:pressed { background: #252525; }
+                QPushButton:checked {
+                    background: #1F2B1F;
+                    color: #EAEAEA;
+                    border-color: #2E4A2E;
+                }
+                """
+
+            for btn in (self._output_btn_live, self._output_btn_console):
+                if btn is not None:
+                    btn.setStyleSheet(button_css)
+        except Exception:
+            pass
+
+    def _tinted_rail_icon(self, icon_path: Path, color: str) -> QIcon:
+        try:
+            base_icon = QIcon(str(icon_path))
+            pixmap = base_icon.pixmap(self._rail_icon_size)
+            if pixmap.isNull():
+                return base_icon
+
+            tinted = QPixmap(pixmap.size())
+            tinted.fill(Qt.transparent)
+
+            painter = QPainter(tinted)
+            try:
+                painter.drawPixmap(0, 0, pixmap)
+                painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+                painter.fillRect(tinted.rect(), QColor(color))
+            finally:
+                painter.end()
+
+            return QIcon(tinted)
+        except Exception:
+            return QIcon(str(icon_path))
+
+    def _refresh_left_rail_icons(self) -> None:
+        try:
+            effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+            if effective_mode == "light":
+                active = "#000000"
+                inactive = "#7A7A7A"
+            else:
+                active = "#FFFFFF"
+                inactive = "#A7A7A7"
+            current_index = self._stack.currentIndex() if getattr(self, "_stack", None) is not None else -1
+
+            run_color = active if current_index == getattr(self, "_page_run_index", -1) else inactive
+            results_color = active if current_index == getattr(self, "_page_results_index", -1) else inactive
+
+            self._btn_run_page.setIcon(self._tinted_rail_icon(self._run_icon_path, run_color))
+            self._btn_results_page.setIcon(self._tinted_rail_icon(self._results_icon_path, results_color))
+            self._btn_help.setIcon(self._tinted_rail_icon(self._help_icon_path, inactive))
+            self._btn_settings.setIcon(self._tinted_rail_icon(self._settings_icon_path, inactive))
         except Exception:
             pass
 
@@ -1596,6 +1765,13 @@ class MainWindow(QWidget):
         try:
             style_combobox_popup(self.fur_demo_combo, self.theme_mode)
             style_combobox_popup(self.fur_res_combo, self.theme_mode)
+            self._live_monitor.set_theme_mode(self.theme_mode)
+            self._live_graph.set_theme_mode(self.theme_mode)
+            self.graph.set_theme_mode(self.theme_mode)
+            self._apply_left_rail_theme()
+            self._apply_results_tree_theme()
+            self._apply_output_toggle_theme()
+            self._refresh_left_rail_icons()
         except Exception:
             pass
 
@@ -1626,6 +1802,7 @@ class MainWindow(QWidget):
         self.gpu_btn.setChecked(stress_gpu)
         self.cpu_btn.blockSignals(False)
         self.gpu_btn.blockSignals(False)
+        self._sync_furmark_gpu_controls()
 
     def save_settings(self):
         """Save settings to JSON file."""
@@ -1675,8 +1852,21 @@ class MainWindow(QWidget):
             apply_theme(app, self.theme_mode)
             style_combobox_popup(self.fur_demo_combo, self.theme_mode)
             style_combobox_popup(self.fur_res_combo, self.theme_mode)
+            self._live_monitor.set_theme_mode(self.theme_mode)
+            self._live_graph.set_theme_mode(self.theme_mode)
+            self.graph.set_theme_mode(self.theme_mode)
+            self._apply_left_rail_theme()
+            self._apply_results_tree_theme()
+            self._apply_output_toggle_theme()
+            self._refresh_left_rail_icons()
+            self._sync_furmark_gpu_controls()
 
         self.save_settings()
+
+    def open_help(self) -> None:
+        """Open help/instructions dialog."""
+        dlg = HelpDialog(self, theme_mode=self.theme_mode)
+        dlg.exec()
 
     def closeEvent(self, event):
         """Handle window close event."""
@@ -1687,6 +1877,32 @@ class MainWindow(QWidget):
     def append(self, text: str) -> None:
         """Append text to log."""
         self.log.append(text.rstrip())
+
+    def _refresh_live_widget_theme(self) -> None:
+        try:
+            self._live_monitor.set_theme_mode(self.theme_mode)
+            self._live_graph.set_theme_mode(self.theme_mode)
+            self._live_monitor.repaint()
+            self._live_graph.repaint()
+        except Exception:
+            pass
+
+    def _show_live_output(self, *_args) -> None:
+        try:
+            self._refresh_live_widget_theme()
+            if self._output_stack is not None:
+                self._output_stack.setCurrentIndex(0)
+            QTimer.singleShot(0, self._refresh_live_widget_theme)
+            QTimer.singleShot(0, self._apply_live_split_ratio)
+        except Exception:
+            pass
+
+    def _show_console_output(self, *_args) -> None:
+        try:
+            if self._output_stack is not None:
+                self._output_stack.setCurrentIndex(1)
+        except Exception:
+            pass
 
     # ---------- live monitor hooks ----------
     def _on_run_started(self, settings: dict, columns: list[str]) -> None:
@@ -1706,8 +1922,7 @@ class MainWindow(QWidget):
                 pass
 
             if self._output_stack is not None:
-                self._output_stack.setCurrentIndex(0)
-                QTimer.singleShot(0, self._apply_live_split_ratio)
+                self._show_live_output()
             if self._output_btn_live is not None:
                 self._output_btn_live.setChecked(True)
         except Exception:
@@ -1736,7 +1951,7 @@ class MainWindow(QWidget):
                 pass
 
             if self._output_stack is not None:
-                self._output_stack.setCurrentIndex(1)
+                self._show_console_output()
             if self._output_btn_console is not None:
                 self._output_btn_console.setChecked(True)
         except Exception:

@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.graph_preview.graph_plot_helpers import group_columns_by_unit, get_measurement_type_label
+from ui.widgets.ui_theme import resolve_effective_theme_mode
 
 
 class LegendStatsPopup(QDialog):
@@ -47,6 +48,7 @@ class LegendStatsPopup(QDialog):
         stats_map: dict[str, tuple[float, float, float]] | None = None,
         room_temperature: Optional[float] = None,
         test_settings: Optional[dict] = None,
+        theme_mode: Optional[str] = None,
         on_close: Optional[Callable[[], None]] = None,
     ):
         super().__init__(parent)
@@ -66,6 +68,9 @@ class LegendStatsPopup(QDialog):
         self._test_settings = test_settings if isinstance(test_settings, dict) else None
         self._building = False
         self._post_toggle_timer: Optional[QTimer] = None
+        self._theme_mode = resolve_effective_theme_mode(theme_mode or "device", QApplication.instance())
+        self._theme_is_dark = self._theme_mode == "dark"
+        self._theme = self._build_theme_palette()
 
         root = QVBoxLayout(self)
         root.setSizeConstraint(QLayout.SetDefaultConstraint)
@@ -77,18 +82,15 @@ class LegendStatsPopup(QDialog):
         title_row.setContentsMargins(0, 0, 0, 0)
 
         title_area = QLabel(title)
-        title_area.setStyleSheet("color:#EAEAEA; font-weight:600; font-size:13px;")
+        title_area.setStyleSheet(
+            f"color:{self._theme['text']}; font-weight:600; font-size:13px;"
+        )
 
         close_btn = QToolButton()
         close_btn.setText("✕")
         close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.clicked.connect(self.close)
-        close_btn.setStyleSheet(
-            """
-            QToolButton { color:#9A9A9A; background: transparent; border: none; padding: 4px 6px; }
-            QToolButton:hover { color:#EAEAEA; background: rgba(255,255,255,0.06); border-radius: 6px; }
-            """
-        )
+        close_btn.setStyleSheet(self._close_button_stylesheet())
 
         self._title_full = title
         self._title_label = title_area
@@ -112,52 +114,12 @@ class LegendStatsPopup(QDialog):
         settings_btn.setCheckable(True)
         settings_btn.setChecked(False)
         settings_btn.clicked.connect(self._toggle_settings_panel)
-        settings_btn.setStyleSheet(
-            """
-            QPushButton {
-                background: #2A2A2A;
-                color: #EAEAEA;
-                border: 1px solid #3A3A3A;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background: #333333;
-                border-color: #4A4A4A;
-            }
-            QPushButton:pressed {
-                background: #252525;
-            }
-            QPushButton:checked {
-                background: #1F2B1F;
-                border-color: #2E4A2E;
-            }
-            """
-        )
+        settings_btn.setStyleSheet(self._button_stylesheet(checkable=True))
         
         copy_btn = QPushButton("Copy Table")
         copy_btn.setCursor(Qt.PointingHandCursor)
         copy_btn.clicked.connect(self._copy_table_to_clipboard)
-        copy_btn.setStyleSheet(
-            """
-            QPushButton {
-                background: #2A2A2A;
-                color: #EAEAEA;
-                border: 1px solid #3A3A3A;
-                border-radius: 6px;
-                padding: 6px 14px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background: #333333;
-                border-color: #4A4A4A;
-            }
-            QPushButton:pressed {
-                background: #252525;
-            }
-            """
-        )
+        copy_btn.setStyleSheet(self._button_stylesheet())
         
         copy_btn_row.addStretch(1)
         copy_btn_row.addWidget(settings_btn)
@@ -245,13 +207,17 @@ class LegendStatsPopup(QDialog):
         sp_root.setSpacing(6)
 
         sp_title = QLabel("Test Settings")
-        sp_title.setStyleSheet("color:#9A9A9A; font-weight:600; font-size:11px;")
+        sp_title.setStyleSheet(
+            f"color:{self._theme['secondary_text']}; font-weight:600; font-size:11px;"
+        )
         sp_root.addWidget(sp_title)
 
         self._settings_label = QLabel()
         self._settings_label.setTextFormat(Qt.RichText)
         self._settings_label.setWordWrap(True)
-        self._settings_label.setStyleSheet("color:#EAEAEA; font-size:11px;")
+        self._settings_label.setStyleSheet(
+            f"color:{self._theme['text']}; font-size:11px;"
+        )
         sp_root.addWidget(self._settings_label, 1)
 
         self._render_test_settings()
@@ -277,96 +243,7 @@ class LegendStatsPopup(QDialog):
         self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         # Styling
-        self.setStyleSheet(
-            """
-            QDialog { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 10px; }
-            QLabel { background: transparent; }
-
-            QFrame#SettingsPanel { background: #151515; border: 1px solid #2A2A2A; border-radius: 10px; }
-
-            QTreeWidget { background: transparent; border: none; color: #EAEAEA; outline: none; }
-
-            QTreeWidget::item {
-                padding: 6px 6px;
-                border-radius: 0px;
-                background: transparent;
-            }
-
-            QTreeWidget::item:hover {
-                background: rgba(255,255,255,0.06);
-            }
-
-            QTreeWidget::item:selected,
-            QTreeWidget::item:selected:hover {
-                background: transparent;
-            }
-
-            QHeaderView::section {
-                background: transparent;
-                color: #9A9A9A;
-                font-weight: 600;
-                padding: 6px 10px;
-                border: none;
-            }
-
-            QHeaderView {
-                background: #151515;
-            }
-
-            QHeaderView::viewport {
-                background: #151515;
-                margin: 0px;
-                padding: 0px;
-                border: none;
-            }
-
-            /* ---------- Scrollbar hidden by default ---------- */
-            QTreeWidget QScrollBar:vertical {
-                background: transparent;
-                width: 8px;
-                margin: 0px;
-            }
-
-            QTreeWidget QScrollBar::groove:vertical {
-                background: transparent;
-                border-radius: 4px;
-            }
-
-            QTreeWidget QScrollBar::handle:vertical {
-                background: transparent;
-                border-radius: 4px;
-                min-height: 28px;
-            }
-
-            QTreeWidget QScrollBar::add-line:vertical,
-            QTreeWidget QScrollBar::sub-line:vertical {
-                height: 0px;
-                width: 0px;
-                background: transparent;
-            }
-            QTreeWidget QScrollBar::add-page:vertical,
-            QTreeWidget QScrollBar::sub-page:vertical {
-                background: transparent;
-            }
-
-            /* ---------- Show scrollbar when hovering ---------- */
-            QTreeWidget:hover QScrollBar::groove:vertical {
-                background: rgba(255,255,255,0.06);
-            }
-
-            QTreeWidget:hover QScrollBar::handle:vertical {
-                background: rgba(220,220,220,0.55);
-            }
-
-            QTreeWidget:hover QScrollBar::handle:vertical:hover {
-                background: rgba(220,220,220,0.70);
-            }
-
-            QTreeWidget:hover QScrollBar::handle:vertical:pressed {
-                background: rgba(220,220,220,0.85);
-            }
-            """
-        )
+        self.setStyleSheet(self._dialog_stylesheet())
 
         self._rebuild(active_set or set())
 
@@ -377,6 +254,174 @@ class LegendStatsPopup(QDialog):
         super().showEvent(event)
         # Re-run sizing on show to account for DPI/font rounding.
         QTimer.singleShot(0, self._autosize_to_content)
+
+    def _build_theme_palette(self) -> dict[str, str]:
+        if self._theme_is_dark:
+            return {
+                "text": "#EAEAEA",
+                "secondary_text": "#9A9A9A",
+                "dialog_bg": "#1A1A1A",
+                "dialog_border": "#2A2A2A",
+                "panel_bg": "#151515",
+                "header_bg": "#151515",
+                "hover_bg": "rgba(255,255,255,0.06)",
+                "button_bg": "#2A2A2A",
+                "button_border": "#3A3A3A",
+                "button_hover_bg": "#333333",
+                "button_hover_border": "#4A4A4A",
+                "button_pressed_bg": "#252525",
+                "button_checked_bg": "#1F2B1F",
+                "button_checked_border": "#2E4A2E",
+                "scroll_groove": "rgba(255,255,255,0.06)",
+                "scroll_handle": "rgba(220,220,220,0.55)",
+                "scroll_handle_hover": "rgba(220,220,220,0.70)",
+                "scroll_handle_pressed": "rgba(220,220,220,0.85)",
+                "empty_text": "#9A9A9A",
+            }
+        return {
+            "text": "#111111",
+            "secondary_text": "#5E5E5E",
+            "dialog_bg": "#F7F7F7",
+            "dialog_border": "#D4D4D4",
+            "panel_bg": "#ECECEC",
+            "header_bg": "#ECECEC",
+            "hover_bg": "rgba(0,0,0,0.06)",
+            "button_bg": "#FFFFFF",
+            "button_border": "#CFCFCF",
+            "button_hover_bg": "#F0F0F0",
+            "button_hover_border": "#BDBDBD",
+            "button_pressed_bg": "#E8E8E8",
+            "button_checked_bg": "#DCE9DC",
+            "button_checked_border": "#AFC6AF",
+            "scroll_groove": "rgba(0,0,0,0.08)",
+            "scroll_handle": "rgba(0,0,0,0.28)",
+            "scroll_handle_hover": "rgba(0,0,0,0.38)",
+            "scroll_handle_pressed": "rgba(0,0,0,0.48)",
+            "empty_text": "#6B6B6B",
+        }
+
+    def _close_button_stylesheet(self) -> str:
+        return (
+            "QToolButton { "
+            f"color:{self._theme['secondary_text']}; background: transparent; border: none; padding: 4px 6px;"
+            " }"
+            "QToolButton:hover { "
+            f"color:{self._theme['text']}; background: {self._theme['hover_bg']}; border-radius: 6px;"
+            " }"
+        )
+
+    def _button_stylesheet(self, *, checkable: bool = False) -> str:
+        checked = ""
+        if checkable:
+            checked = (
+                "QPushButton:checked { "
+                f"background: {self._theme['button_checked_bg']}; border-color: {self._theme['button_checked_border']};"
+                " }"
+            )
+        return (
+            "QPushButton { "
+            f"background: {self._theme['button_bg']}; color: {self._theme['text']}; border: 1px solid {self._theme['button_border']};"
+            " border-radius: 6px; padding: 6px 14px; font-size: 12px;"
+            " }"
+            "QPushButton:hover { "
+            f"background: {self._theme['button_hover_bg']}; border-color: {self._theme['button_hover_border']};"
+            " }"
+            "QPushButton:pressed { "
+            f"background: {self._theme['button_pressed_bg']};"
+            " }"
+            f"{checked}"
+        )
+
+    def _dialog_stylesheet(self) -> str:
+        return f"""
+            QDialog {{ background: {self._theme['dialog_bg']}; border: 1px solid {self._theme['dialog_border']}; border-radius: 10px; }}
+            QLabel {{ background: transparent; }}
+
+            QFrame#SettingsPanel {{ background: {self._theme['panel_bg']}; border: 1px solid {self._theme['dialog_border']}; border-radius: 10px; }}
+
+            QTreeWidget {{ background: transparent; border: none; color: {self._theme['text']}; outline: none; }}
+
+            QTreeWidget::item {{
+                padding: 6px 6px;
+                border-radius: 0px;
+                background: transparent;
+            }}
+
+            QTreeWidget::item:hover {{
+                background: {self._theme['hover_bg']};
+            }}
+
+            QTreeWidget::item:selected,
+            QTreeWidget::item:selected:hover {{
+                background: transparent;
+            }}
+
+            QHeaderView::section {{
+                background: transparent;
+                color: {self._theme['secondary_text']};
+                font-weight: 600;
+                padding: 6px 10px;
+                border: none;
+            }}
+
+            QHeaderView {{
+                background: {self._theme['header_bg']};
+            }}
+
+            QHeaderView::viewport {{
+                background: {self._theme['header_bg']};
+                margin: 0px;
+                padding: 0px;
+                border: none;
+            }}
+
+            QTreeWidget QScrollBar:vertical {{
+                background: transparent;
+                width: 8px;
+                margin: 0px;
+            }}
+
+            QTreeWidget QScrollBar::groove:vertical {{
+                background: transparent;
+                border-radius: 4px;
+            }}
+
+            QTreeWidget QScrollBar::handle:vertical {{
+                background: transparent;
+                border-radius: 4px;
+                min-height: 28px;
+            }}
+
+            QTreeWidget QScrollBar::add-line:vertical,
+            QTreeWidget QScrollBar::sub-line:vertical {{
+                height: 0px;
+                width: 0px;
+                background: transparent;
+            }}
+            QTreeWidget QScrollBar::add-page:vertical,
+            QTreeWidget QScrollBar::sub-page:vertical {{
+                background: transparent;
+            }}
+
+            QTreeWidget:hover QScrollBar::groove:vertical {{
+                background: {self._theme['scroll_groove']};
+            }}
+
+            QTreeWidget:hover QScrollBar::handle:vertical {{
+                background: {self._theme['scroll_handle']};
+            }}
+
+            QTreeWidget:hover QScrollBar::handle:vertical:hover {{
+                background: {self._theme['scroll_handle_hover']};
+            }}
+
+            QTreeWidget:hover QScrollBar::handle:vertical:pressed {{
+                background: {self._theme['scroll_handle_pressed']};
+            }}
+        """
+
+    def _empty_settings_html(self, message: str) -> str:
+        return f"<span style='color:{self._theme['empty_text']};'>{message}</span>"
 
     def _toggle_settings_panel(self) -> None:
         try:
@@ -406,14 +451,33 @@ class LegendStatsPopup(QDialog):
                 except Exception:
                     return default
 
+            def gb(key: str) -> bool | None:
+                try:
+                    if key not in s:
+                        return None
+                    value = s.get(key)
+                    if isinstance(value, bool):
+                        return value
+                    text = str(value).strip().lower()
+                    if text in {"1", "true", "yes", "on"}:
+                        return True
+                    if text in {"0", "false", "no", "off"}:
+                        return False
+                except Exception:
+                    pass
+                return None
+
             warm = g("warmup_display") or g("warmup_total_sec")
             logt = g("log_display") or g("log_total_sec")
             stress = g("stress_mode")
             demo = g("furmark_demo")
             res = g("furmark_resolution_display") or g("furmark_resolution")
+            stress_gpu = gb("stress_gpu")
+            if stress_gpu is None:
+                stress_gpu = "gpu" in stress.lower()
 
             if not any([warm, logt, stress, demo, res]):
-                self._settings_label.setText("<span style='color:#9A9A9A;'>No settings recorded for this run.</span>")
+                self._settings_label.setText(self._empty_settings_html("No settings recorded for this run."))
                 return
 
             lines = []
@@ -423,15 +487,15 @@ class LegendStatsPopup(QDialog):
                 lines.append(f"<b>Log time:</b> {logt}")
             if stress:
                 lines.append(f"<b>Stresstest:</b> {stress}")
-            if demo:
+            if stress_gpu and demo:
                 lines.append(f"<b>FurMark demo:</b> {demo}")
-            if res:
+            if stress_gpu and res:
                 lines.append(f"<b>FurMark resolution:</b> {res}")
 
             self._settings_label.setText("<br>".join(lines))
         except Exception:
             try:
-                self._settings_label.setText("<span style='color:#9A9A9A;'>No settings recorded for this run.</span>")
+                self._settings_label.setText(self._empty_settings_html("No settings recorded for this run."))
             except Exception:
                 pass
 

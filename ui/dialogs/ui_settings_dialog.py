@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtWidgets import (
     QDialog,
     QWidget,
@@ -25,6 +25,8 @@ from core.resources import resource_path
 
 from ..widgets.ui_titlebar import TitleBar
 from ..widgets.ui_rounding import apply_rounded_corners
+from ..graph_preview.ui_dim_overlay import DimOverlay
+from ..widgets.ui_theme import resolve_effective_theme_mode
 
 
 class SettingsDialog(QDialog):
@@ -41,6 +43,8 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
 
         self._update_callback = update_callback
+        self._dim_overlay: DimOverlay | None = None
+        self._overlay_filter: QObject | None = None
 
         self.corner_radius = 12
         apply_rounded_corners(self, self.corner_radius)
@@ -183,16 +187,7 @@ class SettingsDialog(QDialog):
         """Resolve a theme value to 'light' or 'dark'.
         If 'device' is provided, inspect the application palette to pick light/dark.
         """
-        t = (t or "dark").strip().lower()
-        if t == "device":
-            try:
-                from PySide6.QtWidgets import QApplication
-                pal = QApplication.instance().palette()
-                bg = pal.color(QPalette.Window)
-                return "dark" if bg.lightness() < 128 else "light"
-            except Exception:
-                return "dark"
-        return "light" if t == "light" else "dark"
+        return resolve_effective_theme_mode(t)
 
     def _apply_mode_combo_theme(self, t: str | None) -> None:
         """Apply the mode combo's popup stylesheet for the resolved theme.
@@ -318,11 +313,93 @@ class SettingsDialog(QDialog):
         except Exception:
             return ""
 
+    def _top_window(self) -> QWidget | None:
+        try:
+            parent = self.parentWidget()
+            if parent is None:
+                return None
+            return parent.window() if hasattr(parent, "window") else parent
+        except Exception:
+            return None
+
+    def _ensure_dim_overlay(self) -> None:
+        top = self._top_window()
+        if top is None:
+            return
+
+        if self._dim_overlay is None or self._dim_overlay.parentWidget() is not top:
+            try:
+                if self._dim_overlay is not None:
+                    self._dim_overlay.deleteLater()
+            except Exception:
+                pass
+            self._dim_overlay = DimOverlay(top, on_click=self.reject)
+
+        try:
+            self._dim_overlay.setGeometry(top.rect())
+        except Exception:
+            pass
+
+        if self._overlay_filter is None:
+            class _Filter(QObject):
+                def __init__(self, dlg: "SettingsDialog"):
+                    super().__init__(dlg)
+                    self._dlg = dlg
+
+                def eventFilter(self, obj, event):
+                    try:
+                        if event.type() in (QEvent.Resize, QEvent.Show):
+                            self._dlg._ensure_dim_overlay()
+                    except Exception:
+                        pass
+                    return False
+
+            self._overlay_filter = _Filter(self)
+            try:
+                top.installEventFilter(self._overlay_filter)
+            except Exception:
+                pass
+
+    def _set_dimmed(self, on: bool) -> None:
+        try:
+            if on:
+                self._ensure_dim_overlay()
+                if self._dim_overlay is not None:
+                    self._dim_overlay.show()
+                    self._dim_overlay.raise_()
+            else:
+                if self._dim_overlay is not None:
+                    self._dim_overlay.hide()
+        except Exception:
+            pass
+
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._set_dimmed(True)
         p = self.parentWidget()
         if p:
             pg = p.geometry()
             sg = self.geometry()
             self.move(pg.center().x() - sg.width() // 2, pg.center().y() - sg.height() // 2)
+
+    def closeEvent(self, event) -> None:
+        try:
+            self._set_dimmed(False)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def accept(self) -> None:
+        try:
+            self._set_dimmed(False)
+        except Exception:
+            pass
+        return super().accept()
+
+    def reject(self) -> None:
+        try:
+            self._set_dimmed(False)
+        except Exception:
+            pass
+        return super().reject()

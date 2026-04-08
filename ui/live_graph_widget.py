@@ -6,8 +6,8 @@ from collections import deque
 from datetime import datetime
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QFrame, QVBoxLayout, QSizePolicy
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtWidgets import QApplication, QFrame, QVBoxLayout, QSizePolicy
 
 from matplotlib.figure import Figure
 import matplotlib.patheffects as pe
@@ -15,10 +15,12 @@ import matplotlib.patheffects as pe
 from ui.interactive_canvas import InteractiveCanvas
 from ui.graph_preview.graph_plot_helpers import (
     apply_dark_axes_style,
+    apply_light_axes_style,
     build_tab20_color_map,
     group_columns_by_unit,
     get_measurement_type_label,
 )
+from ui.widgets.ui_theme import resolve_effective_theme_mode
 
 
 class LiveGraphWidget(QFrame):
@@ -35,6 +37,11 @@ class LiveGraphWidget(QFrame):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+
+        self._theme_is_dark = True
+        self._theme_colors: dict[str, str] = {}
+        self._theme_mode: str = "dark"
+        self._applying_theme = False
 
         self._columns: list[str] = []
         self._active: set[str] = set()
@@ -55,6 +62,11 @@ class LiveGraphWidget(QFrame):
         try:
             self._canvas.setAttribute(Qt.WA_TranslucentBackground, False)
             self._canvas.setStyleSheet("background: transparent;")
+        except Exception:
+            pass
+
+        try:
+            self._canvas.shown_or_resized.connect(self._redraw_after_show)
         except Exception:
             pass
 
@@ -87,16 +99,7 @@ class LiveGraphWidget(QFrame):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.setObjectName("LiveGraph")
-        self.setStyleSheet(
-            """
-            QFrame#LiveGraph { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 10px; }
-            """
-        )
-
-        try:
-            self._fig.set_facecolor("#121212")
-        except Exception:
-            pass
+        self._apply_theme()
 
     def start(self, *, columns: list[str]) -> None:
         self._columns = [str(c) for c in (columns or []) if str(c).strip()]
@@ -231,7 +234,7 @@ class LiveGraphWidget(QFrame):
             self._axes.append(ax)
             self._unit_axes[unit] = ax
 
-            apply_dark_axes_style(self._fig, ax, grid_color="#2A2A2A", dot_dashes=(1, 2))
+            self._apply_axis_theme(ax)
 
             try:
                 ax.margins(x=0.0)
@@ -240,8 +243,8 @@ class LiveGraphWidget(QFrame):
                 pass
 
             try:
-                ax.tick_params(axis="x", colors="#BDBDBD")
-                ax.tick_params(axis="y", colors="#BDBDBD")
+                ax.tick_params(axis="x", colors=self._theme_colors.get("tick", "#BDBDBD"))
+                ax.tick_params(axis="y", colors=self._theme_colors.get("tick", "#BDBDBD"))
             except Exception:
                 pass
 
@@ -252,19 +255,19 @@ class LiveGraphWidget(QFrame):
                     pass
             else:
                 try:
-                    ax.set_xlabel("Time (s)", color="#EAEAEA")
+                    ax.set_xlabel("Time (s)", color=self._theme_colors.get("label", "#EAEAEA"))
                 except Exception:
                     pass
 
             try:
                 if unit and unit != "other":
-                    ax.set_ylabel(f"[{unit}]", fontsize=9, color="white")
+                    ax.set_ylabel(f"[{unit}]", fontsize=9, color=self._theme_colors.get("label", "#EAEAEA"))
             except Exception:
                 pass
 
             for col in self._unit_cols.get(unit, []):
                 try:
-                    colc = self._color_map.get(col, "#FFFFFF")
+                    colc = self._color_map.get(col, self._theme_colors.get("label", "#FFFFFF"))
                     (ln,) = ax.plot(
                         [],
                         [],
@@ -505,7 +508,7 @@ class LiveGraphWidget(QFrame):
                 except Exception:
                     pass
             try:
-                vis_axes[-1].set_xlabel("Time (s)", color="#EAEAEA")
+                vis_axes[-1].set_xlabel("Time (s)", color=self._theme_colors.get("label", "#EAEAEA"))
             except Exception:
                 pass
         except Exception:
@@ -609,7 +612,7 @@ class LiveGraphWidget(QFrame):
                         x,
                         linewidth=1.6,
                         linestyle=(0, (3, 3)),
-                        color="#BDBDBD",
+                        color=self._theme_colors.get("phase", "#BDBDBD"),
                         alpha=0.55,
                         zorder=50,
                     )
@@ -620,7 +623,7 @@ class LiveGraphWidget(QFrame):
                         transform=ax.transAxes,
                         ha="center", va="top",
                         fontsize=9,
-                        color="#BDBDBD",
+                        color=self._theme_colors.get("phase", "#BDBDBD"),
                         alpha=0.85,
                         zorder=60,
                     )
@@ -629,7 +632,7 @@ class LiveGraphWidget(QFrame):
                         transform=ax.transAxes,
                         ha="center", va="top",
                         fontsize=9,
-                        color="#BDBDBD",
+                        color=self._theme_colors.get("phase", "#BDBDBD"),
                         alpha=0.85,
                         zorder=60,
                     )
@@ -698,5 +701,172 @@ class LiveGraphWidget(QFrame):
             self._relayout_visible_axes()
             self._update_phase_labels()
             self._canvas.draw_idle()
+        except Exception:
+            pass
+
+    def showEvent(self, event) -> None:
+        try:
+            super().showEvent(event)
+        except Exception:
+            pass
+
+        self._redraw_after_show()
+
+    def changeEvent(self, event) -> None:
+        try:
+            super().changeEvent(event)
+        except Exception:
+            pass
+
+        try:
+            if self._applying_theme:
+                return
+            if self._theme_mode == "device" and event.type() in (QEvent.PaletteChange, QEvent.ApplicationPaletteChange):
+                self._apply_theme()
+        except Exception:
+            pass
+
+    def set_theme_mode(self, mode: str) -> None:
+        try:
+            self._theme_mode = str(mode or "dark").strip().lower() or "dark"
+            self._apply_theme()
+        except Exception:
+            pass
+
+    def _apply_theme(self) -> None:
+        if self._applying_theme:
+            return
+        self._applying_theme = True
+        try:
+            mode = str(getattr(self, "_theme_mode", "dark") or "dark").strip().lower()
+            resolved_mode = resolve_effective_theme_mode(mode, QApplication.instance())
+            self._theme_is_dark = (resolved_mode != "light")
+
+            if self._theme_is_dark:
+                self._theme_colors = {
+                    "panel_bg": "#1A1A1A",
+                    "panel_border": "#2A2A2A",
+                    "figure_bg": "#121212",
+                    "grid": "#2A2A2A",
+                    "tick": "#BDBDBD",
+                    "label": "#EAEAEA",
+                    "phase": "#BDBDBD",
+                }
+            else:
+                self._theme_colors = {
+                    "panel_bg": "#FFFFFF",
+                    "panel_border": "#D0D0D0",
+                    "figure_bg": "#FFFFFF",
+                    "grid": "#DADADA",
+                    "tick": "#666666",
+                    "label": "#1A1A1A",
+                    "phase": "#7A7A7A",
+                }
+
+            colors = self._theme_colors
+            self.setStyleSheet(
+                f"""
+                QFrame#LiveGraph {{ background: {colors['panel_bg']}; border: 1px solid {colors['panel_border']}; border-radius: 10px; }}
+                """
+            )
+
+            try:
+                self.style().unpolish(self)
+                self.style().polish(self)
+                self._canvas.update()
+                self.update()
+            except Exception:
+                pass
+
+            try:
+                self._fig.set_facecolor(colors["figure_bg"])
+            except Exception:
+                pass
+
+            self._apply_theme_to_existing_axes()
+        finally:
+            self._applying_theme = False
+
+    def _apply_axis_theme(self, ax: object) -> None:
+        try:
+            if self._theme_is_dark:
+                apply_dark_axes_style(self._fig, ax, grid_color=self._theme_colors.get("grid", "#2A2A2A"), dot_dashes=(1, 2))
+            else:
+                apply_light_axes_style(self._fig, ax, grid_color=self._theme_colors.get("grid", "#DADADA"), dot_dashes=(1, 2))
+        except Exception:
+            pass
+
+    def _apply_theme_to_existing_axes(self) -> None:
+        try:
+            for ax in self._axes:
+                self._apply_axis_theme(ax)
+                try:
+                    ax.tick_params(axis="x", colors=self._theme_colors.get("tick", "#BDBDBD"))
+                    ax.tick_params(axis="y", colors=self._theme_colors.get("tick", "#BDBDBD"))
+                    ax.xaxis.label.set_color(self._theme_colors.get("label", "#EAEAEA"))
+                    ax.yaxis.label.set_color(self._theme_colors.get("label", "#EAEAEA"))
+                except Exception:
+                    pass
+
+            for phase_line in self._phase_lines:
+                try:
+                    phase_line.set_color(self._theme_colors.get("phase", "#BDBDBD"))
+                except Exception:
+                    pass
+
+            for warm_txt, log_txt in self._phase_texts:
+                try:
+                    warm_txt.set_color(self._theme_colors.get("phase", "#BDBDBD"))
+                    log_txt.set_color(self._theme_colors.get("phase", "#BDBDBD"))
+                except Exception:
+                    pass
+
+            if self._axes:
+                self._relayout_visible_axes()
+                self._update_phase_labels()
+                self._canvas.draw_idle()
+            else:
+                try:
+                    self._fig.clear()
+                except Exception:
+                    pass
+                try:
+                    self._fig.set_facecolor(self._theme_colors.get("figure_bg", "#121212"))
+                except Exception:
+                    pass
+                try:
+                    self._canvas.draw_idle()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _redraw_after_show(self) -> None:
+        try:
+            self._apply_theme()
+
+            if not self._axes:
+                try:
+                    self._fig.clear()
+                except Exception:
+                    pass
+                try:
+                    self._fig.set_facecolor(self._theme_colors.get("figure_bg", "#121212"))
+                except Exception:
+                    pass
+
+            try:
+                self._canvas.draw()
+            except Exception:
+                try:
+                    self._canvas.draw_idle()
+                except Exception:
+                    pass
+
+            try:
+                self._canvas.update()
+                self.update()
+            except Exception:
+                pass
         except Exception:
             pass

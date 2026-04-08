@@ -1956,6 +1956,8 @@ class BenchmarkController:
                 "warmup_display": self._fmt_hhmmss(int(warm)),
                 "log_total_sec": int(logsec),
                 "log_display": self._fmt_hhmmss(int(logsec)),
+                "stress_cpu": bool(stress_cpu),
+                "stress_gpu": bool(stress_gpu),
                 "stress_mode": str(stress_mode),
                 "furmark_demo": str(demo_disp),
                 "furmark_resolution": f"{int(fur_w)}x{int(fur_h)}",

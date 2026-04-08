@@ -173,6 +173,7 @@ class SensorManager:
             selected_tokens=list(self.selected_tokens),
             group_map=group_map,
             has_spd=has_spd,
+            theme_mode=str(getattr(self.parent, "theme_mode", "device")),
         )
         dlg.exec()
 
@@ -199,6 +200,7 @@ class SensorManager:
             has_spd=has_spd,
             group_map=group_map,
             preselected=pre,
+            theme_mode=str(getattr(self.parent, "theme_mode", "device")),
         )
         if dlg.exec() == QDialog.Accepted:
             self.selected_tokens = dlg.selected_tokens()
