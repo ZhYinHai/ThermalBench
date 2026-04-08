@@ -444,8 +444,8 @@ class LegendStatsPopup(QDialog):
         super().closeEvent(event)
 
     # ---------- Copy table to clipboard ----------
-    def _copy_table_to_clipboard(self) -> None:
-        """Copy the table data to clipboard in HTML table format for pasting into Word."""
+    def build_table_clipboard_payload(self) -> tuple[str, str] | None:
+        """Build the plain-text and HTML payload used for Word-compatible table copy."""
         try:
             # Build header row
             if self._room_temperature is not None:
@@ -541,9 +541,20 @@ class LegendStatsPopup(QDialog):
             
             html_parts.extend(['</tbody></table>', '</body>', '</html>'])
             
-            # Prepare clipboard with both plain text and HTML
             table_text = "\n".join(text_lines)
             table_html = "".join(html_parts)
+            return table_text, table_html
+        except Exception:
+            return None
+
+    def _copy_table_to_clipboard(self) -> None:
+        """Copy the table data to clipboard in HTML table format for pasting into Word."""
+        try:
+            payload = self.build_table_clipboard_payload()
+            if not payload:
+                return
+
+            table_text, table_html = payload
             
             mime_data = QMimeData()
             mime_data.setText(table_text)
@@ -559,8 +570,7 @@ class LegendStatsPopup(QDialog):
                     original_text = btn.text()
                     btn.setText("✓ Copied!")
                     QTimer.singleShot(1500, lambda: btn.setText(original_text))
-        except Exception as e:
-            # Fail silently or could show an error
+        except Exception:
             pass
 
     # ---------- helpers ----------

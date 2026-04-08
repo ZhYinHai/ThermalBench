@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import mimetypes
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -27,6 +29,7 @@ class NtfyNotifier(QObject):
         topic: str,
         title: str,
         message: str,
+        markdown: bool = False,
         timeout_sec: float = 6.0,
         retries: int = 2,
     ) -> None:
@@ -43,6 +46,8 @@ class NtfyNotifier(QObject):
             "Title": str(title or "ThermalBench: test finished").strip(),
             "Content-Type": "text/plain; charset=utf-8",
         }
+        if markdown:
+            headers["Markdown"] = "yes"
         payload = (str(message or "").strip() + "\n").encode("utf-8")
 
         def _worker() -> None:
@@ -51,6 +56,85 @@ class NtfyNotifier(QObject):
             for attempt in range(int(retries) + 1):
                 try:
                     resp = requests.post(url, data=payload, headers=headers, timeout=float(timeout_sec))
+                    if 200 <= int(resp.status_code) < 300:
+                        try:
+                            self.finished.emit(True, "Push notification sent")
+                        except Exception:
+                            pass
+                        return
+
+                    txt = ""
+                    try:
+                        txt = str(resp.text or "").strip()
+                    except Exception:
+                        txt = ""
+                    if txt and len(txt) > 200:
+                        txt = txt[:200] + "…"
+                    last_err = f"HTTP {resp.status_code}" + (f": {txt}" if txt else "")
+                except Exception as e:
+                    last_err = str(e)
+
+                if attempt < int(retries):
+                    try:
+                        time.sleep(backoff)
+                    except Exception:
+                        pass
+                    backoff = min(6.0, backoff * 2.0)
+
+            try:
+                self.finished.emit(False, f"Push notification failed: {last_err}".strip())
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def send_file(
+        self,
+        *,
+        topic: str,
+        title: str,
+        file_path: str,
+        filename: str | None = None,
+        timeout_sec: float = 10.0,
+        retries: int = 2,
+    ) -> None:
+        url = self._normalize_topic(topic)
+        path = Path(str(file_path or "").strip())
+        if not url:
+            try:
+                self.finished.emit(False, "Push notification not configured (ntfy topic missing)")
+            except Exception:
+                pass
+            return
+        if not path.exists() or not path.is_file():
+            try:
+                self.finished.emit(False, f"Push notification attachment missing: {path}")
+            except Exception:
+                pass
+            return
+
+        try:
+            payload = path.read_bytes()
+        except Exception as e:
+            try:
+                self.finished.emit(False, f"Push notification attachment read failed: {e}")
+            except Exception:
+                pass
+            return
+
+        mime_type, _ = mimetypes.guess_type(str(path))
+        headers = {
+            "Title": str(title or "ThermalBench: attachment").strip(),
+            "Filename": str(filename or path.name).strip(),
+            "Content-Type": str(mime_type or "application/octet-stream"),
+        }
+
+        def _worker() -> None:
+            last_err = ""
+            backoff = 1.0
+            for attempt in range(int(retries) + 1):
+                try:
+                    resp = requests.put(url, data=payload, headers=headers, timeout=float(timeout_sec))
                     if 200 <= int(resp.status_code) < 300:
                         try:
                             self.finished.emit(True, "Push notification sent")

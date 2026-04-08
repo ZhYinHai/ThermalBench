@@ -1,3 +1,5 @@
+import json
+
 # ui/main_window.py
 import os
 import sys
@@ -49,6 +51,9 @@ from .live_graph_widget import LiveGraphWidget
 from .runs_proxy_model import RunsProxyModel
 
 from core.settings_store import get_settings_path, load_json, save_json
+from ui.graph_preview.graph_plot_helpers import load_run_csv_dataframe
+from ui.graph_preview.graph_stats_helpers import infer_stats_title, stats_from_dataframe, stats_from_summary_csv
+from ui.graph_preview.ui_legend_stats_popup import LegendStatsPopup
 
 from ui.ntfy_notifier import NtfyNotifier
 
@@ -1776,10 +1781,116 @@ class MainWindow(QWidget):
         if run_dir:
             body += f"Run folder: {run_dir}\n"
 
+        table_attachment = self._export_ntfy_word_table_html(run_dir)
+        if table_attachment is not None:
+            body += f"Word table file saved: {table_attachment.name}\n"
+
         try:
             self._ntfy_notifier.send(topic=topic, title=subject, message=body)
         except Exception:
             pass
+
+        if table_attachment is not None:
+            try:
+                self._ntfy_notifier.send_file(
+                    topic=topic,
+                    title=f"ThermalBench: {case_name or 'Test'} Word table",
+                    file_path=str(table_attachment),
+                    filename=str(table_attachment.name),
+                )
+            except Exception:
+                pass
+
+    def _export_ntfy_word_table_html(self, run_dir: str) -> Path | None:
+        try:
+            folder = Path(str(run_dir or "").strip())
+            if not folder.exists() or not folder.is_dir():
+                return None
+
+            payload = self._build_word_table_payload(run_dir)
+            if not payload:
+                return None
+
+            out_path = folder / "word_table.html"
+            out_path.write_text(str(payload[1] or ""), encoding="utf-8")
+            return out_path
+        except Exception:
+            return None
+
+    def _build_word_table_payload(self, run_dir: str) -> tuple[str, str] | None:
+        try:
+            folder = Path(str(run_dir or "").strip())
+            if not folder.exists() or not folder.is_dir():
+                return None
+
+            csv_path = folder / "run_window.csv"
+            if not csv_path.exists() or not csv_path.is_file():
+                return None
+
+            df_data, cols = load_run_csv_dataframe(str(csv_path))
+            stats_map = stats_from_summary_csv(str(csv_path))
+            if not stats_map:
+                stats_map = stats_from_dataframe(df_data[cols])
+            if not stats_map:
+                return None
+
+            room_temperature = None
+            try:
+                ambient_col = None
+                if "Ambient [°C]" in df_data.columns:
+                    ambient_col = "Ambient [°C]"
+                else:
+                    for col in df_data.columns:
+                        if "ambient" in str(col).lower():
+                            ambient_col = str(col)
+                            break
+                if ambient_col and ambient_col in df_data.columns:
+                    ser = df_data[ambient_col]
+                    room_temperature = float(ser.mean(skipna=True))
+            except Exception:
+                room_temperature = None
+
+            if room_temperature is None:
+                try:
+                    avg_temp_path = folder / "avg_temperature.json"
+                    if avg_temp_path.exists() and avg_temp_path.is_file():
+                        payload = json.loads(avg_temp_path.read_text(encoding="utf-8"))
+                        if isinstance(payload, dict) and payload.get("manual_average_temperature") is not None:
+                            room_temperature = float(payload.get("manual_average_temperature"))
+                except Exception:
+                    room_temperature = None
+
+            test_settings = None
+            try:
+                settings_path = folder / "test_settings.json"
+                if settings_path.exists() and settings_path.is_file():
+                    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+                    if isinstance(payload, dict):
+                        test_settings = payload
+            except Exception:
+                test_settings = None
+
+            popup = LegendStatsPopup(
+                self,
+                title=infer_stats_title(list(cols or [])),
+                columns=list(cols or []),
+                active_set=set(cols or []),
+                color_for=lambda _name: "#EAEAEA",
+                on_toggle=lambda _name, _checked, _active_cols=None: None,
+                stats_map=stats_map,
+                room_temperature=room_temperature,
+                test_settings=test_settings,
+                on_close=None,
+            )
+            try:
+                return popup.build_table_clipboard_payload()
+            finally:
+                try:
+                    popup.deleteLater()
+                except Exception:
+                    pass
+        except Exception:
+            return None
 
     def _on_ntfy_notify_finished(self, ok: bool, message: str) -> None:
         try:
