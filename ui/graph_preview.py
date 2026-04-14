@@ -57,6 +57,7 @@ class GraphPreview(QObject):
         # Simple cache to avoid expensive redraw when switching tabs repeatedly
         self._last_csv_path: Optional[str] = None
         self._last_csv_mtime: Optional[float] = None
+        self._current_preview_path: Optional[str] = None
 
         # Initialize matplotlib canvas
         try:
@@ -438,10 +439,68 @@ class GraphPreview(QObject):
     def get_canvas(self):
         return self._preview_canvas
 
+    def release_preview(self) -> None:
+        """Drop preview UI state and cached references so selected files can be deleted on Windows."""
+        try:
+            self._close_sensor_popup()
+        except Exception:
+            pass
+
+        try:
+            self._tt_anim_timer.stop()
+        except Exception:
+            pass
+
+        self._last_csv_path = None
+        self._last_csv_mtime = None
+        self._current_preview_path = None
+        self._preview_x = None
+        self._preview_df = None
+        self._preview_all_cols = []
+        self._preview_lines = {}
+        self._preview_series_data = {}
+        self._preview_series_visible = {}
+        self._preview_colors = []
+        self._preview_last_idx = None
+        self._preview_bg = None
+        self._preview_ax_bbox = None
+
+        try:
+            if self._preview_collective_box is not None:
+                self._preview_collective_box.set_visible(False)
+        except Exception:
+            pass
+
+        try:
+            if self._preview_vline is not None:
+                self._preview_vline.set_visible(False)
+        except Exception:
+            pass
+
+        try:
+            if self._preview_ax is not None:
+                self._preview_ax.clear()
+        except Exception:
+            pass
+
+        try:
+            self._preview_label.clear()
+            self._preview_label.show()
+        except Exception:
+            pass
+
+        try:
+            if self._preview_canvas is not None:
+                self._preview_canvas.hide()
+                self._preview_canvas.draw_idle()
+        except Exception:
+            pass
+
     def preview_path(self, fpath: str) -> None:
         """Preview a file (CSV or image)."""
         try:
             p = Path(fpath)
+            self._current_preview_path = str(p)
 
             if p.is_file() and p.suffix.lower() == ".csv" and self._preview_canvas is not None:
                 # cache to reduce tab-switch delay
@@ -497,6 +556,7 @@ class GraphPreview(QObject):
                 self._preview_canvas.hide()
         except Exception:
             pass
+        self._current_preview_path = None
         self._preview_label.clear()
         self._preview_label.show()
 
@@ -505,6 +565,7 @@ class GraphPreview(QObject):
         try:
             p = Path(folder)
             if not p.exists() or not p.is_dir():
+                self._current_preview_path = None
                 try:
                     if self._preview_canvas is not None:
                         self._preview_canvas.hide()
@@ -528,8 +589,10 @@ class GraphPreview(QObject):
                     self._preview_canvas.hide()
             except Exception:
                 pass
+            self._current_preview_path = None
             self._preview_label.clear()
         except Exception:
+            self._current_preview_path = None
             self._preview_label.clear()
 
     # -------------------------------------------------------------------------

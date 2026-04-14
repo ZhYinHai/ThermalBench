@@ -29,6 +29,7 @@ class RunsProxyModel(QSortFilterProxyModel):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._folder_name_filter = ""
 
         # Display prefix for compare result folders in the tree.
         # Subtle but clearly distinct from normal run folders.
@@ -40,6 +41,100 @@ class RunsProxyModel(QSortFilterProxyModel):
         self._active_compare_dir_norm: str | None = None
         self._compare_highlight_run_dirs_norm: dict[str, QColor] = {}
         self._active_compare_segment_colors: list[QColor] = []
+        self._preview_current_dir_norm: str | None = None
+        self._compare_selected_run_dirs_norm: set[str] = set()
+
+        try:
+            self.setDynamicSortFilter(True)
+        except Exception:
+            pass
+
+    def set_folder_name_filter(self, text: str | None) -> None:
+        try:
+            new_value = str(text or "").strip().casefold()
+        except Exception:
+            new_value = ""
+
+        if new_value == self._folder_name_filter:
+            return
+
+        self._folder_name_filter = new_value
+        try:
+            self.invalidateFilter()
+        except Exception:
+            self.invalidate()
+
+    def folder_name_filter(self) -> str:
+        try:
+            return str(self._folder_name_filter or "")
+        except Exception:
+            return ""
+
+    def _source_name_matches_folder_filter(self, source_index: QModelIndex) -> bool:
+        filter_text = self.folder_name_filter()
+        if not filter_text:
+            return True
+
+        try:
+            if not source_index.isValid():
+                return False
+
+            sm = self.sourceModel()
+            if sm is None:
+                return False
+
+            name = str(sm.fileName(source_index) or "").casefold()
+            return filter_text in name
+        except Exception:
+            return True
+
+    def _has_matching_descendant(self, source_index: QModelIndex) -> bool:
+        filter_text = self.folder_name_filter()
+        if not filter_text:
+            return True
+
+        try:
+            if not source_index.isValid():
+                return False
+
+            sm = self.sourceModel()
+            if sm is None:
+                return False
+
+            try:
+                is_dir = bool(sm.isDir(source_index))
+            except Exception:
+                is_dir = False
+            if not is_dir:
+                return False
+
+            child_count = int(sm.rowCount(source_index) or 0)
+            for child_row in range(child_count):
+                child_index = sm.index(child_row, 0, source_index)
+                if self._source_name_matches_folder_filter(child_index):
+                    return True
+                if self._has_matching_descendant(child_index):
+                    return True
+        except Exception:
+            return True
+
+        return False
+
+    def _has_matching_ancestor(self, source_index: QModelIndex) -> bool:
+        filter_text = self.folder_name_filter()
+        if not filter_text:
+            return True
+
+        try:
+            parent_index = source_index.parent()
+            while parent_index.isValid():
+                if self._source_name_matches_folder_filter(parent_index):
+                    return True
+                parent_index = parent_index.parent()
+        except Exception:
+            return True
+
+        return False
 
     @staticmethod
     def _norm_path(p: str) -> str:
@@ -155,6 +250,50 @@ class RunsProxyModel(QSortFilterProxyModel):
     def get_compare_case_color_map(self) -> dict[str, QColor]:
         """Backward-compat shim for older delegate logic."""
         return {}
+
+    def set_preview_current_dir(self, path: str | None) -> None:
+        try:
+            new_value = self._norm_path(path) if str(path or "").strip() else None
+            if new_value == self._preview_current_dir_norm:
+                return
+            self._preview_current_dir_norm = new_value
+        except Exception:
+            self._preview_current_dir_norm = None
+
+        try:
+            self.layoutChanged.emit()
+        except Exception:
+            pass
+
+    def is_preview_current_dir_path(self, path: str) -> bool:
+        try:
+            return bool(self._preview_current_dir_norm and self._norm_path(path) == self._preview_current_dir_norm)
+        except Exception:
+            return False
+
+    def set_compare_selected_dirs(self, paths: list[str] | set[str] | tuple[str, ...] | None) -> None:
+        try:
+            new_set = {
+                self._norm_path(p)
+                for p in (paths or [])
+                if str(p or "").strip()
+            }
+            if new_set == self._compare_selected_run_dirs_norm:
+                return
+            self._compare_selected_run_dirs_norm = set(new_set)
+        except Exception:
+            self._compare_selected_run_dirs_norm = set()
+
+        try:
+            self.layoutChanged.emit()
+        except Exception:
+            pass
+
+    def is_compare_selected_dir_path(self, path: str) -> bool:
+        try:
+            return self._norm_path(path) in (self._compare_selected_run_dirs_norm or set())
+        except Exception:
+            return False
 
     def _is_run_folder_source_index(self, source_index: QModelIndex) -> bool:
         try:
@@ -307,6 +446,20 @@ class RunsProxyModel(QSortFilterProxyModel):
                 return False
         except Exception:
             pass
+
+        try:
+            sm = self.sourceModel()
+            if sm is not None:
+                source_index = sm.index(source_row, 0, source_parent)
+                if source_index.isValid() and not (
+                    self._source_name_matches_folder_filter(source_index)
+                    or self._has_matching_ancestor(source_index)
+                    or self._has_matching_descendant(source_index)
+                ):
+                    return False
+        except Exception:
+            pass
+
         return True
 
     def hasChildren(self, parent: QModelIndex) -> bool:

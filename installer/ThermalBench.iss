@@ -9,7 +9,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.16"
+  #define MyAppVersion "0.0.20"
 #endif
 
 #ifndef InstallerPrefix

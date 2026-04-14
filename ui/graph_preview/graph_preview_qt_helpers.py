@@ -118,6 +118,14 @@ def on_app_state_changed(gp: Any, state) -> None:
 
 def handle_preview_canvas_event_filter(gp: Any, obj, event) -> None:
     try:
+        if obj is getattr(gp, "_preview_scroll_viewport", None):
+            et = event.type()
+
+            if et in (QEvent.Resize, QEvent.Show):
+                gp._sync_preview_canvas_scroll_height()
+                QTimer.singleShot(0, gp._preview_relayout_and_redraw)
+            return
+
         if obj is getattr(gp, "_preview_canvas", None):
             et = event.type()
 

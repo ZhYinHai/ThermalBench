@@ -1,4 +1,8 @@
 import json
+import ctypes
+import re
+from datetime import datetime
+from ctypes import wintypes
 
 # ui/main_window.py
 import os
@@ -23,12 +27,14 @@ from PySide6.QtWidgets import (
     QTreeView,
     QFileSystemModel,
     QSplitter,
+    QScrollArea,
     QToolButton,
     QStackedWidget,
     QFrame,
     QMessageBox,
     QProgressDialog,
     QMenu,
+    QListWidget,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QStyle,
@@ -77,6 +83,29 @@ GITHUB_OWNER = "ZhYinHai"
 GITHUB_REPO = "ThermalBench"
 INSTALLER_PREFIX = "ThermalBench-Setup-v"
 
+_RESULT_RUN_FOLDER_RE = re.compile(
+    r"^(?:\d{8}_\d{6}|(?:CPU|GPU|CPUGPU)_W\d+_L\d+_V\d+)$",
+    re.IGNORECASE,
+)
+
+
+class _WinMsg(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("message", wintypes.UINT),
+        ("wParam", wintypes.WPARAM),
+        ("lParam", wintypes.LPARAM),
+        ("time", wintypes.DWORD),
+        ("pt", wintypes.POINT),
+        ("lPrivate", wintypes.DWORD),
+    ]
+
+
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33
+_DWMWCP_DEFAULT = 0
+_DWMWCP_DONOTROUND = 1
+_DWMWCP_ROUND = 2
+
 
 class _FetchLatestReleaseWorker(QObject):
     finished = Signal(object)  # ReleaseInfo
@@ -124,12 +153,71 @@ class _CompareNameDelegate(QStyledItemDelegate):
     Activates only while RunsProxyModel reports an active compare directory.
     """
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._run_meta_cache: dict[str, tuple[float, str]] = {}
+
     @staticmethod
     def _norm_path(p: str) -> str:
         try:
             return os.path.normcase(os.path.abspath(str(p)))
         except Exception:
             return str(p or "")
+
+    def _run_meta_text(self, path: str) -> str:
+        try:
+            run_dir = Path(str(path or ""))
+            if not run_dir.is_dir():
+                return ""
+
+            settings_path = run_dir / "test_settings.json"
+
+            sig = 0.0
+            try:
+                sig = float(run_dir.stat().st_mtime or 0.0)
+            except Exception:
+                sig = 0.0
+            try:
+                if settings_path.is_file():
+                    sig = max(sig, float(settings_path.stat().st_mtime or 0.0))
+            except Exception:
+                pass
+
+            cache_key = self._norm_path(str(run_dir))
+            cached = self._run_meta_cache.get(cache_key)
+            if cached is not None and cached[0] == sig:
+                return str(cached[1] or "")
+
+            dt = None
+            if settings_path.is_file():
+                try:
+                    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+                except Exception:
+                    payload = {}
+                recorded_at = str(payload.get("recorded_at") or "").strip()
+                if recorded_at:
+                    try:
+                        dt = datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+                    except Exception:
+                        dt = None
+
+            if dt is None:
+                try:
+                    dt = datetime.strptime(run_dir.name, "%Y%m%d_%H%M%S")
+                except Exception:
+                    dt = None
+
+            if dt is None:
+                try:
+                    dt = datetime.fromtimestamp(float(run_dir.stat().st_mtime or 0.0))
+                except Exception:
+                    dt = None
+
+            text = dt.strftime("%Y-%m-%d %H:%M") if dt is not None else ""
+            self._run_meta_cache[cache_key] = (sig, text)
+            return text
+        except Exception:
+            return ""
 
     def paint(self, painter: QPainter, option, index):
         try:
@@ -161,6 +249,20 @@ class _CompareNameDelegate(QStyledItemDelegate):
             if not path:
                 return super().paint(painter, option, index)
 
+            is_compare_result_dir = False
+            try:
+                is_compare_fn = getattr(model, "is_compare_result_dir_path", None)
+                if is_dir and callable(is_compare_fn):
+                    is_compare_result_dir = bool(is_compare_fn(path))
+            except Exception:
+                is_compare_result_dir = False
+
+            is_regular_run_dir = bool(
+                is_dir
+                and (not is_compare_result_dir)
+                and _RESULT_RUN_FOLDER_RE.match(Path(path).name or "")
+            )
+
             is_compare_case_dir = False
             try:
                 is_compare_case_fn = getattr(model, "is_compare_case_dir_path", None)
@@ -168,6 +270,22 @@ class _CompareNameDelegate(QStyledItemDelegate):
                     is_compare_case_dir = bool(is_compare_case_fn(path))
             except Exception:
                 is_compare_case_dir = False
+
+            is_preview_current = False
+            try:
+                is_preview_fn = getattr(model, "is_preview_current_dir_path", None)
+                if callable(is_preview_fn):
+                    is_preview_current = bool(is_preview_fn(path))
+            except Exception:
+                is_preview_current = False
+
+            is_compare_selected = False
+            try:
+                is_compare_sel_fn = getattr(model, "is_compare_selected_dir_path", None)
+                if callable(is_compare_sel_fn):
+                    is_compare_selected = bool(is_compare_sel_fn(path))
+            except Exception:
+                is_compare_selected = False
 
             # Compare marker prefix (drawn by delegate so it can be colored).
             compare_prefix = "↔ "
@@ -177,6 +295,28 @@ class _CompareNameDelegate(QStyledItemDelegate):
                     compare_prefix = str(get_pref() or compare_prefix)
             except Exception:
                 pass
+
+            def _selected_row_text_color(opt: QStyleOptionViewItem, *, secondary: bool = False) -> QColor:
+                try:
+                    if not (opt.state & QStyle.State_Selected):
+                        base = QColor(opt.palette.color(QPalette.Text))
+                        if secondary:
+                            base.setAlpha(150)
+                        return base
+
+                    base_text = QColor(opt.palette.color(QPalette.Text))
+                    if base_text.isValid() and base_text.lightness() < 80:
+                        return QColor("#000000")
+
+                    c = QColor(opt.palette.color(QPalette.HighlightedText))
+                    if secondary:
+                        c.setAlpha(235)
+                    return c
+                except Exception:
+                    c = QColor(option.palette.text().color())
+                    if secondary:
+                        c.setAlpha(150)
+                    return c
 
             def _symbol_pen_color(opt: QStyleOptionViewItem) -> QColor:
                 try:
@@ -197,11 +337,7 @@ class _CompareNameDelegate(QStyledItemDelegate):
                         except Exception:
                             pass
 
-                    base = (
-                        opt.palette.color(QPalette.HighlightedText)
-                        if (opt.state & QStyle.State_Selected)
-                        else opt.palette.color(QPalette.Text)
-                    )
+                    base = _selected_row_text_color(opt, secondary=True)
                     c = QColor(base)
                     # Nudge toward higher contrast without introducing new theme colors.
                     if c.lightness() < 128:
@@ -212,6 +348,64 @@ class _CompareNameDelegate(QStyledItemDelegate):
                 except Exception:
                     return QColor(opt.palette.text().color())
 
+            def _meta_pen_color(opt: QStyleOptionViewItem) -> QColor:
+                try:
+                    if opt.state & QStyle.State_Selected:
+                        return _selected_row_text_color(opt, secondary=True)
+                    try:
+                        c = QColor(opt.palette.color(QPalette.PlaceholderText))
+                        if c.isValid():
+                            return c
+                    except Exception:
+                        pass
+                    c = QColor(opt.palette.color(QPalette.Text))
+                    c.setAlpha(150)
+                    return c
+                except Exception:
+                    c = QColor(option.palette.text().color())
+                    c.setAlpha(150)
+                    return c
+
+            def _paint_text_with_meta(txt: str, meta: str) -> None:
+                if not txt:
+                    super().paint(painter, option, index)
+                    return
+
+                opt = QStyleOptionViewItem(option)
+                self.initStyleOption(opt, index)
+                opt.text = ""
+                if is_compare_selected:
+                    opt.state &= ~QStyle.State_Selected
+                style = opt.widget.style() if opt.widget is not None else QApplication.style()
+                style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+                _paint_row_state_overlay(opt)
+
+                text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, opt.widget)
+                fm = opt.fontMetrics
+                baseline = text_rect.y() + (text_rect.height() + fm.ascent() - fm.descent()) // 2
+
+                painter.save()
+                painter.setClipRect(option.rect)
+
+                gap = fm.horizontalAdvance("   ") if meta else 0
+                meta_w = fm.horizontalAdvance(meta) if meta else 0
+                avail = max(0, int(text_rect.width() - meta_w - gap))
+                txt_elided = fm.elidedText(txt, Qt.ElideRight, avail)
+
+                x = text_rect.x()
+                txt_pen = _selected_row_text_color(opt)
+                painter.setPen(QColor(txt_pen))
+                painter.drawText(x, baseline, txt_elided)
+                x += fm.horizontalAdvance(txt_elided)
+
+                if meta:
+                    x += gap
+                    painter.setPen(_meta_pen_color(opt))
+                    painter.drawText(x, baseline, meta)
+
+                painter.restore()
+                return
+
             def _paint_compare_prefix_and_text(txt: str) -> None:
                 if not txt:
                     super().paint(painter, option, index)
@@ -220,8 +414,11 @@ class _CompareNameDelegate(QStyledItemDelegate):
                 opt = QStyleOptionViewItem(option)
                 self.initStyleOption(opt, index)
                 opt.text = ""
+                if is_compare_selected:
+                    opt.state &= ~QStyle.State_Selected
                 style = opt.widget.style() if opt.widget is not None else QApplication.style()
                 style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+                _paint_row_state_overlay(opt)
 
                 text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, opt.widget)
                 fm = opt.fontMetrics
@@ -242,18 +439,50 @@ class _CompareNameDelegate(QStyledItemDelegate):
                     painter.drawText(x, baseline, pref)
                     x += pref_w
 
-                txt_pen = (
-                    opt.palette.color(QPalette.HighlightedText)
-                    if (opt.state & QStyle.State_Selected)
-                    else opt.palette.color(QPalette.Text)
-                )
+                txt_pen = _selected_row_text_color(opt)
                 painter.setPen(QColor(txt_pen))
                 painter.drawText(x, baseline, txt_elided)
 
                 painter.restore()
                 return
 
+            def _paint_row_state_overlay(opt: QStyleOptionViewItem) -> None:
+                try:
+                    if not is_compare_selected:
+                        return
+
+                    base_text = QColor(opt.palette.color(QPalette.Text))
+                    light_mode = bool(base_text.isValid() and base_text.lightness() < 80)
+
+                    if light_mode:
+                        fill = QColor("#CDEECC")
+                    else:
+                        fill = QColor("#1F4D2E")
+
+                    fill_rect = option.rect.adjusted(0, 0, 0, -1)
+                    try:
+                        if opt.widget is not None and hasattr(opt.widget, "viewport"):
+                            vp = opt.widget.viewport()
+                            if vp is not None:
+                                fill_rect = option.rect.adjusted(-option.rect.x(), 0, int(vp.width() - option.rect.right() - 1), -1)
+                    except Exception:
+                        fill_rect = option.rect.adjusted(0, 0, 0, -1)
+
+                    painter.save()
+                    painter.setClipRect(fill_rect)
+                    painter.fillRect(fill_rect, fill)
+                    painter.restore()
+                except Exception:
+                    pass
+
             active_norm = get_active()
+
+            if is_regular_run_dir:
+                txt = str(index.data(Qt.DisplayRole) or "")
+                meta = self._run_meta_text(path)
+                if meta:
+                    _paint_text_with_meta(txt, meta)
+                    return
 
             # If this is a compare-result directory but NOT the active compare selection,
             # draw the compare marker symbol in a subtle color and keep the folder name normal.
@@ -283,8 +512,11 @@ class _CompareNameDelegate(QStyledItemDelegate):
             opt = QStyleOptionViewItem(option)
             self.initStyleOption(opt, index)
             opt.text = ""
+            if is_compare_selected:
+                opt.state &= ~QStyle.State_Selected
             style = opt.widget.style() if opt.widget is not None else QApplication.style()
             style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+            _paint_row_state_overlay(opt)
 
             # Paint colored segments inside the text rect.
             text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, opt.widget)
@@ -314,7 +546,7 @@ class _CompareNameDelegate(QStyledItemDelegate):
 
                 if i != (len(parts) - 1):
                     sep = " vs "
-                    painter.setPen(opt.palette.text().color())
+                    painter.setPen(_selected_row_text_color(opt))
                     painter.drawText(x, baseline, sep)
                     x += fm.horizontalAdvance(sep)
 
@@ -325,6 +557,17 @@ class _CompareNameDelegate(QStyledItemDelegate):
 
 
 class MainWindow(QWidget):
+    _WM_NCHITTEST = 0x0084
+    _HTCLIENT = 1
+    _HTLEFT = 10
+    _HTRIGHT = 11
+    _HTTOP = 12
+    _HTTOPLEFT = 13
+    _HTTOPRIGHT = 14
+    _HTBOTTOM = 15
+    _HTBOTTOMLEFT = 16
+    _HTBOTTOMRIGHT = 17
+
     def _update_compare_manifests_for_case_rename(self, *, old_case: str, new_case: str) -> None:
         """Rewrite compare manifests so compare results survive case-folder renames.
 
@@ -530,9 +773,17 @@ class MainWindow(QWidget):
         # Default startup size
         DEFAULT_W, DEFAULT_H = 1366, 768
         self.resize(DEFAULT_W, DEFAULT_H)
+        self.setMinimumHeight(DEFAULT_H)
 
         # Enable custom titlebar by making window frameless
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self._resize_border_px = 8
+        self._rounded_corners_applied = False
+        self._restoring_window_state = False
+        self._window_settings_timer = QTimer(self)
+        self._window_settings_timer.setSingleShot(True)
+        self._window_settings_timer.timeout.connect(self.save_settings)
+        QTimer.singleShot(0, self._apply_window_corner_preference)
 
         # Keep the real window title in sync (taskbar/alt-tab) with the custom titlebar text
         self.setWindowTitle(f"ThermalBench v{__version__}")
@@ -554,6 +805,24 @@ class MainWindow(QWidget):
 
         # Inputs
         self.case_edit = QLineEdit("TEST")
+        self._case_name_popup = QListWidget(self)
+        self._case_name_popup.hide()
+        self._case_name_popup.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._case_name_popup.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._case_name_popup.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._case_name_popup.setFocusPolicy(Qt.NoFocus)
+        self._case_name_popup.itemClicked.connect(self._on_case_name_popup_item_clicked)
+        self.case_edit.installEventFilter(self)
+        self._case_name_popup.installEventFilter(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+            try:
+                app.focusChanged.connect(self._on_app_focus_changed)
+            except Exception:
+                pass
+        self._apply_case_name_completer_theme()
+        self._refresh_case_name_suggestions()
 
         self.warmup_min = make_time_spin(2, 24 * 60, 20)
         self.warmup_sec = make_time_spin(2, 59, 0)
@@ -736,6 +1005,16 @@ class MainWindow(QWidget):
         except Exception:
             self._runs_tree_compare_delegate = None
 
+        self._runs_tree_search = QLineEdit()
+        self._runs_tree_search.setPlaceholderText("Search folders")
+        self._runs_tree_search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._runs_tree_search_expanded_paths: set[str] | None = None
+        try:
+            self._runs_tree_search.setClearButtonEnabled(True)
+        except Exception:
+            pass
+        self._runs_tree_search.textChanged.connect(self._on_runs_tree_search_changed)
+
         for c in range(1, 4):
             try:
                 self._runs_tree.hideColumn(c)
@@ -890,12 +1169,31 @@ class MainWindow(QWidget):
         top_row = QHBoxLayout()
         top_row.addWidget(self._bold_label("Name"))
         top_row.addStretch(1)
-        top_row.addWidget(self.live_timer)
         root.addLayout(top_row)
         root.addWidget(self.case_edit)
 
+        row = QHBoxLayout()
+        row.addWidget(self._bold_label("HWiNFO CSV (continuous)"))
+        row.addWidget(self.hwinfo_edit, 1)
+        row.addWidget(self.pick_hwinfo_btn)
+        row.addSpacing(8)
+        row.addWidget(self.csv_dot)
+        row.addSpacing(6)
+        row.addWidget(self.sm2_dot)
+        root.addLayout(row)
+
         time_row = QHBoxLayout()
         time_row.setSpacing(18)
+
+        stress_col = QVBoxLayout()
+        stress_col.setSpacing(4)
+        stress_col.addWidget(self._bold_label("Stress test"))
+        stress_toggle_row = QHBoxLayout()
+        stress_toggle_row.setSpacing(10)
+        stress_toggle_row.addWidget(self.cpu_btn)
+        stress_toggle_row.addWidget(self.gpu_btn)
+        stress_toggle_row.addStretch(1)
+        stress_col.addLayout(stress_toggle_row)
 
         warm_col = QVBoxLayout()
         warm_col.setSpacing(4)
@@ -921,27 +1219,10 @@ class MainWindow(QWidget):
         log_row.addStretch(1)
         log_col.addLayout(log_row)
 
+        time_row.addLayout(stress_col)
         time_row.addLayout(warm_col)
         time_row.addLayout(log_col)
         root.addLayout(time_row)
-
-        row = QHBoxLayout()
-        row.addWidget(self._bold_label("HWiNFO CSV (continuous)"))
-        row.addWidget(self.hwinfo_edit, 1)
-        row.addWidget(self.pick_hwinfo_btn)
-        row.addSpacing(8)
-        row.addWidget(self.csv_dot)
-        row.addSpacing(6)
-        row.addWidget(self.sm2_dot)
-        root.addLayout(row)
-
-        stress_row = QHBoxLayout()
-        stress_row.setSpacing(10)
-        stress_row.addWidget(self._bold_label("Stress test"))
-        stress_row.addWidget(self.cpu_btn)
-        stress_row.addWidget(self.gpu_btn)
-        stress_row.addStretch(1)
-        root.addLayout(stress_row)
 
         fur_row = QHBoxLayout()
         fur_row.setSpacing(18)
@@ -995,6 +1276,7 @@ class MainWindow(QWidget):
 
         out_hdr.addWidget(self._output_btn_live)
         out_hdr.addWidget(self._output_btn_console)
+        out_hdr.addWidget(self.live_timer)
         root.addLayout(out_hdr)
 
         # Live panel: left = table, right = live graph
@@ -1081,6 +1363,11 @@ class MainWindow(QWidget):
         tree_panel_layout = QVBoxLayout(tree_panel)
         tree_panel_layout.setContentsMargins(0, 0, 0, 0)
         tree_panel_layout.setSpacing(0)
+        tree_search_row = QHBoxLayout()
+        tree_search_row.setContentsMargins(5, 6, 5, 4)
+        tree_search_row.setSpacing(0)
+        tree_search_row.addWidget(self._runs_tree_search)
+        tree_panel_layout.addLayout(tree_search_row)
         tree_panel_layout.addWidget(self._runs_tree, 1)
 
         tree_footer = QVBoxLayout()
@@ -1092,14 +1379,98 @@ class MainWindow(QWidget):
 
         splitter.addWidget(tree_panel)
 
-        preview_widget = QWidget()
-        preview_layout = QVBoxLayout(preview_widget)
-        preview_layout.setContentsMargins(0, 6, 0, 6)
-        preview_layout.setSpacing(6)
+        preview_widget = QScrollArea()
+        preview_widget.setWidgetResizable(True)
+        preview_widget.setFrameShape(QFrame.NoFrame)
+        preview_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        preview_widget.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._preview_widget = preview_widget
+
+        preview_content = QWidget()
+        self._preview_content_widget = preview_content
+        preview_layout = QVBoxLayout(preview_content)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(0)
         preview_layout.addWidget(self._preview_label)
         preview_layout.addWidget(self.graph.get_canvas())
+        preview_widget.setWidget(preview_content)
+        try:
+            self.graph.set_preview_scroll_area(preview_widget)
+        except Exception:
+            pass
 
-        splitter.addWidget(preview_widget)
+        preview_footer_canvas = self.graph.get_timeline_canvas()
+        self._preview_timeline_canvas = preview_footer_canvas
+        preview_footer_canvas.hide()
+
+        preview_header = QWidget()
+        self._preview_header = preview_header
+        preview_header.hide()
+        preview_header_layout = QHBoxLayout(preview_header)
+        preview_header_layout.setContentsMargins(10, 8, 10, 8)
+        preview_header_layout.setSpacing(8)
+
+        preview_header_meta = QWidget()
+        self._preview_header_meta = preview_header_meta
+        preview_header_meta.setMinimumWidth(0)
+        preview_header_meta.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        preview_header_meta_layout = QVBoxLayout(preview_header_meta)
+        preview_header_meta_layout.setContentsMargins(0, 0, 0, 0)
+        preview_header_meta_layout.setSpacing(1)
+        self._preview_header_title = QLabel("")
+        self._preview_header_subtitle = QLabel("")
+        self._preview_header_title.setMinimumWidth(0)
+        self._preview_header_subtitle.setMinimumWidth(0)
+        self._preview_header_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._preview_header_subtitle.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._preview_header_title.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._preview_header_subtitle.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        preview_header_meta_layout.addWidget(self._preview_header_title)
+        preview_header_meta_layout.addWidget(self._preview_header_subtitle)
+        preview_header_layout.addWidget(preview_header_meta, 1)
+
+        self._preview_zero_btn = QPushButton("AutoY")
+        self._preview_delta_btn = QPushButton("T")
+        self._preview_legend_btn = QPushButton("≡ Legend & stats")
+        for btn in (self._preview_zero_btn, self._preview_delta_btn, self._preview_legend_btn):
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFocusPolicy(Qt.NoFocus)
+        preview_header_layout.addWidget(self._preview_zero_btn)
+        preview_header_layout.addWidget(self._preview_delta_btn)
+        preview_header_layout.addWidget(self._preview_legend_btn)
+
+        preview_header_separator = QFrame()
+        self._preview_header_separator = preview_header_separator
+        preview_header_separator.setFrameShape(QFrame.HLine)
+        preview_header_separator.setFrameShadow(QFrame.Plain)
+        preview_header_separator.setFixedHeight(1)
+        preview_header_separator.hide()
+
+        try:
+            self.graph.set_preview_header_controls(
+                header_widget=preview_header,
+                separator=preview_header_separator,
+                title_label=self._preview_header_title,
+                subtitle_label=self._preview_header_subtitle,
+                zero_btn=self._preview_zero_btn,
+                delta_btn=self._preview_delta_btn,
+                legend_btn=self._preview_legend_btn,
+            )
+        except Exception:
+            pass
+
+        preview_panel = QWidget()
+        self._preview_panel = preview_panel
+        preview_panel_layout = QVBoxLayout(preview_panel)
+        preview_panel_layout.setContentsMargins(0, 0, 0, 0)
+        preview_panel_layout.setSpacing(0)
+        preview_panel_layout.addWidget(preview_header, 0)
+        preview_panel_layout.addWidget(preview_header_separator, 0)
+        preview_panel_layout.addWidget(preview_widget, 1)
+        preview_panel_layout.addWidget(preview_footer_canvas, 0)
+
+        splitter.addWidget(preview_panel)
+        self._apply_results_preview_theme()
 
         try:
             splitter.setStretchFactor(0, 0)
@@ -1145,6 +1516,7 @@ class MainWindow(QWidget):
 
         # Connect settings change handlers
         self.case_edit.textChanged.connect(self.save_settings)
+        self.case_edit.textEdited.connect(self._on_case_name_text_edited)
         self.hwinfo_edit.textChanged.connect(self.save_settings)
         self.warmup_min.valueChanged.connect(lambda *_: self.save_settings())
         self.warmup_sec.valueChanged.connect(lambda *_: self.save_settings())
@@ -1313,12 +1685,41 @@ class MainWindow(QWidget):
             effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
             if effective_mode == "light":
                 tree_text = "#000000"
-                selection_bg = "#D9E9FF"
+                selection_text = "#0F172A"
+                selection_bg = "#BFD8FF"
                 hover_bg = "#ECECEC"
+                placeholder_text = "#5B6472"
+                search_bg = "#FFFFFF"
+                search_border = "#B8C0CC"
+                search_focus = "#2F6FEB"
             else:
                 tree_text = "#B0B0B0"
+                selection_text = tree_text
                 selection_bg = "#2A2A2A"
                 hover_bg = "#242424"
+                placeholder_text = "#7F7F7F"
+                search_bg = "#171717"
+                search_border = "rgba(128, 128, 128, 0.45)"
+                search_focus = "#5B9BFF"
+
+            try:
+                pal = self._runs_tree.palette()
+                text_color = QColor(tree_text)
+                selected_text_color = QColor(selection_text)
+                selected_bg_color = QColor(selection_bg)
+                placeholder_color = QColor(placeholder_text)
+
+                for group in (QPalette.Active, QPalette.Inactive):
+                    pal.setColor(group, QPalette.Text, text_color)
+                    pal.setColor(group, QPalette.WindowText, text_color)
+                    pal.setColor(group, QPalette.Highlight, selected_bg_color)
+                    pal.setColor(group, QPalette.HighlightedText, selected_text_color)
+                    pal.setColor(group, QPalette.PlaceholderText, placeholder_color)
+
+                self._runs_tree.setPalette(pal)
+                self._runs_tree.viewport().setPalette(pal)
+            except Exception:
+                pass
 
             self._runs_tree.setStyleSheet(
                 f"""
@@ -1330,9 +1731,17 @@ class MainWindow(QWidget):
                 }}
                 QTreeView::item:selected {{
                     background-color: {selection_bg};
-                    color: {tree_text};
+                    color: {selection_text};
                     outline: none;
                     border: none;
+                }}
+                QTreeView::item:selected:active {{
+                    background-color: {selection_bg};
+                    color: {selection_text};
+                }}
+                QTreeView::item:selected:!active {{
+                    background-color: {selection_bg};
+                    color: {selection_text};
                 }}
                 QTreeView::item:hover {{
                     background-color: {hover_bg};
@@ -1345,10 +1754,356 @@ class MainWindow(QWidget):
             )
 
             try:
+                self._runs_tree_search.setStyleSheet(
+                    f"""
+                    QLineEdit {{
+                        background-color: {search_bg};
+                        color: {tree_text};
+                        border: 1px solid {search_border};
+                        border-radius: 8px;
+                        padding: 2px 8px;
+                    }}
+                    QLineEdit:focus {{
+                        border: 1px solid {search_focus};
+                    }}
+                    """
+                )
+            except Exception:
+                pass
+
+            try:
                 self._runs_tree.viewport().update()
                 self._runs_tree.update()
             except Exception:
                 pass
+
+            try:
+                self._apply_results_preview_theme()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _apply_results_preview_theme(self) -> None:
+        try:
+            preview_widget = getattr(self, "_preview_widget", None)
+            preview_content = getattr(self, "_preview_content_widget", None)
+            preview_panel = getattr(self, "_preview_panel", None)
+            if preview_widget is None:
+                return
+
+            effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+            if effective_mode == "light":
+                bg = "#FFFFFF"
+            else:
+                bg = "#121212"
+
+            preview_widget.setStyleSheet(
+                f"QScrollArea {{ background: {bg}; border: none; margin: 0px; padding: 0px; }}"
+            )
+            if preview_content is not None:
+                preview_content.setStyleSheet(
+                    f"QWidget {{ background: {bg}; border: none; margin: 0px; padding: 0px; }}"
+                )
+            if preview_panel is not None:
+                preview_panel.setStyleSheet(
+                    f"QWidget {{ background: {bg}; border: none; margin: 0px; padding: 0px; }}"
+                )
+        except Exception:
+            pass
+
+    def _on_runs_tree_search_changed(self, text: str) -> None:
+        try:
+            search_text = str(text or "").strip()
+            if search_text and self._runs_tree_search_expanded_paths is None:
+                self._runs_tree_search_expanded_paths = self._capture_runs_tree_expanded_paths()
+
+            proxy = getattr(self, "_runs_proxy", None)
+            if proxy is not None and hasattr(proxy, "set_folder_name_filter"):
+                proxy.set_folder_name_filter(text)
+                try:
+                    root_index = self._runs_model.index(str(self._runs_root))
+                    self._runs_tree.setRootIndex(proxy.mapFromSource(root_index))
+                except Exception:
+                    pass
+            elif getattr(self, "_runs_model", None) is not None:
+                # Fallback: keep the search box inert rather than breaking the tree
+                return
+
+            saved_paths = self._runs_tree_search_expanded_paths
+            if saved_paths is not None:
+                self._apply_runs_tree_expanded_paths(saved_paths)
+
+            if not search_text:
+                self._runs_tree_search_expanded_paths = None
+        except Exception:
+            pass
+
+    def _normalize_runs_tree_path(self, path: str) -> str:
+        try:
+            return os.path.normcase(os.path.abspath(str(path or "")))
+        except Exception:
+            return str(path or "")
+
+    def _capture_runs_tree_expanded_paths(self) -> set[str]:
+        expanded_paths: set[str] = set()
+        try:
+            model = self._runs_tree.model()
+            if model is None:
+                return expanded_paths
+
+            root_index = self._runs_tree.rootIndex()
+
+            def _walk(parent_index) -> None:
+                try:
+                    row_count = int(model.rowCount(parent_index) or 0)
+                except Exception:
+                    row_count = 0
+
+                for row in range(row_count):
+                    try:
+                        child_index = model.index(row, 0, parent_index)
+                    except Exception:
+                        continue
+                    if child_index is None or not child_index.isValid():
+                        continue
+
+                    try:
+                        is_expanded = bool(self._runs_tree.isExpanded(child_index))
+                    except Exception:
+                        is_expanded = False
+
+                    if not is_expanded:
+                        continue
+
+                    path = self._runs_tree_index_to_path(child_index)
+                    if path:
+                        expanded_paths.add(self._normalize_runs_tree_path(path))
+                    _walk(child_index)
+
+            _walk(root_index)
+        except Exception:
+            return expanded_paths
+        return expanded_paths
+
+    def _apply_runs_tree_expanded_paths(self, paths: set[str] | None) -> None:
+        try:
+            model = self._runs_tree.model()
+            if model is None:
+                return
+
+            normalized_paths = {
+                self._normalize_runs_tree_path(path)
+                for path in (paths or set())
+                if str(path or "").strip()
+            }
+            root_index = self._runs_tree.rootIndex()
+
+            def _walk(parent_index) -> None:
+                try:
+                    row_count = int(model.rowCount(parent_index) or 0)
+                except Exception:
+                    row_count = 0
+
+                for row in range(row_count):
+                    try:
+                        child_index = model.index(row, 0, parent_index)
+                    except Exception:
+                        continue
+                    if child_index is None or not child_index.isValid():
+                        continue
+
+                    path = self._normalize_runs_tree_path(self._runs_tree_index_to_path(child_index))
+                    if path in normalized_paths:
+                        try:
+                            self._runs_tree.expand(child_index)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            self._runs_tree.collapse(child_index)
+                        except Exception:
+                            pass
+                    _walk(child_index)
+
+            _walk(root_index)
+        except Exception:
+            pass
+
+    def _existing_case_folder_names(self) -> list[str]:
+        try:
+            runs_root = Path(getattr(self, "_runs_root", "") or "")
+            if not runs_root.exists() or not runs_root.is_dir():
+                return []
+
+            names: list[str] = []
+            for entry in os.scandir(str(runs_root)):
+                if not entry.is_dir():
+                    continue
+
+                is_compare_case = False
+                try:
+                    for child in os.scandir(entry.path):
+                        if not child.is_dir():
+                            continue
+                        if (Path(child.path) / "compare_manifest.json").is_file():
+                            is_compare_case = True
+                            break
+                except Exception:
+                    is_compare_case = False
+
+                if is_compare_case:
+                    continue
+
+                name = str(entry.name or "").strip()
+                if name:
+                    names.append(name)
+            return sorted(set(names), key=str.casefold)
+        except Exception:
+            return []
+
+    def _refresh_case_name_suggestions(self) -> None:
+        try:
+            names = self._existing_case_folder_names()
+            text = str(self.case_edit.text() or "").strip().casefold()
+            if text:
+                names = [name for name in names if text in name.casefold()]
+
+            self._case_name_popup.blockSignals(True)
+            self._case_name_popup.clear()
+            self._case_name_popup.addItems(names)
+            self._case_name_popup.clearSelection()
+            self._case_name_popup.setCurrentRow(-1)
+            self._case_name_popup.blockSignals(False)
+        except Exception:
+            pass
+
+    def _apply_case_name_completer_theme(self) -> None:
+        try:
+            popup = self._case_name_popup
+            effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+            if effective_mode == "light":
+                bg = "#FFFFFF"
+                fg = "#000000"
+                border = "rgba(0, 0, 0, 0.18)"
+                hover = "#ECECEC"
+                selected = "#D9E9FF"
+            else:
+                bg = "#1E1E1E"
+                fg = "#E6E6E6"
+                border = "rgba(255, 255, 255, 0.16)"
+                hover = "#242424"
+                selected = "#2A2A2A"
+
+            popup.setStyleSheet(
+                f"""
+                QListWidget {{
+                    background: {bg};
+                    color: {fg};
+                    border: 1px solid {border};
+                    outline: none;
+                }}
+                QListWidget::item {{
+                    padding: 3px 10px;
+                }}
+                QListWidget::item:hover {{
+                    background: {hover};
+                }}
+                QListWidget::item:selected {{
+                    background: {selected};
+                    color: {fg};
+                }}
+                """
+            )
+        except Exception:
+            pass
+
+    def _on_case_name_text_edited(self, _text: str) -> None:
+        try:
+            self._show_case_name_suggestions()
+        except Exception:
+            pass
+
+    def _show_case_name_suggestions(self, *, force: bool = False) -> None:
+        try:
+            self._refresh_case_name_suggestions()
+            names = self._case_name_popup.count()
+            if not names:
+                self._case_name_popup.hide()
+                return
+
+            anchor = self.mapFromGlobal(self.case_edit.mapToGlobal(self.case_edit.rect().bottomLeft()))
+            row_height = self._case_name_popup.sizeHintForRow(0)
+            if row_height <= 0:
+                row_height = max(20, self.case_edit.height() - 4)
+            visible_rows = min(10, self._case_name_popup.count())
+            frame = self._case_name_popup.frameWidth() * 2
+            popup_height = (row_height * visible_rows) + frame + 2
+            self._case_name_popup.setGeometry(anchor.x(), anchor.y() + 1, self.case_edit.width(), popup_height)
+            self._case_name_popup.raise_()
+            self._case_name_popup.show()
+        except Exception:
+            pass
+
+    def _dismiss_case_name_suggestions(self, *, clear_focus: bool = True, require_edit_to_reopen: bool = False) -> None:
+        try:
+            self._case_name_popup.hide()
+            if clear_focus and self.case_edit.hasFocus():
+                self.case_edit.clearFocus()
+        except Exception:
+            pass
+
+    def _on_case_name_popup_item_clicked(self, item) -> None:
+        try:
+            if item is None:
+                return
+            text = str(item.text() or "")
+            self.case_edit.setText(text)
+            self.case_edit.setCursorPosition(len(text))
+            self.case_edit.setFocus()
+            self._dismiss_case_name_suggestions(clear_focus=False, require_edit_to_reopen=False)
+        except Exception:
+            pass
+
+    def _is_case_name_popup_target(self, obj) -> bool:
+        try:
+            popup = self._case_name_popup
+            if obj in (self.case_edit, popup, popup.viewport()):
+                return True
+
+            if isinstance(obj, QWidget):
+                if self.case_edit.isAncestorOf(obj) or popup.isAncestorOf(obj):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _case_name_click_target(self, obj, event):
+        try:
+            if event is not None:
+                gp = None
+                if hasattr(event, "globalPosition"):
+                    try:
+                        gp = event.globalPosition().toPoint()
+                    except Exception:
+                        gp = None
+                if gp is None and hasattr(event, "globalPos"):
+                    try:
+                        gp = event.globalPos()
+                    except Exception:
+                        gp = None
+                if gp is not None:
+                    hit = QApplication.widgetAt(gp)
+                    if hit is not None:
+                        return hit
+        except Exception:
+            pass
+        return obj
+
+    def _on_app_focus_changed(self, _old, now) -> None:
+        try:
+            if self._case_name_popup.isVisible() and not self._is_case_name_popup_target(now):
+                QTimer.singleShot(0, self._dismiss_case_name_suggestions)
         except Exception:
             pass
 
@@ -1747,6 +2502,8 @@ class MainWindow(QWidget):
         if not data:
             return
 
+        self._apply_saved_window_state(data)
+
         self.case_edit.setText(str(data.get("case_name", self.case_edit.text())))
         self.hwinfo_edit.setText(str(data.get("hwinfo_csv", self.hwinfo_edit.text())))
 
@@ -1765,6 +2522,8 @@ class MainWindow(QWidget):
         try:
             style_combobox_popup(self.fur_demo_combo, self.theme_mode)
             style_combobox_popup(self.fur_res_combo, self.theme_mode)
+            self._apply_case_name_completer_theme()
+            self._refresh_case_name_suggestions()
             self._live_monitor.set_theme_mode(self.theme_mode)
             self._live_graph.set_theme_mode(self.theme_mode)
             self.graph.set_theme_mode(self.theme_mode)
@@ -1804,6 +2563,51 @@ class MainWindow(QWidget):
         self.gpu_btn.blockSignals(False)
         self._sync_furmark_gpu_controls()
 
+    def _apply_saved_window_state(self, data: dict) -> None:
+        try:
+            width = int(data.get("window_width", 0) or 0)
+            height = int(data.get("window_height", 0) or 0)
+            was_maximized = bool(data.get("window_maximized", False))
+        except Exception:
+            return
+
+        if width <= 0 or height <= 0:
+            if was_maximized:
+                try:
+                    QTimer.singleShot(0, self.showMaximized)
+                except Exception:
+                    pass
+            return
+
+        try:
+            self._restoring_window_state = True
+            self.resize(max(960, width), max(768, height))
+        except Exception:
+            pass
+        finally:
+            self._restoring_window_state = False
+
+        if was_maximized:
+            try:
+                QTimer.singleShot(0, self.showMaximized)
+            except Exception:
+                pass
+
+    def _current_window_settings(self) -> dict:
+        try:
+            geom = self.normalGeometry() if self.isMaximized() else self.geometry()
+            width = int(geom.width())
+            height = int(geom.height())
+        except Exception:
+            width = int(self.width())
+            height = int(self.height())
+
+        return {
+            "window_width": max(1, width),
+            "window_height": max(1, height),
+            "window_maximized": bool(self.isMaximized()),
+        }
+
     def save_settings(self):
         """Save settings to JSON file."""
         payload = {
@@ -1823,6 +2627,7 @@ class MainWindow(QWidget):
             "ntfy_topic": self.ntfy_topic,
             "theme": self.theme_mode,
         }
+        payload.update(self._current_window_settings())
         save_json(self.settings_path, payload)
         self._update_run_button_state()
 
@@ -1852,6 +2657,8 @@ class MainWindow(QWidget):
             apply_theme(app, self.theme_mode)
             style_combobox_popup(self.fur_demo_combo, self.theme_mode)
             style_combobox_popup(self.fur_res_combo, self.theme_mode)
+            self._apply_case_name_completer_theme()
+            self._refresh_case_name_suggestions()
             self._live_monitor.set_theme_mode(self.theme_mode)
             self._live_graph.set_theme_mode(self.theme_mode)
             self.graph.set_theme_mode(self.theme_mode)
@@ -2195,6 +3002,15 @@ class MainWindow(QWidget):
         (auto-expand/select/preview).
         """
         try:
+            if event is not None and event.type() == QEvent.MouseButtonPress:
+                click_target = self._case_name_click_target(obj, event)
+                if self._case_name_popup.isVisible() and not self._is_case_name_popup_target(click_target):
+                    self._dismiss_case_name_suggestions()
+
+            if obj is getattr(self, "case_edit", None):
+                if event is not None and event.type() in (QEvent.FocusIn, QEvent.MouseButtonPress):
+                    QTimer.singleShot(0, lambda: self._show_case_name_suggestions(force=True))
+
             if getattr(self, "_runs_tree", None) is not None and obj is self._runs_tree.viewport():
                 if event is not None and event.type() == QEvent.MouseButtonPress:
                     try:
@@ -2264,23 +3080,47 @@ class MainWindow(QWidget):
             is_case = self._is_case_folder(target)
 
             menu = QMenu(self)
-            # Add a visible hover effect for menu items (dark theme friendly).
+            try:
+                effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+            except Exception:
+                effective_mode = "dark"
+
+            # Match the context menu to the active app theme so remove actions do not
+            # fall back to a dark popup while the rest of the UI is light.
             try:
                 menu.setStyleSheet(
-                    """
-                    QMenu {
-                        background-color: #1E1E1E;
-                        border: 1px solid rgba(128, 128, 128, 0.3);
-                        padding: 4px;
-                    }
-                    QMenu::item {
-                        padding: 6px 22px;
-                        color: #EAEAEA;
-                    }
-                    QMenu::item:selected {
-                        background-color: rgba(255,255,255,0.06);
-                    }
-                    """
+                    (
+                        """
+                        QMenu {
+                            background-color: #FFFFFF;
+                            border: 1px solid #D0D0D0;
+                            padding: 4px;
+                        }
+                        QMenu::item {
+                            padding: 6px 22px;
+                            color: #1A1A1A;
+                        }
+                        QMenu::item:selected {
+                            background-color: #CFE4FF;
+                        }
+                        """
+                        if effective_mode == "light"
+                        else
+                        """
+                        QMenu {
+                            background-color: #1E1E1E;
+                            border: 1px solid rgba(128, 128, 128, 0.3);
+                            padding: 4px;
+                        }
+                        QMenu::item {
+                            padding: 6px 22px;
+                            color: #EAEAEA;
+                        }
+                        QMenu::item:selected {
+                            background-color: rgba(255,255,255,0.06);
+                        }
+                        """
+                    )
                 )
             except Exception:
                 pass
@@ -2620,3 +3460,88 @@ class MainWindow(QWidget):
             QTimer.singleShot(0, self._apply_results_split_ratio)
         except Exception:
             pass
+
+        try:
+            if not bool(getattr(self, "_restoring_window_state", False)) and not self.isMinimized():
+                self._window_settings_timer.start(250)
+        except Exception:
+            pass
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        try:
+            QTimer.singleShot(0, self._apply_window_corner_preference)
+        except Exception:
+            pass
+
+    def _apply_window_corner_preference(self) -> None:
+        try:
+            if not sys.platform.startswith("win"):
+                return
+
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+
+            dwmapi = ctypes.windll.dwmapi
+            preference = ctypes.c_int(_DWMWCP_DONOTROUND if self.isMaximized() or self.isFullScreen() else _DWMWCP_ROUND)
+            result = dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(hwnd),
+                ctypes.c_uint(_DWMWA_WINDOW_CORNER_PREFERENCE),
+                ctypes.byref(preference),
+                ctypes.sizeof(preference),
+            )
+            self._rounded_corners_applied = (int(result) == 0)
+        except Exception:
+            self._rounded_corners_applied = False
+
+    def nativeEvent(self, eventType, message):
+        """Allow edge and corner resizing for the frameless main window on Windows."""
+        try:
+            if not sys.platform.startswith("win"):
+                return super().nativeEvent(eventType, message)
+
+            msg = _WinMsg.from_address(int(message))
+            if int(msg.message) != self._WM_NCHITTEST:
+                return super().nativeEvent(eventType, message)
+
+            if self.isMaximized() or self.isFullScreen():
+                return False, self._HTCLIENT
+
+            border = int(getattr(self, "_resize_border_px", 8) or 8)
+            if border <= 0:
+                return super().nativeEvent(eventType, message)
+
+            x = ctypes.c_short(int(msg.lParam) & 0xFFFF).value
+            y = ctypes.c_short((int(msg.lParam) >> 16) & 0xFFFF).value
+            frame = self.frameGeometry()
+            local_x = int(x - frame.left())
+            local_y = int(y - frame.top())
+            width = int(frame.width())
+            height = int(frame.height())
+
+            on_left = local_x < border
+            on_right = local_x >= max(border, width - border)
+            on_top = local_y < border
+            on_bottom = local_y >= max(border, height - border)
+
+            if on_top and on_left:
+                return True, self._HTTOPLEFT
+            if on_top and on_right:
+                return True, self._HTTOPRIGHT
+            if on_bottom and on_left:
+                return True, self._HTBOTTOMLEFT
+            if on_bottom and on_right:
+                return True, self._HTBOTTOMRIGHT
+            if on_left:
+                return True, self._HTLEFT
+            if on_right:
+                return True, self._HTRIGHT
+            if on_top:
+                return True, self._HTTOP
+            if on_bottom:
+                return True, self._HTBOTTOM
+
+            return False, self._HTCLIENT
+        except Exception:
+            return super().nativeEvent(eventType, message)

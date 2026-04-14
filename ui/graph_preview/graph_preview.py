@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import json
+import re
 import time
 from typing import Optional
 
@@ -15,12 +16,14 @@ from PySide6.QtWidgets import (
     QLabel,
     QSizePolicy,
     QDialog,
+    QPushButton,
     QWidget,
 )
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backend_bases import MouseEvent as MPLMouseEvent
+from matplotlib.lines import Line2D
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 import matplotlib.dates as mdates
@@ -103,6 +106,19 @@ class GraphPreview(QObject):
         self._legend_popup: Optional[LegendStatsPopup] = None
         self._compare_legend_popup: Optional[CompareLegendStatsPopup] = None
         self._dim_overlay: Optional[DimOverlay] = None
+        self._preview_scroll_area = None
+        self._preview_scroll_viewport = None
+        self._preview_visible_axis_slots = 2
+        self._preview_min_axis_height = 220
+        self._preview_header_widget = None
+        self._preview_header_separator = None
+        self._preview_header_title_label = None
+        self._preview_header_subtitle_label = None
+        self._preview_header_zero_btn = None
+        self._preview_header_delta_btn = None
+        self._preview_header_legend_btn = None
+        self._preview_header_title_text = ""
+        self._preview_header_subtitle_text = ""
 
         # data/series state
         self._preview_df_all = None
@@ -177,16 +193,27 @@ class GraphPreview(QObject):
         # matplotlib
         try:
             self._preview_fig = Figure(figsize=(5, 3))
-            self._preview_left_margin_px_base = 60
-            self._preview_top_frac = 0.98
-            self._preview_bottom_frac = 0.08
+            self._preview_left_margin_px_base = 56
+            self._preview_left_tick_pad_px = 3
+            self._preview_right_frac = 0.995
+            self._preview_right_pad_px = 18
+            self._preview_top_frac = 0.93
+            self._preview_bottom_frac = 0.05
+            self._preview_top_pad_px = 30
+            self._preview_bottom_pad_px = 16
+            self._preview_stack_hspace = 0.20
+            self._preview_title_axes_y = 1.02
+            self._preview_title_font_size = 11
 
             self._preview_canvas = FigureCanvas(self._preview_fig)
             self._preview_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self._preview_canvas.setMouseTracking(True)
             self._preview_ax = self._preview_fig.add_subplot(111)
 
-            self._preview_apply_axes_rect(right_frac=0.985, left_margin_px=self._preview_left_margin_px_base)
+            self._preview_apply_axes_rect(
+                right_frac=float(self._preview_effective_right_frac()),
+                left_margin_px=self._preview_left_margin_px_base,
+            )
 
             self._preview_last_canvas_wh = None
             try:
@@ -313,10 +340,20 @@ class GraphPreview(QObject):
 
             self._preview_canvas.hide()
 
+            self._preview_timeline_fig = Figure(figsize=(5, 0.45))
+            self._preview_timeline_canvas = FigureCanvas(self._preview_timeline_fig)
+            self._preview_timeline_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            self._preview_timeline_canvas.setFixedHeight(64)
+            self._preview_timeline_ax = self._preview_timeline_fig.add_subplot(111)
+            self._preview_timeline_canvas.hide()
+
         except Exception:
             self._preview_fig = None
             self._preview_canvas = None
             self._preview_ax = None
+            self._preview_timeline_fig = None
+            self._preview_timeline_canvas = None
+            self._preview_timeline_ax = None
 
         # compare-mode state
         self._compare_mode = False
@@ -337,6 +374,7 @@ class GraphPreview(QObject):
         self._single_axis_vlines = {}
         self._single_last_canvas_wh = None
         self._single_last_idx = None
+        self._single_header_text = None
 
     def set_theme_mode(self, mode: str) -> None:
         try:
@@ -386,6 +424,11 @@ class GraphPreview(QObject):
                     self._preview_fig.set_facecolor(str(self._preview_theme.get("figure_bg", "#121212")))
             except Exception:
                 pass
+
+            try:
+                self._apply_preview_surface_theme()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -415,6 +458,268 @@ class GraphPreview(QObject):
             return str(self._preview_theme.get("secondary_text", "#BDBDBD"))
         except Exception:
             return "#BDBDBD"
+
+    def _preview_css_rgba(self, value, fallback: str) -> str:
+        try:
+            if isinstance(value, str):
+                return value
+            if isinstance(value, tuple) and len(value) in (3, 4):
+                parts = [float(v) for v in value]
+                if len(parts) == 3:
+                    parts.append(1.0)
+                r = max(0, min(255, int(round(parts[0] * 255))))
+                g = max(0, min(255, int(round(parts[1] * 255))))
+                b = max(0, min(255, int(round(parts[2] * 255))))
+                a = max(0.0, min(1.0, float(parts[3])))
+                return f"rgba({r}, {g}, {b}, {a:.3f})"
+        except Exception:
+            pass
+        return fallback
+
+    def _preview_header_button_stylesheet(self, *, active: bool) -> str:
+        text_color = self._preview_css_rgba(self._preview_theme.get("secondary_text", "#BDBDBD"), "#BDBDBD")
+        border_color = self._preview_css_rgba(self._preview_theme.get("grid", "#3A3A3A"), "#3A3A3A")
+        bg_color = "transparent"
+        font_weight = "500"
+        if active:
+            bg_color = self._preview_css_rgba(self._preview_theme.get("button_active_fill", (0.25, 0.25, 0.25, 0.35)), "rgba(64, 64, 64, 0.35)")
+            border_color = self._preview_css_rgba(self._preview_theme.get("button_active_border", (0.55, 0.55, 0.55, 0.85)), border_color)
+            text_color = self._preview_css_rgba(self._preview_theme.get("button_active_text", (1, 1, 1, 0.98)), text_color)
+            font_weight = "700"
+        return (
+            "QPushButton {"
+            f" background: {bg_color};"
+            f" color: {text_color};"
+            f" border: 1px solid {border_color};"
+            " border-radius: 10px;"
+            " padding: 4px 10px;"
+            f" font-weight: {font_weight};"
+            " }"
+            "QPushButton:hover {"
+            f" border-color: {text_color};"
+            " }"
+            "QPushButton:pressed {"
+            f" background: {bg_color};"
+            " }"
+        )
+
+    def _sync_preview_header_controls(self) -> None:
+        try:
+            header = getattr(self, "_preview_header_widget", None)
+            if header is None:
+                return
+
+            try:
+                show_header = bool(self._preview_canvas is not None and self._preview_canvas.isVisible())
+            except Exception:
+                show_header = False
+
+            try:
+                header.setVisible(show_header)
+            except Exception:
+                pass
+
+            bg = str(self._preview_theme.get("figure_bg", "#121212"))
+            line = self._preview_css_rgba(self._preview_theme.get("grid", "#3A3A3A"), "#3A3A3A")
+
+            try:
+                header.setStyleSheet(f"background: {bg}; border: none;")
+            except Exception:
+                pass
+
+            title_label = getattr(self, "_preview_header_title_label", None)
+            if title_label is not None:
+                try:
+                    raw_title = str(getattr(self, "_preview_header_title_text", "") or "")
+                    try:
+                        avail = max(0, int(title_label.contentsRect().width() or title_label.width() or 0) - 2)
+                    except Exception:
+                        avail = max(0, int(title_label.width() or 0) - 2)
+                    text_title = raw_title
+                    if avail > 0 and raw_title:
+                        try:
+                            text_title = title_label.fontMetrics().elidedText(raw_title, Qt.ElideRight, avail)
+                        except Exception:
+                            text_title = raw_title
+                    title_label.setText(text_title)
+                    title_label.setToolTip(raw_title if text_title != raw_title else "")
+                    title_label.setVisible(bool(show_header and raw_title.strip()))
+                    title_label.setStyleSheet(
+                        f"background: transparent; color: {self._preview_label_color()}; font-size: 12px; font-weight: 600;"
+                    )
+                except Exception:
+                    pass
+
+            subtitle_label = getattr(self, "_preview_header_subtitle_label", None)
+            if subtitle_label is not None:
+                try:
+                    raw_subtitle = str(getattr(self, "_preview_header_subtitle_text", "") or "")
+                    try:
+                        avail = max(0, int(subtitle_label.contentsRect().width() or subtitle_label.width() or 0) - 2)
+                    except Exception:
+                        avail = max(0, int(subtitle_label.width() or 0) - 2)
+                    text_subtitle = raw_subtitle
+                    if avail > 0 and raw_subtitle:
+                        try:
+                            text_subtitle = subtitle_label.fontMetrics().elidedText(raw_subtitle, Qt.ElideRight, avail)
+                        except Exception:
+                            text_subtitle = raw_subtitle
+                    subtitle_label.setText(text_subtitle)
+                    subtitle_label.setToolTip(raw_subtitle if text_subtitle != raw_subtitle else "")
+                    subtitle_label.setVisible(bool(show_header and raw_subtitle.strip()))
+                    subtitle_label.setStyleSheet(
+                        f"background: transparent; color: {self._preview_secondary_text_color()}; font-size: 10px; font-weight: 400;"
+                    )
+                except Exception:
+                    pass
+
+            try:
+                sep = getattr(self, "_preview_header_separator", None)
+                if sep is not None:
+                    sep.setVisible(show_header)
+                    sep.setStyleSheet(f"background: {line}; border: none;")
+            except Exception:
+                pass
+
+            legend_btn = getattr(self, "_preview_header_legend_btn", None)
+            if legend_btn is not None:
+                try:
+                    legend_btn.setText("≡ Legend & stats")
+                    legend_btn.setStyleSheet(self._preview_header_button_stylesheet(active=False))
+                    legend_btn.setVisible(show_header)
+                except Exception:
+                    pass
+
+            delta_btn = getattr(self, "_preview_header_delta_btn", None)
+            if delta_btn is not None:
+                try:
+                    delta_btn.setText("ΔT" if bool(getattr(self, "_temp_delta_mode", False)) else "T")
+                    delta_btn.setStyleSheet(self._preview_header_button_stylesheet(active=bool(getattr(self, "_temp_delta_mode", False))))
+                    delta_btn.setVisible(show_header)
+                except Exception:
+                    pass
+
+            zero_btn = getattr(self, "_preview_header_zero_btn", None)
+            if zero_btn is not None:
+                try:
+                    zero_btn.setText("0Y" if bool(getattr(self, "_zero_y_mode", False)) else "AutoY")
+                    zero_btn.setStyleSheet(self._preview_header_button_stylesheet(active=bool(getattr(self, "_zero_y_mode", False))))
+                    zero_btn.setVisible(show_header)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def set_preview_header_controls(
+        self,
+        *,
+        header_widget: QWidget | None = None,
+        separator: QWidget | None = None,
+        title_label: QLabel | None = None,
+        subtitle_label: QLabel | None = None,
+        zero_btn: QPushButton | None = None,
+        delta_btn: QPushButton | None = None,
+        legend_btn: QPushButton | None = None,
+    ) -> None:
+        try:
+            self._preview_header_widget = header_widget
+            self._preview_header_separator = separator
+            self._preview_header_title_label = title_label
+            self._preview_header_subtitle_label = subtitle_label
+            self._preview_header_zero_btn = zero_btn
+            self._preview_header_delta_btn = delta_btn
+            self._preview_header_legend_btn = legend_btn
+
+            for widget in (header_widget, title_label, subtitle_label):
+                if widget is not None:
+                    try:
+                        widget.installEventFilter(self)
+                    except Exception:
+                        pass
+
+            if zero_btn is not None:
+                try:
+                    zero_btn.clicked.connect(self.toggle_zero_y_mode)
+                except Exception:
+                    pass
+            if delta_btn is not None:
+                try:
+                    delta_btn.clicked.connect(self.toggle_delta_mode)
+                except Exception:
+                    pass
+            if legend_btn is not None:
+                try:
+                    legend_btn.clicked.connect(self.toggle_legend_popup)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._sync_preview_header_controls()
+
+    def _set_preview_header_path(self, path: Path | None) -> None:
+        try:
+            if path is None:
+                self._preview_header_title_text = ""
+                self._preview_header_subtitle_text = ""
+            else:
+                run_folder = str(path.parent.name or "").strip()
+                case_folder = str(path.parent.parent.name or "").strip()
+
+                if not case_folder:
+                    case_folder = run_folder
+                if not run_folder:
+                    run_folder = str(path.name or "").strip()
+
+                self._preview_header_title_text = case_folder
+                self._preview_header_subtitle_text = run_folder
+        except Exception:
+            self._preview_header_title_text = ""
+            self._preview_header_subtitle_text = ""
+        self._sync_preview_header_controls()
+
+    def _apply_preview_surface_theme(self) -> None:
+        try:
+            bg = str(self._preview_theme.get("figure_bg", "#121212"))
+        except Exception:
+            bg = "#121212"
+
+        try:
+            if getattr(self, "_preview_canvas", None) is not None:
+                self._preview_canvas.setAttribute(Qt.WA_StyledBackground, True)
+                self._preview_canvas.setContentsMargins(0, 0, 0, 0)
+                self._preview_canvas.setStyleSheet(
+                    f"background-color: {bg}; border: none; margin: 0px; padding: 0px;"
+                )
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_preview_label", None) is not None:
+                self._preview_label.setStyleSheet(
+                    f"background-color: {bg}; border: none; margin: 0px; padding: 0px;"
+                )
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_preview_timeline_fig", None) is not None:
+                self._preview_timeline_fig.set_facecolor(bg)
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_preview_timeline_canvas", None) is not None:
+                self._preview_timeline_canvas.setAttribute(Qt.WA_StyledBackground, True)
+                self._preview_timeline_canvas.setStyleSheet(
+                    f"background-color: {bg}; border: none; margin: 0px; padding: 0px;"
+                )
+        except Exception:
+            pass
+
+        try:
+            self._sync_preview_header_controls()
+        except Exception:
+            pass
 
     def _apply_preview_axes_style(self, ax) -> None:
         try:
@@ -899,7 +1204,10 @@ class GraphPreview(QObject):
                 self._preview_fig.clear()
                 self._preview_ax = self._preview_fig.add_subplot(111)
                 try:
-                    self._preview_apply_axes_rect(right_frac=0.985, left_margin_px=self._preview_left_margin_px_base)
+                    self._preview_apply_axes_rect(
+                        right_frac=float(self._preview_effective_right_frac()),
+                        left_margin_px=self._preview_left_margin_px_base,
+                    )
                 except Exception:
                     pass
         except Exception:
@@ -913,6 +1221,9 @@ class GraphPreview(QObject):
                     self._preview_canvas.mousePressEvent = self._default_mouse_press_event
         except Exception:
             pass
+
+        self._restore_preview_canvas_size_policy()
+        self._hide_sticky_timeline()
 
     def _exit_single_mode_multi_axis(self) -> None:
         """Exit single-mode multi-axis view and reset to default single axis."""
@@ -946,7 +1257,10 @@ class GraphPreview(QObject):
                 self._preview_fig.clear()
                 self._preview_ax = self._preview_fig.add_subplot(111)
                 try:
-                    self._preview_apply_axes_rect(right_frac=0.985, left_margin_px=self._preview_left_margin_px_base)
+                    self._preview_apply_axes_rect(
+                        right_frac=float(self._preview_effective_right_frac()),
+                        left_margin_px=self._preview_left_margin_px_base,
+                    )
                 except Exception:
                     pass
         except Exception:
@@ -960,6 +1274,9 @@ class GraphPreview(QObject):
                     self._preview_canvas.mousePressEvent = self._default_mouse_press_event
         except Exception:
             pass
+
+        self._restore_preview_canvas_size_policy()
+        self._hide_sticky_timeline()
 
     def _hide_compare_hover_all(self) -> None:
         # hide vlines + compare overlay tooltips
@@ -1139,10 +1456,401 @@ class GraphPreview(QObject):
     def get_canvas(self):
         return self._preview_canvas
 
+    def get_timeline_canvas(self):
+        return self._preview_timeline_canvas
+
+    def set_preview_scroll_area(self, scroll_area) -> None:
+        try:
+            old_viewport = getattr(self, "_preview_scroll_viewport", None)
+            if old_viewport is not None:
+                try:
+                    old_viewport.removeEventFilter(self)
+                except Exception:
+                    pass
+
+            self._preview_scroll_area = scroll_area
+            self._preview_scroll_viewport = None
+
+            if scroll_area is not None and hasattr(scroll_area, "viewport"):
+                viewport = scroll_area.viewport()
+                self._preview_scroll_viewport = viewport
+                if viewport is not None:
+                    try:
+                        viewport.installEventFilter(self)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            self._sync_preview_canvas_scroll_height()
+        except Exception:
+            pass
+
+    def _restore_preview_canvas_size_policy(self) -> None:
+        try:
+            if self._preview_canvas is None:
+                return
+            self._preview_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self._preview_canvas.setMinimumHeight(0)
+            self._preview_canvas.setMaximumHeight(16777215)
+        except Exception:
+            pass
+
+    def _preview_effective_right_frac(self) -> float:
+        try:
+            base = float(getattr(self, "_preview_right_frac", 0.995) or 0.995)
+        except Exception:
+            base = 0.995
+
+        try:
+            fig = getattr(self, "_preview_fig", None)
+            if fig is None:
+                return base
+            fig_w_px = float(fig.get_figwidth() * fig.dpi)
+            if fig_w_px <= 1:
+                return base
+            right_pad_px = float(getattr(self, "_preview_right_pad_px", 18) or 18)
+            pad_frac = max(0.0, min(right_pad_px / fig_w_px, 0.2))
+            return max(0.75, min(base - pad_frac, base))
+        except Exception:
+            return base
+
+    def _preview_axis_slot_height_px(self) -> int:
+        try:
+            viewport_h = 0
+            viewport = getattr(self, "_preview_scroll_viewport", None)
+            if viewport is not None:
+                viewport_h = int(viewport.height() or 0)
+            if viewport_h <= 0:
+                try:
+                    viewport_h = int(self._preview_canvas.parentWidget().height() or 0)
+                except Exception:
+                    viewport_h = 0
+            viewport_h = max(320, viewport_h)
+            visible_slots = max(1, int(getattr(self, "_preview_visible_axis_slots", 2) or 2))
+            return max(
+                int(getattr(self, "_preview_min_axis_height", 220) or 220),
+                int(viewport_h / max(1, visible_slots)),
+            )
+        except Exception:
+            return int(getattr(self, "_preview_min_axis_height", 220) or 220)
+
+    def _preview_effective_vertical_fracs(self) -> tuple[float, float]:
+        try:
+            fig = getattr(self, "_preview_fig", None)
+            if fig is None:
+                return (
+                    float(getattr(self, "_preview_top_frac", 0.93) or 0.93),
+                    float(getattr(self, "_preview_bottom_frac", 0.05) or 0.05),
+                )
+            fig_h_px = float(fig.get_figheight() * fig.dpi)
+            if fig_h_px <= 1:
+                return (
+                    float(getattr(self, "_preview_top_frac", 0.93) or 0.93),
+                    float(getattr(self, "_preview_bottom_frac", 0.05) or 0.05),
+                )
+
+            top_pad_px = float(getattr(self, "_preview_top_pad_px", 22) or 22)
+            bottom_pad_px = float(getattr(self, "_preview_bottom_pad_px", 16) or 16)
+            top = 1.0 - max(0.0, min(top_pad_px / fig_h_px, 0.25))
+            bottom = max(0.0, min(bottom_pad_px / fig_h_px, 0.2))
+            top = max(bottom + 0.1, min(top, 0.995))
+            bottom = max(0.0, min(bottom, top - 0.1))
+            return top, bottom
+        except Exception:
+            return (
+                float(getattr(self, "_preview_top_frac", 0.93) or 0.93),
+                float(getattr(self, "_preview_bottom_frac", 0.05) or 0.05),
+            )
+
+    def _apply_single_slot_axis_layout(self, ax) -> None:
+        try:
+            if ax is None or self._preview_fig is None:
+                return
+            pos = ax.get_position()
+            fig_h_px = float(self._preview_fig.get_figheight() * self._preview_fig.dpi)
+            axis_h_px = float(self._preview_axis_slot_height_px())
+            top, min_bottom = self._preview_effective_vertical_fracs()
+            bottom = max(0.0, min(top - 0.05, top - (axis_h_px / fig_h_px))) if fig_h_px > 1 else min_bottom
+            bottom = max(float(min_bottom), bottom)
+            ax.set_position([float(pos.x0), bottom, float(pos.width), max(0.05, top - bottom)])
+        except Exception:
+            pass
+
+    def _hide_sticky_timeline(self) -> None:
+        try:
+            if getattr(self, "_preview_timeline_canvas", None) is not None:
+                self._preview_timeline_canvas.hide()
+        except Exception:
+            pass
+
+    def _update_sticky_timeline(self, source_ax=None) -> None:
+        try:
+            canvas = getattr(self, "_preview_timeline_canvas", None)
+            fig = getattr(self, "_preview_timeline_fig", None)
+            ax = getattr(self, "_preview_timeline_ax", None)
+            if canvas is None or fig is None or ax is None or source_ax is None:
+                self._hide_sticky_timeline()
+                return
+
+            ax.clear()
+            pos = source_ax.get_position()
+            ax.set_position([float(pos.x0), 0.52, float(pos.width), 0.20])
+            x0, x1 = source_ax.get_xlim()
+            ax.set_xlim((x0, x1))
+
+            data_start = None
+            data_end = None
+            formatter = None
+            try:
+                formatter = source_ax.xaxis.get_major_formatter()
+            except Exception:
+                formatter = None
+
+            try:
+                for line in list(source_ax.get_lines() or []):
+                    try:
+                        xdata = np.asarray(line.get_xdata(orig=False), dtype=float)
+                    except Exception:
+                        continue
+                    finite = xdata[np.isfinite(xdata)]
+                    if finite.size == 0:
+                        continue
+                    cur_start = float(finite.min())
+                    cur_end = float(finite.max())
+                    data_start = cur_start if data_start is None else min(data_start, cur_start)
+                    data_end = cur_end if data_end is None else max(data_end, cur_end)
+            except Exception:
+                pass
+
+            range_start = float(data_start) if data_start is not None else float(x0)
+            range_end = float(data_end) if data_end is not None else float(x1)
+            if range_end < range_start:
+                range_start, range_end = range_end, range_start
+
+            try:
+                width_px = float(getattr(source_ax, "bbox", None).width)
+            except Exception:
+                width_px = 0.0
+            label_count = max(2, min(6, int(max(2.0, round(width_px / 180.0))) + 1))
+
+            if abs(range_end - range_start) <= 1e-12:
+                ticks = [float(range_start)]
+            else:
+                ticks = [float(t) for t in np.linspace(range_start, range_end, num=label_count)]
+
+            labels = []
+            try:
+                labels = [str(formatter(t, i) or "") for i, t in enumerate(ticks)] if formatter is not None else [""] * len(ticks)
+            except Exception:
+                labels = [""] * len(ticks)
+
+            try:
+                dedup_ticks: list[float] = []
+                dedup_labels: list[str] = []
+                last_label = None
+                for tick, label in zip(ticks, labels):
+                    text = str(label or "")
+                    if last_label is not None and text == last_label and len(ticks) > 1:
+                        continue
+                    dedup_ticks.append(float(tick))
+                    dedup_labels.append(text)
+                    last_label = text
+                ticks = dedup_ticks
+                labels = dedup_labels
+            except Exception:
+                pass
+
+            minor_ticks = []
+            try:
+                if len(ticks) >= 2:
+                    for left_tick, right_tick in zip(ticks[:-1], ticks[1:]):
+                        step = (float(right_tick) - float(left_tick)) / 4.0
+                        if step <= 0:
+                            continue
+                        minor_ticks.extend(
+                            float(left_tick) + step * part
+                            for part in (1.0, 2.0, 3.0)
+                        )
+            except Exception:
+                minor_ticks = []
+
+            try:
+                bg = str(self._preview_theme.get("figure_bg", "#121212"))
+            except Exception:
+                bg = "#121212"
+            try:
+                fg = str(self._preview_theme.get("secondary_text", "#BDBDBD"))
+            except Exception:
+                fg = "#BDBDBD"
+            try:
+                grid = str(self._preview_theme.get("grid", "#3A3A3A"))
+            except Exception:
+                grid = "#3A3A3A"
+
+            fig.set_facecolor(bg)
+            try:
+                fig.lines.clear()
+                fig.lines.append(
+                    Line2D([0.0, 1.0], [0.72, 0.72], transform=fig.transFigure, color=grid, linewidth=0.8)
+                )
+            except Exception:
+                pass
+            ax.set_facecolor(bg)
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([])
+            ax.set_xticks(minor_ticks, minor=True)
+            ax.set_yticks([])
+            ax.tick_params(
+                axis="x",
+                which="major",
+                colors=fg,
+                labelsize=10,
+                top=True,
+                bottom=False,
+                labeltop=False,
+                labelbottom=False,
+                direction="in",
+                length=6,
+                width=0.8,
+                pad=0,
+            )
+            ax.tick_params(
+                axis="x",
+                which="minor",
+                colors=grid,
+                top=True,
+                bottom=False,
+                direction="in",
+                length=3,
+                width=0.6,
+            )
+            ax.tick_params(axis="y", left=False, labelleft=False)
+            try:
+                ax.xaxis.set_label_position("bottom")
+            except Exception:
+                pass
+            for spine_name, spine in ax.spines.items():
+                try:
+                    spine.set_visible(spine_name == "top")
+                    if spine_name == "top":
+                        spine.set_color(grid)
+                        spine.set_linewidth(0.8)
+                        spine.set_linestyle("-")
+                except Exception:
+                    pass
+
+            try:
+                xtrans = ax.get_xaxis_transform()
+                for tick, label in zip(ticks, labels):
+                    text = str(label or "").strip()
+                    if not text:
+                        continue
+                    ax.text(
+                        float(tick),
+                        -0.95,
+                        text,
+                        transform=xtrans,
+                        ha="center",
+                        va="top",
+                        color=fg,
+                        fontsize=10,
+                        clip_on=False,
+                    )
+            except Exception:
+                pass
+
+            canvas.show()
+            canvas.draw_idle()
+        except Exception:
+            self._hide_sticky_timeline()
+
+    def _sync_preview_canvas_scroll_height(self, axis_count: int | None = None) -> None:
+        try:
+            if self._preview_canvas is None:
+                return
+
+            if axis_count is None:
+                if getattr(self, "_compare_mode", False):
+                    axis_count = int(len(getattr(self, "_compare_axes", []) or []))
+                elif getattr(self, "_single_mode_multi_axis", False):
+                    axis_count = int(len(getattr(self, "_single_axes", []) or []))
+                else:
+                    axis_count = 1
+
+            axis_count = max(1, int(axis_count or 1))
+            if axis_count <= 0:
+                self._restore_preview_canvas_size_policy()
+                self._hide_sticky_timeline()
+                return
+
+            viewport_h = 0
+            try:
+                viewport = getattr(self, "_preview_scroll_viewport", None)
+                if viewport is not None:
+                    viewport_h = int(viewport.height() or 0)
+            except Exception:
+                viewport_h = 0
+
+            if viewport_h <= 0:
+                try:
+                    viewport_h = int(self._preview_canvas.parentWidget().height() or 0)
+                except Exception:
+                    viewport_h = 0
+
+            viewport_h = max(320, viewport_h)
+            axis_height = self._preview_axis_slot_height_px()
+            if axis_count == 1:
+                target_h = max(viewport_h, axis_height)
+            else:
+                target_h = max(viewport_h, axis_height * axis_count)
+
+            self._preview_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            self._preview_canvas.setMinimumHeight(target_h)
+            self._preview_canvas.setMaximumHeight(target_h)
+        except Exception:
+            pass
+
+    def _forward_preview_wheel_to_scroll_area(self, event) -> bool:
+        try:
+            scroll_area = getattr(self, "_preview_scroll_area", None)
+            if scroll_area is None:
+                return False
+
+            bar = scroll_area.verticalScrollBar()
+            if bar is None or int(bar.maximum() or 0) <= int(bar.minimum() or 0):
+                return False
+
+            delta = 0
+            try:
+                delta = int(event.angleDelta().y())
+            except Exception:
+                delta = 0
+            if delta == 0:
+                try:
+                    delta = int(event.pixelDelta().y())
+                except Exception:
+                    delta = 0
+            if delta == 0:
+                return False
+
+            single_step = max(20, int(bar.singleStep() or 20))
+            steps = float(delta) / 120.0 if abs(delta) >= 120 else (1.0 if delta > 0 else -1.0)
+            bar.setValue(int(bar.value() - round(steps * single_step * 3)))
+            try:
+                event.accept()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
     def preview_path(self, fpath: str) -> None:
         try:
             self._exit_compare_mode()
             p = Path(fpath)
+            self._set_preview_header_path(p)
             if is_csv_file(p) and self._preview_canvas is not None:
                 self._plot_run_csv(str(p))
                 return
@@ -1153,7 +1861,9 @@ class GraphPreview(QObject):
                         self._preview_canvas.hide()
                     except Exception:
                         pass
+                self._hide_sticky_timeline()
                 self._hide_qt_tooltip()
+                self._sync_preview_header_controls()
                 pix = QPixmap(str(p))
                 if not pix.isNull():
                     w = max(100, self._preview_label.width())
@@ -1169,7 +1879,11 @@ class GraphPreview(QObject):
                 self._preview_canvas.hide()
         except Exception:
             pass
+        self._restore_preview_canvas_size_policy()
+        self._hide_sticky_timeline()
         self._hide_qt_tooltip()
+        self._set_preview_header_path(None)
+        self._sync_preview_header_controls()
         self._preview_label.clear()
         self._preview_label.show()
 
@@ -1179,6 +1893,7 @@ class GraphPreview(QObject):
             try:
                 mp = Path(folder) / "compare_manifest.json"
                 if mp.exists() and mp.is_file():
+                    self._set_preview_header_path(mp)
                     self._plot_compare_manifest(mp)
                     return
             except Exception:
@@ -1192,6 +1907,8 @@ class GraphPreview(QObject):
                 except Exception:
                     pass
                 self._hide_qt_tooltip()
+                self._set_preview_header_path(None)
+                self._sync_preview_header_controls()
                 self._preview_label.clear()
                 return
 
@@ -1199,12 +1916,30 @@ class GraphPreview(QObject):
             return
         except Exception:
             self._hide_qt_tooltip()
+            self._set_preview_header_path(None)
             self._preview_label.clear()
 
     # ---------------------------------------------------------------------
     # Event filter
     # ---------------------------------------------------------------------
     def eventFilter(self, obj, event):
+        try:
+            if obj is getattr(self, "_preview_canvas", None) and event is not None and event.type() == QEvent.Wheel:
+                if self._forward_preview_wheel_to_scroll_area(event):
+                    return True
+        except Exception:
+            pass
+
+        try:
+            if obj in {
+                getattr(self, "_preview_header_widget", None),
+                getattr(self, "_preview_header_title_label", None),
+                getattr(self, "_preview_header_subtitle_label", None),
+            } and event is not None and event.type() in (QEvent.Resize, QEvent.Show, QEvent.LayoutRequest):
+                self._sync_preview_header_controls()
+        except Exception:
+            pass
+
         _gp_handle_preview_canvas_event_filter(self, obj, event)
         return super().eventFilter(obj, event)
 
@@ -1445,6 +2180,102 @@ class GraphPreview(QObject):
         if amb:
             return [c for c in cols if c != amb]
         return cols
+
+    def _single_axis_measurement_label(self, cols: list[str] | None = None) -> str:
+        try:
+            probe_cols = [str(c) for c in (cols or self._effective_active_cols() or []) if str(c)]
+            if not probe_cols:
+                probe_cols = [str(c) for c in (self._preview_available_cols or []) if str(c)]
+            if not probe_cols:
+                return ""
+
+            groups = group_columns_by_unit(probe_cols)
+            if len(groups) == 1:
+                unit = next(iter(groups.keys()))
+                return str(get_measurement_type_label(unit) or "").strip()
+
+            first_col = str(probe_cols[0]).strip()
+            if not first_col:
+                return ""
+            fallback_groups = group_columns_by_unit([first_col])
+            if len(fallback_groups) == 1:
+                unit = next(iter(fallback_groups.keys()))
+                return str(get_measurement_type_label(unit) or "").strip()
+        except Exception:
+            pass
+        return ""
+
+    def _update_single_axis_header(self) -> None:
+        try:
+            if self._preview_ax is None:
+                return
+            try:
+                if getattr(self, "_single_header_text", None) is not None:
+                    self._single_header_text.remove()
+            except Exception:
+                pass
+            self._single_header_text = None
+
+            label = str(self._single_axis_measurement_label() or "").strip()
+            if not label:
+                return
+
+            self._single_header_text = self._preview_ax.text(
+                0.0,
+                float(getattr(self, "_preview_title_axes_y", 1.02)),
+                label,
+                transform=self._preview_ax.transAxes,
+                ha="left",
+                va="bottom",
+                fontsize=int(getattr(self, "_preview_title_font_size", 11) or 11),
+                color=self._preview_label_color(),
+                zorder=3000,
+                clip_on=False,
+            )
+        except Exception:
+            pass
+
+    def _hide_single_axis_top_gridline(self) -> None:
+        try:
+            if self._preview_ax is None:
+                return
+            gridlines = [gl for gl in list(self._preview_ax.get_ygridlines() or []) if gl is not None]
+            if not gridlines:
+                return
+
+            top_line = None
+            top_y = None
+            for gl in gridlines:
+                try:
+                    ydata = gl.get_ydata(orig=False)
+                    if ydata is None or len(ydata) == 0:
+                        continue
+                    yval = float(ydata[0])
+                except Exception:
+                    continue
+                if top_y is None or yval > top_y:
+                    top_y = yval
+                    top_line = gl
+
+            for gl in gridlines:
+                try:
+                    gl.set_visible(gl is not top_line)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _apply_single_axis_header_chrome(self) -> None:
+        try:
+            if self._preview_ax is None:
+                return
+            try:
+                self._preview_ax.spines["top"].set_visible(False)
+            except Exception:
+                pass
+            self._hide_single_axis_top_gridline()
+        except Exception:
+            pass
 
     def _find_ambient_col(self, df: Optional[pd.DataFrame]) -> Optional[str]:
         try:
@@ -1865,6 +2696,7 @@ class GraphPreview(QObject):
     def _update_delta_button_visual(self) -> None:
         try:
             if self._delta_btn_text is None:
+                self._sync_preview_header_controls()
                 return
 
             is_on = bool(getattr(self, "_temp_delta_mode", False))
@@ -1914,10 +2746,15 @@ class GraphPreview(QObject):
                 pass
         except Exception:
             pass
+        try:
+            self._sync_preview_header_controls()
+        except Exception:
+            pass
 
     def _update_zero_y_button_visual(self) -> None:
         try:
             if self._zero_btn_text is None:
+                self._sync_preview_header_controls()
                 return
 
             is_on = bool(getattr(self, "_zero_y_mode", False))
@@ -1960,6 +2797,10 @@ class GraphPreview(QObject):
                         pass
             except Exception:
                 pass
+        except Exception:
+            pass
+        try:
+            self._sync_preview_header_controls()
         except Exception:
             pass
 
@@ -2045,6 +2886,14 @@ class GraphPreview(QObject):
 
             if not self._is_over_delta_button(qt_x, qt_y):
                 return False
+
+            return self.toggle_delta_mode()
+
+        except Exception:
+            return False
+
+    def toggle_delta_mode(self) -> bool:
+        try:
 
             self._temp_delta_mode = not bool(getattr(self, "_temp_delta_mode", False))
 
@@ -2321,6 +3170,14 @@ class GraphPreview(QObject):
             if not self._is_over_zero_y_button(qt_x, qt_y):
                 return False
 
+            return self.toggle_zero_y_mode()
+
+        except Exception:
+            return False
+
+    def toggle_zero_y_mode(self) -> bool:
+        try:
+
             self._zero_y_mode = not bool(getattr(self, "_zero_y_mode", False))
 
             # Immediate visual feedback.
@@ -2468,25 +3325,32 @@ class GraphPreview(QObject):
         if not self._is_over_ls_button(qt_x, qt_y):
             return False
 
-        # Compare mode: show per-run stats tables side-by-side.
-        if getattr(self, "_compare_mode", False):
-            if not (getattr(self, "_compare_manifest_sensors", None) or []):
+        return self.toggle_legend_popup()
+
+    def toggle_legend_popup(self) -> bool:
+        try:
+
+            # Compare mode: show per-run stats tables side-by-side.
+            if getattr(self, "_compare_mode", False):
+                if not (getattr(self, "_compare_manifest_sensors", None) or []):
+                    return True
+                try:
+                    self._open_compare_legend_popup()
+                except Exception:
+                    pass
                 return True
+
+            if not self._preview_available_cols:
+                return True
+
             try:
-                self._open_compare_legend_popup()
+                self._open_legend_popup()
             except Exception:
                 pass
-            return True
 
-        if not self._preview_available_cols:
             return True
-
-        try:
-            self._open_legend_popup()
         except Exception:
-            pass
-
-        return True
+            return False
 
     def _close_legend_popup(self) -> None:
         try:
@@ -2817,6 +3681,17 @@ class GraphPreview(QObject):
         except Exception:
             pass
         _gp_preview_relayout_and_redraw(self)
+        try:
+            self._sync_preview_canvas_scroll_height(1)
+            self._apply_single_slot_axis_layout(self._preview_ax)
+            self._preview_canvas.draw()
+            try:
+                self._on_preview_draw()
+            except Exception:
+                pass
+            self._update_sticky_timeline(self._preview_ax)
+        except Exception:
+            self._hide_sticky_timeline()
 
     def _compare_relayout_and_redraw(self) -> None:
         """Relayout all compare subplots on resize/show."""
@@ -2828,6 +3703,8 @@ class GraphPreview(QObject):
             if not getattr(self, "_compare_mode", False) or not getattr(self, "_compare_axes", None):
                 return
 
+            self._sync_preview_canvas_scroll_height(len(getattr(self, "_compare_axes", []) or []))
+
             self._preview_canvas.draw()
             renderer = self._preview_canvas.get_renderer()
             if renderer is None:
@@ -2838,7 +3715,15 @@ class GraphPreview(QObject):
             for ax in list(self._compare_axes):
                 try:
                     self._preview_ax = ax
-                    left_px = max(left_px, float(self._preview_required_left_margin_px(renderer, pad_px=8)))
+                    left_px = max(
+                        left_px,
+                        float(
+                            self._preview_required_left_margin_px(
+                                renderer,
+                                pad_px=int(getattr(self, "_preview_left_tick_pad_px", 3) or 3),
+                            )
+                        ),
+                    )
                 except Exception:
                     continue
 
@@ -2846,13 +3731,14 @@ class GraphPreview(QObject):
                 fig_w_px = float(self._preview_fig.get_figwidth() * self._preview_fig.dpi)
                 left = (left_px / fig_w_px) if fig_w_px > 1 else 0.08
                 left = max(0.02, min(left, 0.35))
+                top, bottom = self._preview_effective_vertical_fracs()
 
                 self._preview_fig.subplots_adjust(
                     left=left,
-                    right=0.985,
-                    top=float(getattr(self, "_preview_top_frac", 0.98)),
-                    bottom=float(getattr(self, "_preview_bottom_frac", 0.08)),
-                    hspace=0.18,
+                    right=float(self._preview_effective_right_frac()),
+                    top=float(top),
+                    bottom=float(bottom),
+                    hspace=float(getattr(self, "_preview_stack_hspace", 0.35)),
                 )
             except Exception:
                 pass
@@ -2862,8 +3748,22 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
+            if len(getattr(self, "_compare_axes", []) or []) == 1:
+                try:
+                    ax0 = list(getattr(self, "_compare_axes", []) or [None])[0]
+                    self._apply_single_slot_axis_layout(ax0)
+                    self._preview_ax = ax0
+                    self._hide_single_axis_top_gridline()
+                except Exception:
+                    pass
+
             self._preview_canvas.draw()
             self._refresh_compare_backgrounds()
+            try:
+                axes = list(getattr(self, "_compare_axes", []) or [])
+                self._update_sticky_timeline(axes[-1] if axes else None)
+            except Exception:
+                self._hide_sticky_timeline()
         except Exception:
             try:
                 if self._preview_canvas is not None:
@@ -3320,6 +4220,8 @@ class GraphPreview(QObject):
             self._preview_build_tooltip_for_cols(eff_active)
 
             self._preview_autoscale_y_to_active()
+            self._update_single_axis_header()
+            self._apply_single_axis_header_chrome()
             self._preview_relayout_and_redraw()
 
             # Rebuild hover caches after a short idle (expensive)
@@ -3848,6 +4750,7 @@ class GraphPreview(QObject):
 
         self._compare_mode = True
         self._compare_axes = axes
+        self._sync_preview_canvas_scroll_height(len(axes))
         # Use the top axis for shared draw helpers (button bbox caching, etc.).
         try:
             self._preview_ax = axes[0] if axes else self._preview_ax
@@ -4015,13 +4918,13 @@ class GraphPreview(QObject):
             # sensor label
             try:
                 ax.text(
-                    0.01,
-                    1.0,
+                    0.0,
+                    float(getattr(self, "_preview_title_axes_y", 1.02)),
                     str(sensor),
                     transform=ax.transAxes,
                     ha="left",
                     va="bottom",
-                    fontsize=9,
+                    fontsize=int(getattr(self, "_preview_title_font_size", 11) or 11),
                     color=self._preview_label_color(),
                     zorder=2500,
                     clip_on=False,
@@ -4029,55 +4932,14 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
-            # Legend & stats button only on the TOP-most compare subplot.
-            # Keep it flush-right but align its Y anchor to the sensor label Y (y=1.0).
-            if i == 0:
-                try:
-                    self._ls_btn_text = ax.text(
-                        0.995,
-                        1.0,
-                        "≡ Legend & stats",
-                        transform=ax.transAxes,
-                        ha="right",
-                        va="bottom",
-                        fontsize=9,
-                        color=self._preview_secondary_text_color(),
-                        zorder=3000,
-                        clip_on=False,
-                        bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
-                    )
-                    self._ls_btn_bbox = None
-                except Exception:
-                    self._ls_btn_text = None
-                    self._ls_btn_bbox = None
-
-                # Add the same buttons as single mode: 0Y and ΔT.
-                try:
-                    self._delta_btn_text = ax.text(
-                        0.90,
-                        1.0,
-                        "ΔT" if getattr(self, "_temp_delta_mode", False) else "T",
-                        transform=ax.transAxes,
-                        ha="right",
-                        va="bottom",
-                        fontsize=9,
-                        color=self._preview_secondary_text_color(),
-                        zorder=3000,
-                        clip_on=False,
-                        bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
-                    )
-                    self._update_delta_button_visual()
-                    self._delta_btn_bbox = None
-                except Exception:
-                    self._delta_btn_text = None
-                    self._delta_btn_bbox = None
-
-                # Compare mode: temporarily hide/remove 0Y toggle.
-                self._zero_btn_text = None
-                self._zero_btn_bbox = None
+            # Sticky header owns preview controls for compare mode.
 
             if i == (n - 1):
                 apply_elapsed_time_formatter(ax, is_dt=is_dt, x_vals=x_vals)
+                try:
+                    ax.tick_params(axis="x", which="both", labelbottom=False, bottom=False)
+                except Exception:
+                    pass
 
             vline = create_hover_vline(
                 ax,
@@ -4118,6 +4980,10 @@ class GraphPreview(QObject):
 
         try:
             self._preview_canvas.show()
+        except Exception:
+            pass
+        try:
+            self._sync_preview_header_controls()
         except Exception:
             pass
 
@@ -4512,6 +5378,7 @@ class GraphPreview(QObject):
             return
 
         self._preview_ax.clear()
+        self._single_header_text = None
         self._ls_btn_text = None
         self._ls_btn_bbox = None
         self._delta_btn_text = None
@@ -4569,6 +5436,10 @@ class GraphPreview(QObject):
             pass
 
         apply_elapsed_time_formatter(self._preview_ax, is_dt=is_dt, x_vals=x_vals)
+        try:
+            self._preview_ax.tick_params(axis="x", which="both", labelbottom=False, bottom=False)
+        except Exception:
+            pass
 
         try:
             self._preview_vline = create_hover_vline(
@@ -4583,57 +5454,10 @@ class GraphPreview(QObject):
         self._preview_build_tooltip_for_cols(self._effective_active_cols())
         self._preview_autoscale_y_to_active()
 
-        try:
-            self._ls_btn_text = self._preview_ax.text(
-                0.995, 0.995, "≡ Legend & stats",
-                transform=self._preview_ax.transAxes,
-                ha="right", va="top",
-                fontsize=9,
-                color=self._preview_secondary_text_color(),
-                zorder=3000,
-                bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
-            )
-        except Exception:
-            self._ls_btn_text = None
-            self._ls_btn_bbox = None
+        self._update_single_axis_header()
+        self._apply_single_axis_header_chrome()
 
-        # Delta toggle button (left of Legend & stats; positioned precisely on draw)
-        try:
-            self._delta_btn_text = self._preview_ax.text(
-                0.90,
-                0.995,
-                "ΔT" if getattr(self, "_temp_delta_mode", False) else "T",
-                transform=self._preview_ax.transAxes,
-                ha="right",
-                va="top",
-                fontsize=9,
-                color=self._preview_secondary_text_color(),
-                zorder=3000,
-                bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
-            )
-            self._update_delta_button_visual()
-        except Exception:
-            self._delta_btn_text = None
-            self._delta_btn_bbox = None
-
-        # Zero-based Y toggle button (left of ΔT; positioned precisely on draw)
-        try:
-            self._zero_btn_text = self._preview_ax.text(
-                0.82,
-                0.995,
-                "0Y" if getattr(self, "_zero_y_mode", False) else "AutoY",
-                transform=self._preview_ax.transAxes,
-                ha="right",
-                va="top",
-                fontsize=9,
-                color=self._preview_secondary_text_color(),
-                zorder=3000,
-                bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
-            )
-            self._update_zero_y_button_visual()
-        except Exception:
-            self._zero_btn_text = None
-            self._zero_btn_bbox = None
+        # Sticky header owns preview controls for single-axis mode.
 
         try:
             self._preview_label.clear()
@@ -4642,7 +5466,13 @@ class GraphPreview(QObject):
             pass
 
         try:
+            self._sync_preview_canvas_scroll_height(1)
+        except Exception:
+            pass
+
+        try:
             self._preview_canvas.show()
+            self._sync_preview_header_controls()
             # Batch draw + relayout so we don't paint an intermediate (cropped) layout.
             c = self._preview_canvas
             was_updates = True
@@ -4666,6 +5496,10 @@ class GraphPreview(QObject):
                     self._preview_relayout_and_redraw()
                 except Exception:
                     pass
+                try:
+                    self._update_sticky_timeline(self._preview_ax)
+                except Exception:
+                    self._hide_sticky_timeline()
                 try:
                     self._preview_canvas.draw()
                 except Exception:
@@ -4741,6 +5575,7 @@ class GraphPreview(QObject):
         self._single_axes = axes
         self._single_axis_state = {}
         self._single_axis_vlines = {}
+        self._sync_preview_canvas_scroll_height(len(axes))
 
         # Per-axis Qt tooltip widgets (single-mode multi-axis shows one per subplot)
         def _make_single_tt() -> Optional[QLabel]:
@@ -4868,12 +5703,12 @@ class GraphPreview(QObject):
             try:
                 ax.text(
                     0.0,
-                    1.02,
+                    float(getattr(self, "_preview_title_axes_y", 1.02)),
                     str(measurement_label),
                     transform=ax.transAxes,
                     ha="left",
                     va="bottom",
-                    fontsize=11,
+                    fontsize=int(getattr(self, "_preview_title_font_size", 11) or 11),
                     color=self._preview_label_color(),
                     zorder=2600,
                     clip_on=False,
@@ -4881,68 +5716,7 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
-            # Add Legend & stats button only on the TOP-most graph, aligned to the same row (right).
-            if idx == 0:
-                try:
-                    self._ls_btn_text = ax.text(
-                        1.0,
-                        1.02,
-                        "≡ Legend & stats",
-                        transform=ax.transAxes,
-                        ha="right",
-                        va="bottom",
-                        fontsize=9,
-                        color=self._preview_secondary_text_color(),
-                        zorder=3000,
-                        clip_on=False,
-                        bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
-                    )
-                    self._ls_btn_bbox = None
-                except Exception:
-                    self._ls_btn_text = None
-                    self._ls_btn_bbox = None
-
-                # Delta toggle button (left of Legend & stats; positioned precisely on draw)
-                try:
-                    self._delta_btn_text = ax.text(
-                        0.90,
-                        1.02,
-                        "ΔT" if getattr(self, "_temp_delta_mode", False) else "T",
-                        transform=ax.transAxes,
-                        ha="right",
-                        va="bottom",
-                        fontsize=9,
-                        color=self._preview_secondary_text_color(),
-                        zorder=3000,
-                        clip_on=False,
-                        bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
-                    )
-                    self._update_delta_button_visual()
-                    self._delta_btn_bbox = None
-                except Exception:
-                    self._delta_btn_text = None
-                    self._delta_btn_bbox = None
-
-                # Zero-based Y toggle button (left of ΔT; positioned precisely on draw)
-                try:
-                    self._zero_btn_text = ax.text(
-                        0.82,
-                        1.02,
-                        "0Y" if getattr(self, "_zero_y_mode", False) else "AutoY",
-                        transform=ax.transAxes,
-                        ha="right",
-                        va="bottom",
-                        fontsize=9,
-                        color=self._preview_secondary_text_color(),
-                        zorder=3000,
-                        clip_on=False,
-                        bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0)),
-                    )
-                    self._update_zero_y_button_visual()
-                    self._zero_btn_bbox = None
-                except Exception:
-                    self._zero_btn_text = None
-                    self._zero_btn_bbox = None
+            # Sticky header owns preview controls for multi-axis mode.
 
             # Store axis state
             try:
@@ -4978,6 +5752,10 @@ class GraphPreview(QObject):
             # Apply time formatter only to the last (bottom) axis
             if idx == len(sorted_groups) - 1:
                 apply_elapsed_time_formatter(ax, is_dt=is_dt, x_vals=x_vals)
+                try:
+                    ax.tick_params(axis="x", which="both", labelbottom=False, bottom=False)
+                except Exception:
+                    pass
             else:
                 # Remove x-axis labels for non-bottom axes
                 try:
@@ -4989,10 +5767,10 @@ class GraphPreview(QObject):
         try:
             self._preview_fig.subplots_adjust(
                 left=0.08,
-                right=0.985,
-                top=0.93,
-                bottom=0.05,
-                hspace=0.35,
+                right=float(self._preview_effective_right_frac()),
+                top=float(getattr(self, "_preview_top_frac", 0.93)),
+                bottom=float(getattr(self, "_preview_bottom_frac", 0.05)),
+                hspace=float(getattr(self, "_preview_stack_hspace", 0.35)),
             )
         except Exception:
             pass
@@ -5005,6 +5783,7 @@ class GraphPreview(QObject):
 
         try:
             self._preview_canvas.show()
+            self._sync_preview_header_controls()
             # Batch draw + relayout so we don't paint an intermediate (cropped) layout.
             c = self._preview_canvas
             was_updates = True
@@ -5301,6 +6080,8 @@ class GraphPreview(QObject):
             if not getattr(self, "_single_mode_multi_axis", False) or not getattr(self, "_single_axes", None):
                 return
 
+            self._sync_preview_canvas_scroll_height(len(getattr(self, "_single_axes", []) or []))
+
             self._preview_canvas.draw()
             renderer = self._preview_canvas.get_renderer()
             if renderer is None:
@@ -5311,7 +6092,15 @@ class GraphPreview(QObject):
             for ax in list(self._single_axes):
                 try:
                     self._preview_ax = ax
-                    left_px = max(left_px, float(self._preview_required_left_margin_px(renderer, pad_px=8)))
+                    left_px = max(
+                        left_px,
+                        float(
+                            self._preview_required_left_margin_px(
+                                renderer,
+                                pad_px=int(getattr(self, "_preview_left_tick_pad_px", 3) or 3),
+                            )
+                        ),
+                    )
                 except Exception:
                     continue
 
@@ -5319,13 +6108,14 @@ class GraphPreview(QObject):
                 fig_w_px = float(self._preview_fig.get_figwidth() * self._preview_fig.dpi)
                 left = (left_px / fig_w_px) if fig_w_px > 1 else 0.08
                 left = max(0.02, min(left, 0.35))
+                top, bottom = self._preview_effective_vertical_fracs()
 
                 self._preview_fig.subplots_adjust(
                     left=left,
-                    right=0.985,
-                    top=0.93,
-                    bottom=0.05,
-                    hspace=0.35,
+                    right=float(self._preview_effective_right_frac()),
+                    top=float(top),
+                    bottom=float(bottom),
+                    hspace=float(getattr(self, "_preview_stack_hspace", 0.35)),
                 )
             except Exception:
                 pass
@@ -5340,6 +6130,11 @@ class GraphPreview(QObject):
                 self._refresh_single_backgrounds()
             except Exception:
                 pass
+            try:
+                axes = list(getattr(self, "_single_axes", []) or [])
+                self._update_sticky_timeline(axes[-1] if len(axes) > 1 else None)
+            except Exception:
+                self._hide_sticky_timeline()
         except Exception:
             try:
                 if self._preview_canvas is not None:

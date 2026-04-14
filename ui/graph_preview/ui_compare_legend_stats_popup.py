@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.graph_preview.graph_plot_helpers import group_columns_by_unit, get_measurement_type_label
+from ui.widgets.ui_rounding import apply_rounded_corners
 from ui.widgets.ui_theme import resolve_effective_theme_mode
 
 
@@ -138,6 +139,7 @@ class CompareLegendStatsPopup(QDialog):
         self.setWindowFlag(Qt.Tool, True)
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.setModal(False)
+        apply_rounded_corners(self, 10)
 
         self._on_close = on_close
         self._sensors = [str(s) for s in (sensors or []) if str(s).strip()]

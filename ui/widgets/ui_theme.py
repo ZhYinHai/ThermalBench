@@ -165,6 +165,57 @@ def apply_theme(app: QApplication, mode: str) -> None:
                 border-radius: 6px;
             }
 
+            /* Scrollbars */
+            QScrollBar:vertical {
+                background: transparent;
+                width: 12px;
+                margin: 4px 2px 4px 2px;
+            }
+            QScrollBar::groove:vertical {
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 0.22);
+                border-radius: 6px;
+                min-height: 36px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(255, 255, 255, 0.34);
+            }
+            QScrollBar::handle:vertical:pressed {
+                background: rgba(255, 255, 255, 0.44);
+            }
+            QScrollBar:horizontal {
+                background: transparent;
+                height: 12px;
+                margin: 2px 4px 2px 4px;
+            }
+            QScrollBar::groove:horizontal {
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal {
+                background: rgba(255, 255, 255, 0.22);
+                border-radius: 6px;
+                min-width: 36px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: rgba(255, 255, 255, 0.34);
+            }
+            QScrollBar::handle:horizontal:pressed {
+                background: rgba(255, 255, 255, 0.44);
+            }
+            QScrollBar::add-line,
+            QScrollBar::sub-line,
+            QScrollBar::add-page,
+            QScrollBar::sub-page {
+                background: transparent;
+                border: none;
+                width: 0px;
+                height: 0px;
+            }
+
             /* ---------- ComboBox popup (dropdown list) ---------- */
             QComboBox QAbstractItemView {
                 border: 0px;
@@ -286,6 +337,57 @@ def apply_theme(app: QApplication, mode: str) -> None:
                 border-radius: 6px;
             }
 
+            /* Scrollbars */
+            QScrollBar:vertical {
+                background: transparent;
+                width: 12px;
+                margin: 4px 2px 4px 2px;
+            }
+            QScrollBar::groove:vertical {
+                background: rgba(0, 0, 0, 0.06);
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(0, 0, 0, 0.24);
+                border-radius: 6px;
+                min-height: 36px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: rgba(0, 0, 0, 0.34);
+            }
+            QScrollBar::handle:vertical:pressed {
+                background: rgba(0, 0, 0, 0.44);
+            }
+            QScrollBar:horizontal {
+                background: transparent;
+                height: 12px;
+                margin: 2px 4px 2px 4px;
+            }
+            QScrollBar::groove:horizontal {
+                background: rgba(0, 0, 0, 0.06);
+                border-radius: 6px;
+            }
+            QScrollBar::handle:horizontal {
+                background: rgba(0, 0, 0, 0.24);
+                border-radius: 6px;
+                min-width: 36px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: rgba(0, 0, 0, 0.34);
+            }
+            QScrollBar::handle:horizontal:pressed {
+                background: rgba(0, 0, 0, 0.44);
+            }
+            QScrollBar::add-line,
+            QScrollBar::sub-line,
+            QScrollBar::add-page,
+            QScrollBar::sub-page {
+                background: transparent;
+                border: none;
+                width: 0px;
+                height: 0px;
+            }
+
             /* ---------- ComboBox popup (dropdown list) ---------- */
             QComboBox QAbstractItemView {
                 border: 0px;
@@ -320,6 +422,13 @@ def apply_theme(app: QApplication, mode: str) -> None:
             update_all_custom_comboboxes("light")
         except Exception:
             pass
+
+    try:
+        from .ui_overlay_scrollbars import install_overlay_scrollbars
+
+        install_overlay_scrollbars(app, mode)
+    except Exception:
+        pass
 
 
 def style_combobox_popup(combo: QComboBox, mode: str, arrow_path: str | None = None) -> None:

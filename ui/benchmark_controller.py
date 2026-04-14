@@ -12,6 +12,7 @@ from typing import Optional
 
 from PySide6.QtCore import QProcess, QTimer, QItemSelectionModel, Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QTreeView,
     QFileSystemModel,
     QMessageBox,
@@ -33,6 +34,7 @@ from ui.graph_preview.graph_plot_helpers import extract_unit_from_column, get_me
 from ui.graph_preview.legend_popup_helpers import raise_center_and_focus
 from ui.graph_preview.ui_compare_popup import ComparePopup
 from ui.graph_preview.ui_dim_overlay import DimOverlay
+from ui.widgets.ui_theme import resolve_effective_theme_mode
 
 _RUN_FOLDER_RE = re.compile(
     r"^(?:"
@@ -273,34 +275,11 @@ class BenchmarkController:
         if self._compare_restoring:
             return
 
-        sm = None
         try:
-            sm = self._runs_tree.selectionModel()
+            if hasattr(self._runs_model, "set_compare_selected_dirs"):
+                self._runs_model.set_compare_selected_dirs([str(p) for p in (self._compare_selected_dirs or set())])
         except Exception:
-            sm = None
-        if sm is None:
-            return
-
-        self._compare_restoring = True
-        try:
-            try:
-                sm.clearSelection()
-            except Exception:
-                try:
-                    sm.clear()
-                except Exception:
-                    pass
-
-            for run_dir in sorted(self._compare_selected_dirs, key=lambda p: p.name):
-                idx = self._path_to_proxy_index(str(run_dir))
-                if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
-                    continue
-                try:
-                    sm.select(idx, QItemSelectionModel.Select | QItemSelectionModel.Rows)
-                except Exception:
-                    pass
-        finally:
-            self._compare_restoring = False
+            pass
 
     def _update_compare_btn_state(self) -> None:
         try:
@@ -652,6 +631,11 @@ class BenchmarkController:
                 self._compare_selected_dirs.clear()
             except Exception:
                 self._compare_selected_dirs = set()
+            try:
+                if hasattr(self._runs_model, "set_compare_selected_dirs"):
+                    self._runs_model.set_compare_selected_dirs([])
+            except Exception:
+                pass
             self._update_compare_btn_state()
 
             # Select and preview the new compare run
@@ -979,8 +963,16 @@ class BenchmarkController:
         confirm_text: str = "Delete",
         cancel_text: str = "Cancel",
     ) -> bool:
-        """Frameless dark confirmation dialog (matches rename styling) + dim overlay."""
+        """Frameless themed confirmation dialog + dim overlay."""
         try:
+            try:
+                theme_mode = str(getattr(self.parent, "theme_mode", "device") or "device")
+            except Exception:
+                theme_mode = "device"
+
+            effective_mode = resolve_effective_theme_mode(theme_mode, QApplication.instance())
+            is_light = effective_mode == "light"
+
             dlg = QDialog(self.parent)
             try:
                 dlg.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
@@ -1057,30 +1049,60 @@ class BenchmarkController:
 
             try:
                 dlg.setStyleSheet(
-                    """
-                    QDialog {
-                        background-color: #151515;
-                        border: 1px solid rgba(128, 128, 128, 0.35);
-                        border-radius: 10px;
-                    }
-                    QLabel { color: #EAEAEA; }
-                    QTextEdit {
-                        background-color: #0F0F0F;
-                        color: #EAEAEA;
-                        border: 1px solid rgba(128, 128, 128, 0.35);
-                        border-radius: 8px;
-                        padding: 8px 10px;
-                    }
-                    QPushButton {
-                        background: #252525;
-                        border: 1px solid rgba(128, 128, 128, 0.35);
-                        color: #EAEAEA;
-                        padding: 6px 16px;
-                        border-radius: 8px;
-                    }
-                    QPushButton:hover { background: #2E2E2E; }
-                    QPushButton:pressed { background: #1F1F1F; }
-                    """
+                    (
+                        """
+                        QDialog {
+                            background-color: #FFFFFF;
+                            border: 1px solid #D0D0D0;
+                            border-radius: 10px;
+                        }
+                        QLabel { color: #1A1A1A; }
+                        QTextEdit {
+                            background-color: #FFFFFF;
+                            color: #1A1A1A;
+                            border: 1px solid #D0D0D0;
+                            border-radius: 8px;
+                            padding: 8px 10px;
+                            selection-background-color: #CFE4FF;
+                            selection-color: #1A1A1A;
+                        }
+                        QPushButton {
+                            background: #FFFFFF;
+                            border: 1px solid #D0D0D0;
+                            color: #1A1A1A;
+                            padding: 6px 16px;
+                            border-radius: 8px;
+                        }
+                        QPushButton:hover { background: #F0F0F0; }
+                        QPushButton:pressed { background: #E6E6E6; }
+                        """
+                        if is_light
+                        else
+                        """
+                        QDialog {
+                            background-color: #151515;
+                            border: 1px solid rgba(128, 128, 128, 0.35);
+                            border-radius: 10px;
+                        }
+                        QLabel { color: #EAEAEA; }
+                        QTextEdit {
+                            background-color: #0F0F0F;
+                            color: #EAEAEA;
+                            border: 1px solid rgba(128, 128, 128, 0.35);
+                            border-radius: 8px;
+                            padding: 8px 10px;
+                        }
+                        QPushButton {
+                            background: #252525;
+                            border: 1px solid rgba(128, 128, 128, 0.35);
+                            color: #EAEAEA;
+                            padding: 6px 16px;
+                            border-radius: 8px;
+                        }
+                        QPushButton:hover { background: #2E2E2E; }
+                        QPushButton:pressed { background: #1F1F1F; }
+                        """
+                    )
                 )
             except Exception:
                 pass
@@ -1233,6 +1255,11 @@ class BenchmarkController:
         try:
             if current is None or (hasattr(current, "isValid") and not current.isValid()):
                 try:
+                    if hasattr(self._runs_model, "set_preview_current_dir"):
+                        self._runs_model.set_preview_current_dir(None)
+                except Exception:
+                    pass
+                try:
                     if hasattr(self._runs_model, "clear_compare_highlights"):
                         self._runs_model.clear_compare_highlights()
                 except Exception:
@@ -1250,6 +1277,12 @@ class BenchmarkController:
             fpath = self._idx_to_path(current)
             if not fpath:
                 return
+
+            try:
+                if hasattr(self._runs_model, "set_preview_current_dir"):
+                    self._runs_model.set_preview_current_dir(fpath)
+            except Exception:
+                pass
 
             p = Path(fpath)
             self._last_selected_path = p
@@ -1279,6 +1312,11 @@ class BenchmarkController:
                         self._compare_selected_dirs.clear()
                     except Exception:
                         self._compare_selected_dirs = set()
+                    try:
+                        if hasattr(self._runs_model, "set_compare_selected_dirs"):
+                            self._runs_model.set_compare_selected_dirs([])
+                    except Exception:
+                        pass
                     self._update_compare_btn_state()
             except Exception:
                 pass
@@ -1414,11 +1452,11 @@ class BenchmarkController:
         try:
             self._update_remove_btn_state()
 
-            # Keep compare-selection highlights stable even if a normal click clears selection.
-            if self._compare_selected_dirs and (not self._compare_restoring):
-                sel_dirs = self._selected_run_folders()
-                if sel_dirs != self._compare_selected_dirs:
-                    self._apply_compare_selection_to_view()
+            try:
+                if hasattr(self._runs_model, "set_compare_selected_dirs"):
+                    self._runs_model.set_compare_selected_dirs([str(p) for p in (self._compare_selected_dirs or set())])
+            except Exception:
+                pass
 
             self._update_compare_btn_state()
         except Exception:
@@ -1427,6 +1465,80 @@ class BenchmarkController:
     def remove_selected_result(self) -> None:
         """Backward-compatible entrypoint: removes all selected results."""
         self.remove_selected_results()
+
+    def _release_preview_for_delete_targets(self, targets: list[Path]) -> None:
+        """Release preview/selection state if any delete target is currently previewed or selected."""
+        try:
+            normalized: list[Path] = []
+            for p in (targets or []):
+                try:
+                    normalized.append(p.resolve())
+                except Exception:
+                    normalized.append(Path(p))
+
+            preview_path = None
+            try:
+                preview_raw = str(getattr(self._graph_preview, "_current_preview_path", "") or "")
+                if preview_raw:
+                    preview_path = Path(preview_raw).resolve()
+            except Exception:
+                preview_path = None
+
+            current_path = None
+            try:
+                idx = self._runs_tree.currentIndex() if self._runs_tree is not None else None
+                current_raw = self._idx_to_path(idx) if idx is not None else ""
+                if current_raw:
+                    current_path = Path(current_raw).resolve()
+            except Exception:
+                current_path = None
+
+            needs_release = False
+            for target in normalized:
+                try:
+                    if preview_path is not None and (preview_path == target or target in preview_path.parents):
+                        needs_release = True
+                        break
+                except Exception:
+                    pass
+                try:
+                    if current_path is not None and (current_path == target or target in current_path.parents):
+                        needs_release = True
+                        break
+                except Exception:
+                    pass
+
+            if not needs_release:
+                return
+
+            try:
+                if self._preview_debounce_timer is not None:
+                    self._preview_debounce_timer.stop()
+            except Exception:
+                pass
+            self._pending_preview_target = None
+            self._pending_preview_is_dir = False
+
+            try:
+                if self._graph_preview is not None and hasattr(self._graph_preview, "release_preview"):
+                    self._graph_preview.release_preview()
+            except Exception:
+                pass
+
+            try:
+                sm = self._runs_tree.selectionModel() if self._runs_tree is not None else None
+                if sm is not None:
+                    sm.clearSelection()
+                    sm.clearCurrentIndex()
+            except Exception:
+                pass
+
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def remove_selected_tree_items(self) -> None:
         """Delete selected files/folders from the Results tree.
@@ -1444,6 +1556,14 @@ class BenchmarkController:
                 rows = sm.selectedRows(0)
             except Exception:
                 rows = [i for i in sm.selectedIndexes() if getattr(i, "column", lambda: 0)() == 0]
+
+            if not rows:
+                try:
+                    cur = self._runs_tree.currentIndex()
+                    if cur is not None and (not hasattr(cur, "isValid") or cur.isValid()):
+                        rows = [cur]
+                except Exception:
+                    rows = []
 
             targets: list[Path] = []
             for idx in rows:
@@ -1524,6 +1644,8 @@ class BenchmarkController:
                 cancel_text="Cancel",
             ):
                 return
+
+            self._release_preview_for_delete_targets(final)
 
             def _is_empty_dir(p: Path) -> bool:
                 try:
@@ -1648,6 +1770,8 @@ class BenchmarkController:
             cancel_text="Cancel",
         ):
             return
+
+        self._release_preview_for_delete_targets(run_dirs)
 
         def _is_empty_dir(p: Path) -> bool:
             try:
@@ -1803,7 +1927,7 @@ class BenchmarkController:
                 self._runs_tree.scrollTo(idx)
                 sm = self._runs_tree.selectionModel()
                 if sm is not None:
-                    sm.select(idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Select)
+                    sm.select(idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
             finally:
                 self._suppress_selection_preview = False
 

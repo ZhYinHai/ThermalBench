@@ -10,12 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QPropertyAnimation, QTimer, Qt, Signal, QEasingCurve
 from PySide6.QtGui import QColor, QBrush, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
     QApplication,
+    QGraphicsOpacityEffect,
+    QScrollBar,
     QTreeWidget,
     QTreeWidgetItem,
     QHeaderView,
@@ -101,6 +103,8 @@ class LiveMonitorWidget(QFrame):
         self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tree.setFrameShape(QFrame.NoFrame)
         self.tree.setLineWidth(0)
+        self.tree.setMouseTracking(True)
+        self.tree.viewport().setMouseTracking(True)
 
         hdr = self.tree.header()
         hdr.setSectionsClickable(False)
@@ -112,6 +116,28 @@ class LiveMonitorWidget(QFrame):
 
         self.tree.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.tree.setProperty("_tb_overlay_scrollbars_disabled", True)
+        self.tree.installEventFilter(self)
+        self.tree.viewport().installEventFilter(self)
+
+        self._overlay_vscroll = QScrollBar(Qt.Vertical, self.tree.viewport())
+        self._overlay_vscroll.setObjectName("LiveMonitorOverlayVScroll")
+        self._overlay_vscroll.hide()
+        self._overlay_vscroll.raise_()
+        self._overlay_vscroll.installEventFilter(self)
+        self._overlay_vscroll_effect = QGraphicsOpacityEffect(self._overlay_vscroll)
+        self._overlay_vscroll_effect.setOpacity(0.0)
+        self._overlay_vscroll.setGraphicsEffect(self._overlay_vscroll_effect)
+        self._overlay_vscroll_anim = QPropertyAnimation(self._overlay_vscroll_effect, b"opacity", self)
+        self._overlay_vscroll_anim.setDuration(2000)
+        self._overlay_vscroll_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._overlay_vscroll_anim.finished.connect(self._finish_overlay_fade)
+        self._overlay_vscroll_hide_pending = False
+
+        internal_vscroll = self.tree.verticalScrollBar()
+        internal_vscroll.rangeChanged.connect(self._sync_overlay_scrollbar)
+        internal_vscroll.valueChanged.connect(self._sync_overlay_scrollbar)
+        self._overlay_vscroll.valueChanged.connect(self._on_overlay_scroll)
 
         try:
             self.tree.itemClicked.connect(self._on_item_clicked)
@@ -155,10 +181,7 @@ class LiveMonitorWidget(QFrame):
             pass
 
         try:
-            if self._columns:
-                self.tree.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-            else:
-                self.tree.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self._sync_overlay_scrollbar()
         except Exception:
             pass
 
@@ -183,6 +206,92 @@ class LiveMonitorWidget(QFrame):
 
         # If we found temperature sensors, default to those; otherwise keep all.
         return temp_cols if temp_cols else cols
+
+    def eventFilter(self, watched, event):
+        try:
+            if watched in (self.tree, self.tree.viewport(), self._overlay_vscroll):
+                et = event.type()
+                if et == QEvent.Resize:
+                    self._position_overlay_scrollbar()
+                elif et in (QEvent.Enter, QEvent.HoverEnter):
+                    self._set_overlay_scrollbar_visible(True)
+                elif et in (QEvent.Leave, QEvent.HoverLeave):
+                    if not self.tree.viewport().underMouse() and not self._overlay_vscroll.underMouse():
+                        self._set_overlay_scrollbar_visible(False)
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
+
+    def _on_overlay_scroll(self, value: int) -> None:
+        try:
+            internal_vscroll = self.tree.verticalScrollBar()
+            if internal_vscroll.value() != value:
+                internal_vscroll.setValue(value)
+        except Exception:
+            pass
+
+    def _sync_overlay_scrollbar(self, *_args) -> None:
+        try:
+            internal_vscroll = self.tree.verticalScrollBar()
+            self._overlay_vscroll.blockSignals(True)
+            self._overlay_vscroll.setRange(internal_vscroll.minimum(), internal_vscroll.maximum())
+            self._overlay_vscroll.setPageStep(internal_vscroll.pageStep())
+            self._overlay_vscroll.setSingleStep(internal_vscroll.singleStep())
+            self._overlay_vscroll.setValue(internal_vscroll.value())
+            self._overlay_vscroll.blockSignals(False)
+            self._position_overlay_scrollbar()
+            self._set_overlay_scrollbar_visible(self.tree.viewport().underMouse() or self._overlay_vscroll.underMouse())
+        except Exception:
+            pass
+
+    def _set_overlay_scrollbar_visible(self, visible: bool) -> None:
+        try:
+            should_show = bool(visible and self._overlay_vscroll.maximum() > self._overlay_vscroll.minimum())
+
+            if should_show:
+                self._overlay_vscroll_hide_pending = False
+                self._overlay_vscroll_anim.stop()
+                self._overlay_vscroll_effect.setOpacity(1.0)
+                self._overlay_vscroll.show()
+                self._overlay_vscroll.raise_()
+                return
+
+            if not self._overlay_vscroll.isVisible():
+                self._overlay_vscroll_effect.setOpacity(0.0)
+                return
+
+            if self._overlay_vscroll_hide_pending:
+                return
+
+            self._overlay_vscroll_hide_pending = True
+            self._overlay_vscroll_anim.stop()
+            self._overlay_vscroll_anim.setStartValue(self._overlay_vscroll_effect.opacity())
+            self._overlay_vscroll_anim.setEndValue(0.0)
+            self._overlay_vscroll_anim.start()
+        except Exception:
+            pass
+
+    def _finish_overlay_fade(self) -> None:
+        try:
+            if self._overlay_vscroll_hide_pending:
+                self._overlay_vscroll_hide_pending = False
+                self._overlay_vscroll_effect.setOpacity(0.0)
+                self._overlay_vscroll.hide()
+        except Exception:
+            pass
+
+    def _position_overlay_scrollbar(self) -> None:
+        try:
+            viewport = self.tree.viewport()
+            if viewport is None:
+                return
+            width = 12
+            margin = 2
+            height = max(0, viewport.height() - (margin * 2))
+            x = max(0, viewport.width() - width - margin)
+            self._overlay_vscroll.setGeometry(x, margin, width, height)
+        except Exception:
+            pass
 
     def set_ambient_csv(self, path: str) -> None:
         """Provide ambient logger CSV path for live ambient stats/plotting."""
@@ -416,6 +525,36 @@ class LiveMonitorWidget(QFrame):
                 QTreeWidget::item:hover {{ background: {colors['hover']}; }}
                 QTreeWidget::item:selected, QTreeWidget::item:selected:hover {{ background: transparent; }}
 
+                QScrollBar#LiveMonitorOverlayVScroll {{
+                    background: transparent;
+                    width: 12px;
+                    margin: 4px 2px 4px 2px;
+                    border: none;
+                }}
+                QScrollBar#LiveMonitorOverlayVScroll::groove:vertical {{
+                    background: {('rgba(255, 255, 255, 0.05)' if self._theme_is_dark else 'rgba(0, 0, 0, 0.06)')};
+                    border-radius: 6px;
+                }}
+                QScrollBar#LiveMonitorOverlayVScroll::handle:vertical {{
+                    background: {('rgba(255, 255, 255, 0.22)' if self._theme_is_dark else 'rgba(0, 0, 0, 0.24)')};
+                    border-radius: 6px;
+                    min-height: 36px;
+                }}
+                QScrollBar#LiveMonitorOverlayVScroll::handle:vertical:hover {{
+                    background: {('rgba(255, 255, 255, 0.34)' if self._theme_is_dark else 'rgba(0, 0, 0, 0.34)')};
+                }}
+                QScrollBar#LiveMonitorOverlayVScroll::handle:vertical:pressed {{
+                    background: {('rgba(255, 255, 255, 0.44)' if self._theme_is_dark else 'rgba(0, 0, 0, 0.44)')};
+                }}
+                QScrollBar#LiveMonitorOverlayVScroll::add-line:vertical,
+                QScrollBar#LiveMonitorOverlayVScroll::sub-line:vertical,
+                QScrollBar#LiveMonitorOverlayVScroll::add-page:vertical,
+                QScrollBar#LiveMonitorOverlayVScroll::sub-page:vertical {{
+                    background: transparent;
+                    border: none;
+                    height: 0px;
+                }}
+
                 QHeaderView {{ background: {colors['header_bg']}; }}
                 QHeaderView::section {{
                     background: transparent;
@@ -447,6 +586,8 @@ class LiveMonitorWidget(QFrame):
             try:
                 self.tree.viewport().update()
                 self.tree.header().viewport().update()
+                self._position_overlay_scrollbar()
+                self._sync_overlay_scrollbar()
                 self.update()
             except Exception:
                 pass
@@ -703,10 +844,9 @@ class LiveMonitorWidget(QFrame):
                                 ts_obj = datetime.strptime(dt_s, fmt)
                                 break
                             except Exception:
-                                continue
+                                pass
             except Exception:
-                ts_obj = None
-
+                pass
             # Update stats from this single row
             updated_any = False
             sample_vals: dict[str, float] = {}

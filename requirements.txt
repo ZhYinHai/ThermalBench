@@ -1,6 +1,7 @@
 PySide6
 pandas
 matplotlib
+psutil
 pyinstaller
 requests
 packaging

@@ -19,8 +19,11 @@ def preview_apply_axes_rect(gp: Any, right_frac: float, left_margin_px: float) -
             return
 
         left = float(left_margin_px) / fig_w_px
-        top = float(gp._preview_top_frac)
-        bottom = float(gp._preview_bottom_frac)
+        try:
+            top, bottom = gp._preview_effective_vertical_fracs()
+        except Exception:
+            top = float(gp._preview_top_frac)
+            bottom = float(gp._preview_bottom_frac)
 
         left = max(0.0, min(left, 0.95))
         right = max(left + 0.05, min(float(right_frac), 0.995))
@@ -76,8 +79,13 @@ def preview_relayout_and_redraw(gp: Any) -> None:
         if renderer is None:
             return
 
-        left_px = gp._preview_required_left_margin_px(renderer, pad_px=8)
-        gp._preview_apply_axes_rect(right_frac=0.985, left_margin_px=left_px)
+        left_pad_px = int(getattr(gp, "_preview_left_tick_pad_px", 3) or 3)
+        try:
+            right_frac = float(gp._preview_effective_right_frac())
+        except Exception:
+            right_frac = float(getattr(gp, "_preview_right_frac", 0.995) or 0.995)
+        left_px = gp._preview_required_left_margin_px(renderer, pad_px=left_pad_px)
+        gp._preview_apply_axes_rect(right_frac=right_frac, left_margin_px=left_px)
 
         gp._preview_invalidate_interaction_cache()
         gp._preview_canvas.draw()

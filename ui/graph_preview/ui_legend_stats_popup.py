@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.graph_preview.graph_plot_helpers import group_columns_by_unit, get_measurement_type_label
+from ui.widgets.ui_rounding import apply_rounded_corners
 from ui.widgets.ui_theme import resolve_effective_theme_mode
 
 
@@ -57,6 +58,7 @@ class LegendStatsPopup(QDialog):
         self.setWindowFlag(Qt.Tool, True)
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.setModal(False)
+        apply_rounded_corners(self, 10)
 
         self._on_close = on_close
 
@@ -377,19 +379,19 @@ class LegendStatsPopup(QDialog):
 
             QTreeWidget QScrollBar:vertical {{
                 background: transparent;
-                width: 8px;
-                margin: 0px;
+                width: 12px;
+                margin: 4px 2px 4px 2px;
             }}
 
             QTreeWidget QScrollBar::groove:vertical {{
-                background: transparent;
-                border-radius: 4px;
+                background: {self._theme['scroll_groove']};
+                border-radius: 6px;
             }}
 
             QTreeWidget QScrollBar::handle:vertical {{
-                background: transparent;
-                border-radius: 4px;
-                min-height: 28px;
+                background: {self._theme['scroll_handle']};
+                border-radius: 6px;
+                min-height: 36px;
             }}
 
             QTreeWidget QScrollBar::add-line:vertical,
