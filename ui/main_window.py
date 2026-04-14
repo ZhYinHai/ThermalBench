@@ -1636,10 +1636,44 @@ class MainWindow(QWidget):
         try:
             self._refresh_left_rail_icons()
             if index == getattr(self, "_page_results_index", -1):
-                # Apply splitter ratio synchronously (cheap), then defer
-                # the heavier select+plot to the next event-loop tick so
-                # the page switch paints immediately.
                 self._apply_results_split_ratio()
+                # Show header text instantly so it appears in the first
+                # painted frame.  Avoid touching the canvas — that would
+                # trigger a heavyweight matplotlib repaint.
+                try:
+                    gp = self.graph
+                    has_content = bool(
+                        gp._preview_csv_path
+                        or getattr(gp, "_compare_mode", False)
+                    )
+                    # First launch: nothing plotted yet, but the prescan
+                    # already cached the latest folder — derive header text
+                    # from it so we can show it immediately.
+                    if not has_content:
+                        folder = getattr(self.benchmark, "_latest_cached_folder", None)
+                        if folder is not None:
+                            from ui.graph_preview.preview_path_helpers import choose_preview_file_for_folder
+                            pick = choose_preview_file_for_folder(str(folder))
+                            if pick is not None:
+                                from pathlib import Path as _P
+                                gp._set_preview_header_path(_P(pick))
+                                has_content = True
+                    if has_content:
+                        hw = getattr(gp, "_preview_header_widget", None)
+                        if hw is not None:
+                            hw.setVisible(True)
+                        tl = getattr(gp, "_preview_header_title_label", None)
+                        if tl is not None:
+                            tl.setVisible(bool(getattr(gp, "_preview_header_title_text", "")))
+                        sl = getattr(gp, "_preview_header_subtitle_label", None)
+                        if sl is not None:
+                            sl.setVisible(bool(getattr(gp, "_preview_header_subtitle_text", "")))
+                        sep = getattr(gp, "_preview_header_separator", None)
+                        if sep is not None:
+                            sep.setVisible(True)
+                except Exception:
+                    pass
+                # Defer the heavier canvas relayout to the next tick.
                 QTimer.singleShot(0, self.benchmark.select_latest_result)
         except Exception:
             pass

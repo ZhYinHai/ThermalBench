@@ -2190,7 +2190,7 @@ class GraphPreview(QObject):
                     except Exception:
                         pass
                     self._sync_preview_header_controls()
-                    QTimer.singleShot(0, self._preview_relayout_and_redraw)
+                    self._preview_relayout_and_redraw()
                     return
                 self._exit_compare_mode()
                 self._plot_run_csv(str(p))
@@ -2255,7 +2255,7 @@ class GraphPreview(QObject):
                         except Exception:
                             pass
                         self._sync_preview_header_controls()
-                        QTimer.singleShot(0, self._preview_relayout_and_redraw)
+                        self._preview_relayout_and_redraw()
                         return
                     self._set_preview_header_path(mp)
                     self._plot_compare_manifest(mp)
