@@ -40,8 +40,10 @@ _RUN_FOLDER_RE = re.compile(
     r"^(?:"
     r"\d{8}_\d{6}"
     r"|(?:CPU|GPU|CPUGPU)_W\d+_L\d+_V\d+"
-    # Compare result folders (created by GUI): "<case> CPU vs <case> CPUGPU" (+ optional suffix)
-    r"|.+\s(?:CPU|GPU|CPUGPU)\svs\s.+\s(?:CPU|GPU|CPUGPU)(?:\s\+\d+)?"
+    # Compare result run folders (created by GUI):
+    # "<case> CPU vs <case> GPU" or "<case> CPU vs <case> GPU vs <case> CPUGPU"
+    # with an optional collision suffix appended to the final full name.
+    r"|.+\s(?:CPU|GPU|CPUGPU)(?:\svs\s.+\s(?:CPU|GPU|CPUGPU))+(?:\s\+\d+)?"
     r")$",
     re.IGNORECASE,
 )
@@ -281,14 +283,31 @@ class BenchmarkController:
         except Exception:
             pass
 
+    def _valid_compare_input_dirs(self) -> list[Path]:
+        try:
+            out: list[Path] = []
+            for run_dir in list(sorted(self._compare_selected_dirs or set(), key=lambda p: p.name)):
+                try:
+                    rd = Path(run_dir)
+                except Exception:
+                    continue
+                if not rd.exists() or not rd.is_dir():
+                    continue
+                if self._is_compare_result_dir(rd):
+                    continue
+                if not (rd / "run_window.csv").is_file():
+                    continue
+                out.append(rd)
+            return out
+        except Exception:
+            return []
+
     def _update_compare_btn_state(self) -> None:
         try:
             if self._compare_btn is None:
                 return
 
-            # Guard: don't allow comparing already-compared results.
-            # Compare-result folders are created by this app and contain compare_manifest.json.
-            valid = [p for p in (self._compare_selected_dirs or set()) if not self._is_compare_result_dir(p)]
+            valid = self._valid_compare_input_dirs()
             self._compare_btn.setEnabled(len(valid) >= 2)
         except Exception:
             pass
@@ -442,17 +461,13 @@ class BenchmarkController:
     def compare_selected_results(self) -> None:
         """Show sensors that exist in ALL compare-selected results."""
         try:
-            if len(self._compare_selected_dirs) < 2:
+            run_dirs = self._valid_compare_input_dirs()
+            if len(run_dirs) < 2:
                 return
-
-            run_dirs = list(sorted(self._compare_selected_dirs, key=lambda p: p.name))
 
             sensor_sets: list[set[str]] = []
             for rd in run_dirs:
                 csvp = rd / "run_window.csv"
-                if not csvp.exists():
-                    sensor_sets.append(set())
-                    continue
                 try:
                     _df, cols = load_run_csv_dataframe(str(csvp))
                     sensor_sets.append(set(cols or []))
@@ -485,6 +500,7 @@ class BenchmarkController:
                 group_map=group_map,
                 on_close=self._close_compare_popup,
                 on_compare=self._create_compare_result_from_popup,
+                theme_mode=str(getattr(self.parent, "theme_mode", "device") or "device"),
             )
 
             self._compare_popup.show()
@@ -521,7 +537,7 @@ class BenchmarkController:
             except Exception:
                 sensors = self._sort_sensors_for_compare(sensors)
 
-            run_dirs = list(sorted(self._compare_selected_dirs, key=lambda p: p.name))
+            run_dirs = self._valid_compare_input_dirs()
             if len(run_dirs) < 2:
                 return
 
@@ -557,7 +573,22 @@ class BenchmarkController:
 
                 return "CPU"
 
-            def _compare_run_dir_name(rd_a: Path, rd_b: Path) -> str:
+            def _compare_case_dir_display_name(run_dirs_for_name: list[Path]) -> str:
+                parts: list[str] = []
+                for rd in run_dirs_for_name:
+                    case = _case_label(rd) or rd.name
+                    parts.append(str(case).strip())
+                return " vs ".join([p for p in parts if p])
+
+            def _compare_run_dir_display_name(run_dirs_for_name: list[Path]) -> str:
+                parts: list[str] = []
+                for rd in run_dirs_for_name:
+                    case = _case_label(rd)
+                    stress = _stress_label(rd)
+                    parts.append(f"{case} {stress}".strip() if case else stress)
+                return " vs ".join([p for p in parts if p])
+
+            def _compare_run_dir_fs_name(rd_a: Path, rd_b: Path) -> str:
                 a_case = _case_label(rd_a)
                 b_case = _case_label(rd_b)
                 a_stress = _stress_label(rd_a)
@@ -565,6 +596,9 @@ class BenchmarkController:
                 left = f"{a_case} {a_stress}".strip() if a_case else a_stress
                 right = f"{b_case} {b_stress}".strip() if b_case else b_stress
                 return f"{left} vs {right}"
+
+            display_case_name = _compare_case_dir_display_name(run_dirs)
+            display_run_name = _compare_run_dir_display_name(run_dirs)
 
             case_a = _case_label(run_dirs[0]) or run_dirs[0].name
             case_b = _case_label(run_dirs[1]) or run_dirs[1].name
@@ -576,7 +610,7 @@ class BenchmarkController:
             out_case_dir = (self._runs_root / case_name)
             out_case_dir.mkdir(parents=True, exist_ok=True)
 
-            base_run_name = _compare_run_dir_name(run_dirs[0], run_dirs[1])
+            base_run_name = _compare_run_dir_fs_name(run_dirs[0], run_dirs[1])
             if len(run_dirs) != 2:
                 base_run_name = f"{base_run_name} +{len(run_dirs) - 2}"
 
@@ -606,6 +640,8 @@ class BenchmarkController:
                 "type": "compare",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "trim": "elapsed_duration_shortest",
+                "display_case_name": display_case_name,
+                "display_run_name": display_run_name,
                 "runs": runs_rel,
                 "sensors": sensors,
             }

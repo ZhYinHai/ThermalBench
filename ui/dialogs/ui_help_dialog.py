@@ -574,7 +574,7 @@ class HelpDialog(QDialog):
                     "Open Settings from the left rail.",
                     "Set the FurMark executable path.",
                     "Set the Prime95 executable path.",
-                    "Optionally configure your ntfy topic or full ntfy URL.",
+                    "Optionally configure your ntfy topic or full ntfy URL, to receive notifications when runs finish or if errors occur.",
                     "Close the dialog to save the updated values.",
                 ],
                 "note": "If the Run button remains disabled, verify that the required stress tool paths are filled in Settings.",

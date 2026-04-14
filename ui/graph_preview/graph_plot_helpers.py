@@ -361,6 +361,30 @@ def trim_dataframes_to_shortest_duration(dfs: list[pd.DataFrame]) -> list[pd.Dat
     if not non_empty:
         return [df for df in dfs]
 
+    def _trim_by_row_count() -> list[pd.DataFrame]:
+        min_len = None
+        for df in non_empty:
+            try:
+                ln = int(len(df))
+            except Exception:
+                continue
+            if min_len is None or ln < min_len:
+                min_len = ln
+
+        if not min_len:
+            return [df for df in dfs]
+
+        out_rows: list[pd.DataFrame] = []
+        for df in dfs:
+            if df is None or df.empty:
+                out_rows.append(df)
+                continue
+            try:
+                out_rows.append(df.iloc[:min_len].copy())
+            except Exception:
+                out_rows.append(df)
+        return out_rows
+
     all_dt = all(getattr(df.index, "dtype", None) is not None and df.index.dtype.kind == "M" for df in non_empty)
 
     if all_dt:
@@ -375,6 +399,12 @@ def trim_dataframes_to_shortest_duration(dfs: list[pd.DataFrame]) -> list[pd.Dat
             return [df for df in dfs]
 
         min_duration = min(durations)
+        try:
+            if getattr(min_duration, "total_seconds", lambda: 0.0)() <= 0.0:
+                return _trim_by_row_count()
+        except Exception:
+            pass
+
         out: list[pd.DataFrame] = []
         for df in dfs:
             if df is None or df.empty:
@@ -386,28 +416,17 @@ def trim_dataframes_to_shortest_duration(dfs: list[pd.DataFrame]) -> list[pd.Dat
                 out.append(df.loc[df.index <= end])
             except Exception:
                 out.append(df)
+
+        try:
+            trimmed_non_empty = [df for df in out if df is not None and not df.empty]
+            if trimmed_non_empty:
+                trimmed_min_len = min(int(len(df)) for df in trimmed_non_empty)
+                original_min_len = min(int(len(df)) for df in non_empty)
+                if trimmed_min_len < 2 <= original_min_len:
+                    return _trim_by_row_count()
+        except Exception:
+            pass
         return out
 
     # Fallback: trim by number of rows (works for RangeIndex and mixed indices)
-    min_len = None
-    for df in non_empty:
-        try:
-            ln = int(len(df))
-        except Exception:
-            continue
-        if min_len is None or ln < min_len:
-            min_len = ln
-
-    if not min_len:
-        return [df for df in dfs]
-
-    out2: list[pd.DataFrame] = []
-    for df in dfs:
-        if df is None or df.empty:
-            out2.append(df)
-            continue
-        try:
-            out2.append(df.iloc[:min_len].copy())
-        except Exception:
-            out2.append(df)
-    return out2
+    return _trim_by_row_count()

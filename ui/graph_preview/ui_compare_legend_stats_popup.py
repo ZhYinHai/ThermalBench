@@ -338,9 +338,10 @@ class CompareLegendStatsPopup(QDialog):
         except Exception:
             pass
 
-        # Keep header horizontally aligned with table scroll.
+        # Keep the custom header moving with the table body so the popup has
+        # a single effective horizontal scroll surface.
         try:
-            tree.horizontalScrollBar().valueChanged.connect(hdr_sc.horizontalScrollBar().setValue)
+            tree.horizontalScrollBar().valueChanged.connect(lambda *_: self._sync_header_scroll(tree))
         except Exception:
             pass
 
@@ -366,6 +367,7 @@ class CompareLegendStatsPopup(QDialog):
         QTimer.singleShot(0, lambda: self._update_header_widths(tree))
         QTimer.singleShot(0, lambda: self._update_header_scrollbar_spacer(tree))
         QTimer.singleShot(0, lambda: self._fit_columns_if_needed(tree))
+        QTimer.singleShot(0, lambda: self._sync_header_scroll(tree))
         QTimer.singleShot(0, self._update_table_separators)
 
     def closeEvent(self, event):
@@ -969,11 +971,7 @@ class CompareLegendStatsPopup(QDialog):
             except Exception:
                 pass
             try:
-                sc = getattr(self, "_hdr_sc", None)
-                if sc is not None:
-                    hhs = sc.horizontalScrollBar()
-                    if hhs is not None:
-                        hhs.setValue(0)
+                self._sync_header_scroll(tree)
             except Exception:
                 pass
         except Exception:
@@ -1840,7 +1838,31 @@ class CompareLegendStatsPopup(QDialog):
         except Exception:
             pass
 
-    def _build_combined_header(self, tree: QTreeWidget) -> QScrollArea:
+    def _sync_header_scroll(self, tree: QTreeWidget) -> None:
+        try:
+            frame = getattr(self, "_hdr_frame", None)
+            host = getattr(self, "_hdr_sc", None)
+            if frame is None or host is None or tree is None:
+                return
+
+            try:
+                offset = int(tree.horizontalScrollBar().value())
+            except Exception:
+                offset = 0
+
+            try:
+                frame.move(-int(offset), 0)
+            except Exception:
+                pass
+
+            try:
+                host.update()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _build_combined_header(self, tree: QTreeWidget) -> QWidget:
         """Build a two-row header widget aligned to the combined tree.
 
         Row 0: Run name spanning its 4 stat columns.
@@ -1848,17 +1870,17 @@ class CompareLegendStatsPopup(QDialog):
         """
         run_tables = list(self._run_tables or [])
 
-        sc = QScrollArea()
+        sc = QFrame()
         sc.setFrameShape(QFrame.NoFrame)
-        # IMPORTANT: keep content at its intrinsic width so horizontal scrolling
-        # matches the tree's horizontal scrolling.
-        sc.setWidgetResizable(False)
-        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        sc.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        try:
+            sc.setAttribute(Qt.WA_StyledBackground, True)
+            sc.setStyleSheet(f"background: {self._theme['header_bg']}; border: none;")
+        except Exception:
+            pass
 
-        frame = QFrame()
+        frame = QFrame(sc)
         frame.setFrameShape(QFrame.NoFrame)
-        sc.setWidget(frame)
         self._hdr_frame = frame
 
         from PySide6.QtWidgets import QGridLayout
@@ -1945,6 +1967,7 @@ class CompareLegendStatsPopup(QDialog):
         # Keep height compact and similar to QHeaderView.
         try:
             frame.setFixedHeight(64)
+            sc.setFixedHeight(64)
         except Exception:
             pass
 
@@ -2089,6 +2112,10 @@ class CompareLegendStatsPopup(QDialog):
                     fr.setFixedWidth(int(total_w))
             except Exception:
                 pass
+            try:
+                self._sync_header_scroll(tree)
+            except Exception:
+                pass
 
             # Prevent stat header row from getting clipped when run labels wrap.
             # Compute required header height from actual label size hints.
@@ -2157,6 +2184,7 @@ class CompareLegendStatsPopup(QDialog):
                 for tw in self.findChildren(QTreeWidget):
                     self._update_header_widths(tw)
                     self._update_header_scrollbar_spacer(tw)
+                    self._sync_header_scroll(tw)
             except Exception:
                 pass
         except Exception:

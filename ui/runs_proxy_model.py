@@ -11,8 +11,10 @@ _RUN_FOLDER_RE = re.compile(
     r"^(?:"
     r"\d{8}_\d{6}"
     r"|(?:CPU|GPU|CPUGPU)_W\d+_L\d+_V\d+"
-    # Compare result folders (created by GUI): "<case> CPU vs <case> CPUGPU" (+ optional suffix)
-    r"|.+\s(?:CPU|GPU|CPUGPU)\svs\s.+\s(?:CPU|GPU|CPUGPU)(?:\s*\+\d+)*"
+    # Compare result run folders (created by GUI):
+    # "<case> CPU vs <case> GPU" or "<case> CPU vs <case> GPU vs <case> CPUGPU"
+    # with an optional collision suffix appended to the final full name.
+    r"|.+\s(?:CPU|GPU|CPUGPU)(?:\svs\s.+\s(?:CPU|GPU|CPUGPU))+(?:\s\+\d+)?"
     r")$",
     re.IGNORECASE,
 )
@@ -36,6 +38,7 @@ class RunsProxyModel(QSortFilterProxyModel):
         self._compare_prefix = "↔ "
         # Cache signature -> bool. Keys are prefixed with "run:" or "case:".
         self._compare_dir_cache: dict[str, tuple[float, bool]] = {}
+        self._compare_display_name_cache: dict[str, tuple[float, str]] = {}
 
         # Compare-selection highlighting (enabled only while a compare result is selected)
         self._active_compare_dir_norm: str | None = None
@@ -411,10 +414,139 @@ class RunsProxyModel(QSortFilterProxyModel):
         """Public helper for delegates that want to draw a compare marker."""
         return str(self._compare_prefix or "")
 
+    @staticmethod
+    def _stress_label_for_run_name(run_name: str) -> str:
+        try:
+            m = re.match(r"^(CPU|GPU|CPUGPU)_W\d+_L\d+_V\d+$", str(run_name or ""), flags=re.IGNORECASE)
+            if m:
+                return str(m.group(1)).upper()
+        except Exception:
+            pass
+        return str(run_name or "").strip()
+
+    def _build_compare_display_names(self, manifest: dict) -> tuple[str, str]:
+        try:
+            case_name = str(manifest.get("display_case_name") or "").strip()
+            run_name = str(manifest.get("display_run_name") or "").strip()
+            if case_name and run_name:
+                return case_name, run_name
+
+            runs_rel = [str(r) for r in (manifest.get("runs") or []) if str(r).strip()]
+            case_parts: list[str] = []
+            run_parts: list[str] = []
+            for rel in runs_rel:
+                parts = [p for p in str(rel).replace("\\", "/").split("/") if p]
+                if len(parts) < 2:
+                    continue
+                case = str(parts[-2]).strip()
+                run = str(parts[-1]).strip()
+                if case:
+                    case_parts.append(case)
+                stress = self._stress_label_for_run_name(run)
+                run_parts.append(f"{case} {stress}".strip() if case else stress)
+
+            if not case_name:
+                case_name = " vs ".join([p for p in case_parts if p])
+            if not run_name:
+                run_name = " vs ".join([p for p in run_parts if p])
+            return case_name, run_name
+        except Exception:
+            return "", ""
+
+    def _compare_run_display_name(self, p: str) -> str:
+        try:
+            dp = Path(str(p or ""))
+            mp = dp / "compare_manifest.json"
+            if not mp.is_file():
+                return ""
+
+            key = f"run-name:{self._norm_path(str(dp))}"
+            try:
+                sig = float(mp.stat().st_mtime or 0.0)
+            except Exception:
+                sig = 0.0
+
+            cached = self._compare_display_name_cache.get(key)
+            if cached is not None and cached[0] == sig:
+                return str(cached[1] or "")
+
+            try:
+                manifest = json.loads(mp.read_text(encoding="utf-8"))
+            except Exception:
+                manifest = {}
+            _, run_name = self._build_compare_display_names(manifest)
+            self._compare_display_name_cache[key] = (sig, run_name)
+            return str(run_name or "")
+        except Exception:
+            return ""
+
+    def _compare_case_display_name(self, p: str) -> str:
+        try:
+            dp = Path(str(p or ""))
+            if not dp.is_dir():
+                return ""
+
+            key = f"case-name:{self._norm_path(str(dp))}"
+            best_sig = -1.0
+            cached = self._compare_display_name_cache.get(key)
+
+            manifests: list[Path] = []
+            try:
+                for ent in dp.iterdir():
+                    try:
+                        if ent.is_dir() and (ent / "compare_manifest.json").is_file():
+                            manifests.append(ent / "compare_manifest.json")
+                    except Exception:
+                        continue
+            except Exception:
+                manifests = []
+
+            for mp in manifests:
+                try:
+                    best_sig = max(best_sig, float(mp.stat().st_mtime or 0.0))
+                except Exception:
+                    best_sig = max(best_sig, 0.0)
+
+            if cached is not None and cached[0] == float(best_sig):
+                return str(cached[1] or "")
+
+            for mp in manifests:
+                try:
+                    manifest = json.loads(mp.read_text(encoding="utf-8"))
+                except Exception:
+                    manifest = {}
+                case_name, _ = self._build_compare_display_names(manifest)
+                if case_name:
+                    self._compare_display_name_cache[key] = (float(best_sig), case_name)
+                    return case_name
+
+            self._compare_display_name_cache[key] = (float(best_sig), "")
+            return ""
+        except Exception:
+            return ""
+
     # ---- icons off ----
     def data(self, index, role=Qt.DisplayRole):
         if role == Qt.DecorationRole:
             return None
+
+        try:
+            if role == Qt.DisplayRole and index is not None and index.isValid():
+                src = self.mapToSource(index)
+                sm = self.sourceModel()
+                if sm is not None and src.isValid() and hasattr(sm, "filePath") and hasattr(sm, "isDir"):
+                    p = str(sm.filePath(src) or "")
+                    if p and bool(sm.isDir(src)):
+                        if self._is_compare_run_dir_path(p):
+                            display = self._compare_run_display_name(p)
+                            if display:
+                                return display
+                        if self._is_compare_case_dir_path(p):
+                            display = self._compare_case_display_name(p)
+                            if display:
+                                return display
+        except Exception:
+            pass
 
         # Highlight run folders referenced by the active compare selection.
         try:

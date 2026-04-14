@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import json
+import html
 import re
 import time
 from typing import Optional
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QDialog,
     QPushButton,
+    QToolTip,
     QWidget,
 )
 
@@ -119,6 +121,10 @@ class GraphPreview(QObject):
         self._preview_header_legend_btn = None
         self._preview_header_title_text = ""
         self._preview_header_subtitle_text = ""
+        self._preview_header_title_elided = False
+        self._preview_header_subtitle_elided = False
+        self._preview_header_tt: Optional[QLabel] = None
+        self._preview_header_tt_source: Optional[QLabel] = None
 
         # data/series state
         self._preview_df_all = None
@@ -447,6 +453,254 @@ class GraphPreview(QObject):
             "}"
         )
 
+    def _preview_header_tooltip_stylesheet(self) -> str:
+        theme = dict(getattr(self, "_preview_theme", {}) or {})
+        bg = str(theme.get("tooltip_bg", "rgba(24,24,24,160)"))
+        border = str(theme.get("tooltip_border", "rgba(255,255,255,18)"))
+        text = str(theme.get("tooltip_text", "#FFFFFF"))
+        return (
+            "QLabel {"
+            f" background-color: {bg};"
+            f" border: 1px solid {border};"
+            " border-radius: 6px;"
+            " padding: 3px 10px;"
+            f" color: {text};"
+            "}"
+        )
+
+    @staticmethod
+    def _html_escape(text: str) -> str:
+        try:
+            return html.escape(str(text or ""), quote=True)
+        except Exception:
+            return str(text or "")
+
+    def _preview_header_compare_colors(self) -> list[str]:
+        try:
+            cmap = dict(getattr(self, "_compare_run_color_map", None) or {})
+            return [str(v) for v in cmap.values() if str(v or "").strip()]
+        except Exception:
+            return []
+
+    def _preview_header_compare_subtitle_html(self, text: str, *, avail: int | None = None) -> tuple[str, bool]:
+        try:
+            raw = str(text or "")
+            parts = [str(p) for p in raw.split(" vs ")]
+            colors = self._preview_header_compare_colors()
+            base = self._preview_secondary_text_color()
+            if len(parts) < 2 or len(colors) < 2:
+                return (f"<div style='white-space:pre-wrap;color:{base};'>{self._html_escape(raw)}</div>", False)
+
+            fm = None
+            try:
+                lab = getattr(self, "_preview_header_subtitle_label", None)
+                if lab is not None:
+                    fm = lab.fontMetrics()
+            except Exception:
+                fm = None
+
+            chunks: list[str] = []
+            overflow = False
+            remaining = int(avail) if avail is not None else -1
+            sep = " vs "
+            sep_w = int(fm.horizontalAdvance(sep)) if (fm is not None and remaining >= 0) else 0
+
+            for idx, part in enumerate(parts):
+                if idx > 0:
+                    if remaining >= 0:
+                        if remaining <= 0:
+                            overflow = True
+                            break
+                        if sep_w > remaining:
+                            overflow = True
+                            break
+                        remaining -= sep_w
+                    chunks.append(f"<span style='color:{base};'>{self._html_escape(sep)}</span>")
+
+                color = colors[idx] if idx < len(colors) else base
+                part_out = part
+                if remaining >= 0 and fm is not None:
+                    part_w = int(fm.horizontalAdvance(part))
+                    if part_w > remaining:
+                        overflow = True
+                        part_out = str(fm.elidedText(part, Qt.ElideRight, max(0, remaining)))
+                        remaining = 0
+                        if part_out:
+                            chunks.append(f"<span style='color:{color};'>{self._html_escape(part_out)}</span>")
+                        break
+                    remaining -= part_w
+
+                chunks.append(f"<span style='color:{color};'>{self._html_escape(part_out)}</span>")
+
+            if not chunks:
+                return (f"<div style='white-space:pre-wrap;color:{base};'>{self._html_escape(raw)}</div>", False)
+            return ("<div style='white-space:pre-wrap;'>" + "".join(chunks) + "</div>", overflow)
+        except Exception:
+            base = self._preview_secondary_text_color()
+            return (f"<div style='white-space:pre-wrap;color:{base};'>{self._html_escape(text)}</div>", False)
+
+    def _preview_header_tooltip_payload(self, label: Optional[QLabel]) -> tuple[str, str]:
+        try:
+            if label is None or not label.isVisible():
+                return ("", "")
+
+            if label is getattr(self, "_preview_header_title_label", None):
+                if not bool(getattr(self, "_preview_header_title_elided", False)):
+                    return ("", "")
+                raw = str(getattr(self, "_preview_header_title_text", "") or "")
+                text_color = self._preview_label_color()
+                return (raw, f"<div style='white-space:pre-wrap;color:{text_color};'>{self._html_escape(raw)}</div>")
+
+            if label is getattr(self, "_preview_header_subtitle_label", None):
+                if not bool(getattr(self, "_preview_header_subtitle_elided", False)):
+                    return ("", "")
+                raw = str(getattr(self, "_preview_header_subtitle_text", "") or "")
+                html_text, _ = self._preview_header_compare_subtitle_html(raw, avail=None)
+                return (raw, html_text)
+        except Exception:
+            pass
+        return ("", "")
+
+    def _preview_header_tooltip_text(self, label: Optional[QLabel]) -> str:
+        try:
+            return self._preview_header_tooltip_payload(label)[0]
+        except Exception:
+            return ""
+
+    def _ensure_preview_header_tooltip(self) -> Optional[QLabel]:
+        try:
+            anchor = (
+                getattr(self, "_preview_header_widget", None)
+                or getattr(self, "_preview_header_title_label", None)
+                or getattr(self, "_preview_header_subtitle_label", None)
+            )
+            if anchor is None:
+                return None
+
+            host = anchor.window()
+            if host is None:
+                return None
+
+            tt = getattr(self, "_preview_header_tt", None)
+            if tt is not None:
+                try:
+                    if tt.parentWidget() is host:
+                        return tt
+                except Exception:
+                    pass
+                try:
+                    tt.hide()
+                    tt.deleteLater()
+                except Exception:
+                    pass
+                self._preview_header_tt = None
+
+            tt = QLabel(host)
+            tt.setObjectName("PreviewHeaderTooltip")
+            tt.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            tt.setTextFormat(Qt.RichText)
+            tt.setWordWrap(True)
+            tt.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            tt.setStyleSheet(self._preview_header_tooltip_stylesheet())
+            tt.hide()
+            self._preview_header_tt = tt
+            return tt
+        except Exception:
+            return None
+
+    def _hide_preview_header_tooltip(self) -> None:
+        try:
+            if self._preview_header_tt is not None:
+                self._preview_header_tt.hide()
+        except Exception:
+            pass
+        self._preview_header_tt_source = None
+
+    def _show_preview_header_tooltip(
+        self,
+        label: Optional[QLabel],
+        *,
+        global_pos=None,
+    ) -> None:
+        try:
+            text, rich_html = self._preview_header_tooltip_payload(label)
+            if not text:
+                self._hide_preview_header_tooltip()
+                return
+
+            tt = self._ensure_preview_header_tooltip()
+            if tt is None or label is None:
+                return
+
+            host = tt.parentWidget()
+            if host is None:
+                return
+
+            tt.setStyleSheet(self._preview_header_tooltip_stylesheet())
+            try:
+                tt.setFont(label.font())
+            except Exception:
+                pass
+            markup = str(rich_html or "").strip()
+            if not markup:
+                markup = f"<div style='white-space:pre-wrap;'>{self._html_escape(text)}</div>"
+            tt.setText(markup)
+
+            host_w = max(0, int(host.width() or 0))
+            host_h = max(0, int(host.height() or 0))
+            margin = 8
+            max_w = max(160, host_w - (margin * 2))
+
+            tt.setMaximumWidth(max_w)
+            tt.setWordWrap(False)
+            tt.adjustSize()
+            natural_w = int(tt.sizeHint().width() or tt.width() or 0)
+
+            if natural_w > max_w:
+                tt.setWordWrap(True)
+                tt.resize(max_w, 1)
+                tt.adjustSize()
+            else:
+                tt.setWordWrap(False)
+                tt.adjustSize()
+
+            label_top_left = label.mapTo(host, label.rect().topLeft())
+            label_bottom_left = label.mapTo(host, label.rect().bottomLeft())
+            x = int(label_top_left.x())
+            y = int(label_bottom_left.y()) + 6
+
+            if global_pos is not None:
+                try:
+                    anchor = host.mapFromGlobal(global_pos)
+                    x = int(anchor.x()) - 18
+                except Exception:
+                    pass
+
+            max_x = max(margin, host_w - margin - tt.width())
+            x = max(margin, min(x, max_x))
+
+            max_y = max(margin, host_h - margin - tt.height())
+            if y > max_y:
+                above_y = int(label_top_left.y()) - tt.height() - 6
+                if above_y >= margin:
+                    y = above_y
+                else:
+                    y = max_y
+            y = max(margin, min(y, max_y))
+
+            tt.move(x, y)
+            tt.raise_()
+            tt.show()
+            self._preview_header_tt_source = label
+        except Exception:
+            self._hide_preview_header_tooltip()
+
+    def _refresh_preview_header_tooltip(self) -> None:
+        label = getattr(self, "_preview_header_tt_source", None)
+        if label is None:
+            return
+        self._show_preview_header_tooltip(label)
+
     def _preview_label_color(self) -> str:
         try:
             return str(self._preview_theme.get("label", "#EAEAEA"))
@@ -514,6 +768,9 @@ class GraphPreview(QObject):
             except Exception:
                 show_header = False
 
+            if not show_header:
+                self._hide_preview_header_tooltip()
+
             try:
                 header.setVisible(show_header)
             except Exception:
@@ -541,6 +798,8 @@ class GraphPreview(QObject):
                             text_title = title_label.fontMetrics().elidedText(raw_title, Qt.ElideRight, avail)
                         except Exception:
                             text_title = raw_title
+                    self._preview_header_title_elided = bool(raw_title and text_title != raw_title)
+                    title_label.setTextFormat(Qt.PlainText)
                     title_label.setText(text_title)
                     title_label.setToolTip(raw_title if text_title != raw_title else "")
                     title_label.setVisible(bool(show_header and raw_title.strip()))
@@ -559,13 +818,24 @@ class GraphPreview(QObject):
                     except Exception:
                         avail = max(0, int(subtitle_label.width() or 0) - 2)
                     text_subtitle = raw_subtitle
+                    subtitle_html = ""
+                    subtitle_elided = False
                     if avail > 0 and raw_subtitle:
                         try:
+                            subtitle_html, subtitle_elided = self._preview_header_compare_subtitle_html(raw_subtitle, avail=avail)
                             text_subtitle = subtitle_label.fontMetrics().elidedText(raw_subtitle, Qt.ElideRight, avail)
                         except Exception:
                             text_subtitle = raw_subtitle
-                    subtitle_label.setText(text_subtitle)
-                    subtitle_label.setToolTip(raw_subtitle if text_subtitle != raw_subtitle else "")
+                            subtitle_html = ""
+                            subtitle_elided = False
+                    self._preview_header_subtitle_elided = bool(raw_subtitle and subtitle_elided)
+                    if subtitle_html and (" vs " in raw_subtitle):
+                        subtitle_label.setTextFormat(Qt.RichText)
+                        subtitle_label.setText(subtitle_html)
+                    else:
+                        subtitle_label.setTextFormat(Qt.PlainText)
+                        subtitle_label.setText(text_subtitle)
+                    subtitle_label.setToolTip(raw_subtitle if self._preview_header_subtitle_elided else "")
                     subtitle_label.setVisible(bool(show_header and raw_subtitle.strip()))
                     subtitle_label.setStyleSheet(
                         f"background: transparent; color: {self._preview_secondary_text_color()}; font-size: 10px; font-weight: 400;"
@@ -607,6 +877,8 @@ class GraphPreview(QObject):
                     zero_btn.setVisible(show_header)
                 except Exception:
                     pass
+
+            self._refresh_preview_header_tooltip()
         except Exception:
             pass
 
@@ -636,6 +908,10 @@ class GraphPreview(QObject):
                         widget.installEventFilter(self)
                     except Exception:
                         pass
+                    try:
+                        widget.setMouseTracking(True)
+                    except Exception:
+                        pass
 
             if zero_btn is not None:
                 try:
@@ -661,6 +937,47 @@ class GraphPreview(QObject):
             if path is None:
                 self._preview_header_title_text = ""
                 self._preview_header_subtitle_text = ""
+            elif str(path.name).strip().lower() == "compare_manifest.json":
+                try:
+                    manifest = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    manifest = {}
+
+                case_name = str(manifest.get("display_case_name") or "").strip()
+                run_name = str(manifest.get("display_run_name") or "").strip()
+
+                if not case_name or not run_name:
+                    runs_rel = [str(r) for r in (manifest.get("runs") or []) if str(r).strip()]
+
+                    def _stress_label_from_run_name(run_name_value: str) -> str:
+                        try:
+                            m = re.match(r"^(CPU|GPU|CPUGPU)_W\d+_L\d+_V\d+$", str(run_name_value or ""), flags=re.IGNORECASE)
+                            if m:
+                                return str(m.group(1)).upper()
+                        except Exception:
+                            pass
+                        return str(run_name_value or "").strip()
+
+                    case_parts: list[str] = []
+                    run_parts: list[str] = []
+                    for rel in runs_rel:
+                        parts = [p for p in str(rel).replace("\\", "/").split("/") if p]
+                        if len(parts) < 2:
+                            continue
+                        case = str(parts[-2]).strip()
+                        run = str(parts[-1]).strip()
+                        if case:
+                            case_parts.append(case)
+                        stress = _stress_label_from_run_name(run)
+                        run_parts.append(f"{case} {stress}".strip() if case else stress)
+
+                    if not case_name:
+                        case_name = " vs ".join([p for p in case_parts if p])
+                    if not run_name:
+                        run_name = " vs ".join([p for p in run_parts if p])
+
+                self._preview_header_title_text = case_name or str(path.parent.parent.name or "").strip()
+                self._preview_header_subtitle_text = run_name or str(path.parent.name or "").strip()
             else:
                 run_folder = str(path.parent.name or "").strip()
                 case_folder = str(path.parent.parent.name or "").strip()
@@ -761,6 +1078,12 @@ class GraphPreview(QObject):
                     tt = (st or {}).get("qt_tt") if isinstance(st, dict) else None
                     if tt is not None:
                         tt.setStyleSheet(self._preview_tooltip_stylesheet())
+            except Exception:
+                pass
+
+            try:
+                if self._preview_header_tt is not None:
+                    self._preview_header_tt.setStyleSheet(self._preview_header_tooltip_stylesheet())
             except Exception:
                 pass
 
@@ -1931,12 +2254,41 @@ class GraphPreview(QObject):
             pass
 
         try:
-            if obj in {
+            title_label = getattr(self, "_preview_header_title_label", None)
+            subtitle_label = getattr(self, "_preview_header_subtitle_label", None)
+            header_widgets = {
                 getattr(self, "_preview_header_widget", None),
-                getattr(self, "_preview_header_title_label", None),
-                getattr(self, "_preview_header_subtitle_label", None),
-            } and event is not None and event.type() in (QEvent.Resize, QEvent.Show, QEvent.LayoutRequest):
+                title_label,
+                subtitle_label,
+            }
+
+            if obj in {title_label, subtitle_label} and event is not None:
+                if event.type() == QEvent.ToolTip:
+                    try:
+                        QToolTip.hideText()
+                    except Exception:
+                        pass
+                    global_pos = None
+                    try:
+                        global_pos = event.globalPos()
+                    except Exception:
+                        pass
+                    self._show_preview_header_tooltip(obj, global_pos=global_pos)
+                    try:
+                        event.accept()
+                    except Exception:
+                        pass
+                    return True
+
+                if event.type() in (QEvent.Leave, QEvent.Hide, QEvent.MouseButtonPress):
+                    if obj is getattr(self, "_preview_header_tt_source", None):
+                        self._hide_preview_header_tooltip()
+
+            if obj in header_widgets and event is not None and event.type() in (QEvent.Resize, QEvent.Show, QEvent.LayoutRequest):
                 self._sync_preview_header_controls()
+
+            if obj is getattr(self, "_preview_header_widget", None) and event is not None and event.type() in (QEvent.Hide, QEvent.Leave):
+                self._hide_preview_header_tooltip()
         except Exception:
             pass
 

@@ -11,6 +11,7 @@ from typing import Iterable, Optional, Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QVBoxLayout,
     QHBoxLayout,
@@ -25,6 +26,8 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 
+from ui.widgets.ui_theme import resolve_effective_theme_mode
+
 
 class ComparePopup(QDialog):
     def __init__(
@@ -36,8 +39,13 @@ class ComparePopup(QDialog):
         group_map: Optional[dict[str, str]] = None,
         on_close: Optional[Callable[[], None]] = None,
         on_compare: Optional[Callable[[list[str]], None]] = None,
+        theme_mode: str = "device",
     ):
         super().__init__(parent)
+
+        self._theme_mode = resolve_effective_theme_mode(theme_mode, QApplication.instance())
+        self._theme_is_dark = self._theme_mode == "dark"
+        self._theme = self._build_theme_palette()
 
         self.setWindowFlag(Qt.Tool, True)
         self.setWindowFlag(Qt.FramelessWindowHint, True)
@@ -55,7 +63,9 @@ class ComparePopup(QDialog):
         title_row.setContentsMargins(0, 0, 0, 0)
 
         title_area = QLabel(title)
-        title_area.setStyleSheet("color:#EAEAEA; font-weight:600; font-size:13px;")
+        title_area.setStyleSheet(
+            f"color:{self._theme['text']}; font-weight:600; font-size:13px;"
+        )
         title_area.setMinimumWidth(0)
         title_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -64,9 +74,9 @@ class ComparePopup(QDialog):
         close_btn.setCursor(Qt.PointingHandCursor)
         close_btn.clicked.connect(self.close)
         close_btn.setStyleSheet(
-            """
-            QToolButton { color:#9A9A9A; background: transparent; border: none; padding: 4px 6px; }
-            QToolButton:hover { color:#EAEAEA; background: rgba(255,255,255,0.06); border-radius: 6px; }
+            f"""
+            QToolButton {{ color:{self._theme['close_fg']}; background: transparent; border: none; padding: 4px 6px; }}
+            QToolButton:hover {{ color:{self._theme['close_hover_fg']}; background: {self._theme['close_hover_bg']}; border-radius: 6px; }}
             """
         )
 
@@ -166,29 +176,40 @@ class ComparePopup(QDialog):
         root.addLayout(footer)
 
         self.setStyleSheet(
-            """
-            QDialog { background: #1A1A1A; border: 1px solid #2A2A2A; border-radius: 10px; }
-            QLabel { background: transparent; }
+            f"""
+            QDialog {{ background: {self._theme['dialog_bg']}; border: 1px solid {self._theme['dialog_border']}; border-radius: 10px; }}
+            QLabel {{ background: transparent; color: {self._theme['text']}; }}
 
-            QTreeWidget { background: transparent; border: none; color: #EAEAEA; outline: none; }
+            QTreeWidget {{ background: transparent; border: none; color: {self._theme['text']}; outline: none; }}
 
-            QTreeWidget::item {
+            QTreeWidget::item {{
                 padding: 8px 14px;
                 border-radius: 0px;
                 background: transparent;
-            }
+            }}
 
-            QTreeWidget::item:hover {
-                background: rgba(255,255,255,0.06);
-            }
+            QTreeWidget::item:hover {{
+                background: {self._theme['tree_hover_bg']};
+            }}
 
             QTreeWidget::item:selected,
-            QTreeWidget::item:selected:hover {
-                background-color: #2A2A2A;
-                color: #EAEAEA;
+            QTreeWidget::item:selected:hover {{
+                background-color: {self._theme['tree_selected_bg']};
+                color: {self._theme['text']};
                 outline: none;
                 border: none;
-            }
+            }}
+
+            QPushButton {{
+                background: {self._theme['button_bg']};
+                color: {self._theme['text']};
+                border: 1px solid {self._theme['button_border']};
+                border-radius: 8px;
+                padding: 6px 12px;
+            }}
+            QPushButton:hover {{ background: {self._theme['button_hover_bg']}; border-color: {self._theme['button_hover_border']}; }}
+            QPushButton:pressed {{ background: {self._theme['button_pressed_bg']}; }}
+            QPushButton:disabled {{ color: {self._theme['button_disabled_fg']}; border-color: {self._theme['button_disabled_border']}; background: {self._theme['button_disabled_bg']}; }}
             """
         )
 
@@ -206,6 +227,45 @@ class ComparePopup(QDialog):
             pass
 
         self._update_compare_btn_state()
+
+    def _build_theme_palette(self) -> dict[str, str]:
+        if self._theme_is_dark:
+            return {
+                "dialog_bg": "#1A1A1A",
+                "dialog_border": "#2A2A2A",
+                "text": "#EAEAEA",
+                "close_fg": "#9A9A9A",
+                "close_hover_fg": "#EAEAEA",
+                "close_hover_bg": "rgba(255,255,255,0.06)",
+                "tree_hover_bg": "rgba(255,255,255,0.06)",
+                "tree_selected_bg": "#2A2A2A",
+                "button_bg": "#2A2A2A",
+                "button_border": "#3A3A3A",
+                "button_hover_bg": "#333333",
+                "button_hover_border": "#4A4A4A",
+                "button_pressed_bg": "#252525",
+                "button_disabled_fg": "#7A7A7A",
+                "button_disabled_bg": "#202020",
+                "button_disabled_border": "#2D2D2D",
+            }
+        return {
+            "dialog_bg": "#F7F7F7",
+            "dialog_border": "#D4D4D4",
+            "text": "#111111",
+            "close_fg": "#666666",
+            "close_hover_fg": "#111111",
+            "close_hover_bg": "rgba(0,0,0,0.06)",
+            "tree_hover_bg": "rgba(0,0,0,0.05)",
+            "tree_selected_bg": "#E6E6E6",
+            "button_bg": "#FFFFFF",
+            "button_border": "#CFCFCF",
+            "button_hover_bg": "#F0F0F0",
+            "button_hover_border": "#BDBDBD",
+            "button_pressed_bg": "#E8E8E8",
+            "button_disabled_fg": "#8E8E8E",
+            "button_disabled_bg": "#F1F1F1",
+            "button_disabled_border": "#D8D8D8",
+        }
 
     def _select_all(self) -> None:
         try:

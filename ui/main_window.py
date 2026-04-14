@@ -1,6 +1,7 @@
 import json
 import ctypes
 import re
+import html
 from datetime import datetime
 from ctypes import wintypes
 
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QSizePolicy,
     QAbstractItemView,
+    QAbstractScrollArea,
     QTreeView,
     QFileSystemModel,
     QSplitter,
@@ -653,6 +655,18 @@ class MainWindow(QWidget):
                             continue
 
                         m["runs"] = new_runs
+                        try:
+                            display_case_name = str(m.get("display_case_name") or "")
+                            if display_case_name:
+                                m["display_case_name"] = display_case_name.replace(old_case, new_case)
+                        except Exception:
+                            pass
+                        try:
+                            display_run_name = str(m.get("display_run_name") or "")
+                            if display_run_name:
+                                m["display_run_name"] = display_run_name.replace(old_case, new_case)
+                        except Exception:
+                            pass
                         try:
                             mp.write_text(json.dumps(m, indent=2), encoding="utf-8")
                         except Exception:
@@ -1781,8 +1795,198 @@ class MainWindow(QWidget):
                 self._apply_results_preview_theme()
             except Exception:
                 pass
+
+            try:
+                tt = getattr(self, "_runs_tree_tooltip", None)
+                if tt is not None:
+                    tt.setStyleSheet(self._runs_tree_tooltip_stylesheet())
+                    tt.setFont(self._runs_tree_tooltip_font())
+            except Exception:
+                pass
         except Exception:
             pass
+
+    def _runs_tree_tooltip_stylesheet(self) -> str:
+        try:
+            effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+        except Exception:
+            effective_mode = "dark"
+
+        if effective_mode == "light":
+            bg = "rgba(255,255,255,235)"
+            border = "rgba(0,0,0,35)"
+            text = "#1A1A1A"
+        else:
+            bg = "rgba(24,24,24,160)"
+            border = "rgba(255,255,255,18)"
+            text = "#FFFFFF"
+
+        return (
+            "QLabel {"
+            f" background-color: {bg};"
+            f" border: 1px solid {border};"
+            " border-radius: 6px;"
+            " padding: 3px 10px;"
+            f" color: {text};"
+            "}"
+        )
+
+    def _runs_tree_tooltip_font(self):
+        try:
+            src = getattr(self, "_preview_header_title", None)
+            if src is not None:
+                return src.font()
+        except Exception:
+            pass
+        try:
+            return self._runs_tree.font()
+        except Exception:
+            return self.font()
+
+    @staticmethod
+    def _html_escape(text: str) -> str:
+        try:
+            return html.escape(str(text or ""), quote=True)
+        except Exception:
+            return str(text or "")
+
+    def _runs_tree_tooltip_text_color(self) -> str:
+        try:
+            effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+            return "#1A1A1A" if effective_mode == "light" else "#FFFFFF"
+        except Exception:
+            return "#FFFFFF"
+
+    def _runs_tree_compare_tooltip_html(self, text: str, compare_prefix: str, seg_colors: list) -> str:
+        try:
+            full_text = str(text or "")
+            prefix = str(compare_prefix or "")
+            body_text = full_text[len(prefix):] if prefix and full_text.startswith(prefix) else full_text
+            parts = body_text.split(" vs ")
+            if not parts:
+                return ""
+
+            base = self._runs_tree_tooltip_text_color()
+            chunks: list[str] = []
+            if prefix and full_text.startswith(prefix):
+                chunks.append(f"<span style='color:{base};'>{self._html_escape(prefix)}</span>")
+
+            for idx, part in enumerate(parts):
+                color = base
+                try:
+                    current = seg_colors[idx] if idx < len(seg_colors) else None
+                    if hasattr(current, "name"):
+                        color = str(current.name() or base)
+                except Exception:
+                    color = base
+
+                chunks.append(f"<span style='color:{color};'>{self._html_escape(part)}</span>")
+                if idx != (len(parts) - 1):
+                    chunks.append(f"<span style='color:{base};'>{self._html_escape(' vs ')}</span>")
+
+            return "<div style='white-space:pre-wrap;'>" + "".join(chunks) + "</div>"
+        except Exception:
+            return ""
+
+    def _ensure_runs_tree_tooltip(self) -> QLabel | None:
+        try:
+            tt = getattr(self, "_runs_tree_tooltip", None)
+            if tt is not None:
+                return tt
+
+            tt = QLabel(self)
+            tt.setObjectName("RunsTreeTooltip")
+            tt.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            tt.setTextFormat(Qt.RichText)
+            tt.setWordWrap(True)
+            tt.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            tt.setStyleSheet(self._runs_tree_tooltip_stylesheet())
+            tt.setFont(self._runs_tree_tooltip_font())
+            tt.hide()
+            self._runs_tree_tooltip = tt
+            return tt
+        except Exception:
+            return None
+
+    def _hide_runs_tree_tooltip(self) -> None:
+        try:
+            tt = getattr(self, "_runs_tree_tooltip", None)
+            if tt is not None:
+                tt.hide()
+        except Exception:
+            pass
+
+    def _show_runs_tree_tooltip(self, text: str, *, viewport_pos, item_rect, rich_html: str = "") -> None:
+        try:
+            tree = getattr(self, "_runs_tree", None)
+            if tree is None:
+                return
+
+            tt = self._ensure_runs_tree_tooltip()
+            if tt is None:
+                return
+
+            tt.setStyleSheet(self._runs_tree_tooltip_stylesheet())
+            tt.setFont(self._runs_tree_tooltip_font())
+            markup = str(rich_html or "").strip()
+            if not markup:
+                markup = f"<div style='white-space:pre-wrap;'>{self._html_escape(text)}</div>"
+            tt.setText(markup)
+
+            host_w = max(0, int(self.width() or 0))
+            host_h = max(0, int(self.height() or 0))
+            margin = 8
+            max_w = max(160, host_w - (margin * 2))
+
+            tt.setMaximumWidth(max_w)
+            tt.setWordWrap(False)
+            tt.adjustSize()
+            natural_w = int(tt.sizeHint().width() or tt.width() or 0)
+            if natural_w > max_w:
+                tt.setWordWrap(True)
+                tt.resize(max_w, 1)
+                tt.adjustSize()
+            else:
+                tt.setWordWrap(False)
+                tt.adjustSize()
+
+            try:
+                if item_rect is not None and item_rect.isValid():
+                    anchor_top_left = tree.viewport().mapTo(self, item_rect.topLeft())
+                    anchor_bottom_left = tree.viewport().mapTo(self, item_rect.bottomLeft())
+                else:
+                    anchor_top_left = tree.viewport().mapTo(self, viewport_pos)
+                    anchor_bottom_left = anchor_top_left
+            except Exception:
+                anchor_top_left = tree.viewport().mapTo(self, viewport_pos)
+                anchor_bottom_left = anchor_top_left
+
+            x = int(anchor_top_left.x())
+            y = int(anchor_bottom_left.y()) + 6
+
+            try:
+                hover_anchor = tree.viewport().mapTo(self, viewport_pos)
+                x = int(hover_anchor.x()) - 18
+            except Exception:
+                pass
+
+            max_x = max(margin, host_w - margin - tt.width())
+            x = max(margin, min(x, max_x))
+
+            max_y = max(margin, host_h - margin - tt.height())
+            if y > max_y:
+                above_y = int(anchor_top_left.y()) - tt.height() - 6
+                if above_y >= margin:
+                    y = above_y
+                else:
+                    y = max_y
+            y = max(margin, min(y, max_y))
+
+            tt.move(x, y)
+            tt.raise_()
+            tt.show()
+        except Exception:
+            self._hide_runs_tree_tooltip()
 
     def _apply_results_preview_theme(self) -> None:
         try:
@@ -1930,6 +2134,96 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
+    def _horizontal_scrollbar_for_object(self, obj):
+        try:
+            cur = obj
+            visited = 0
+            while cur is not None and visited < 12:
+                visited += 1
+                try:
+                    if isinstance(cur, QAbstractScrollArea):
+                        bar = cur.horizontalScrollBar()
+                        if bar is not None:
+                            return bar
+                except Exception:
+                    pass
+
+                try:
+                    if hasattr(cur, "parentWidget"):
+                        cur = cur.parentWidget()
+                    else:
+                        cur = None
+                except Exception:
+                    cur = None
+        except Exception:
+            pass
+        return None
+
+    def _handle_shift_wheel_horizontal_scroll(self, obj, event) -> bool:
+        try:
+            if event is None or event.type() != QEvent.Wheel:
+                return False
+
+            try:
+                if not bool(event.modifiers() & Qt.ShiftModifier):
+                    return False
+            except Exception:
+                return False
+
+            bar = self._horizontal_scrollbar_for_object(obj)
+            if bar is None:
+                return False
+
+            try:
+                if int(bar.maximum()) <= int(bar.minimum()):
+                    return False
+            except Exception:
+                return False
+
+            angle_delta = 0
+            try:
+                ad = event.angleDelta()
+                if ad is not None:
+                    angle_delta = int(ad.y()) if int(ad.y()) != 0 else int(ad.x())
+            except Exception:
+                angle_delta = 0
+
+            pixel_delta = 0
+            try:
+                pd = event.pixelDelta()
+                if pd is not None:
+                    pixel_delta = int(pd.y()) if int(pd.y()) != 0 else int(pd.x())
+            except Exception:
+                pixel_delta = 0
+
+            if angle_delta == 0 and pixel_delta == 0:
+                return False
+
+            cur_val = int(bar.value())
+            if pixel_delta != 0:
+                new_val = int(cur_val - pixel_delta)
+            else:
+                steps = float(angle_delta) / 120.0
+                single_step = 20
+                try:
+                    single_step = max(1, int(bar.singleStep()))
+                except Exception:
+                    pass
+                new_val = int(round(cur_val - (steps * single_step)))
+
+            try:
+                bar.setValue(max(int(bar.minimum()), min(int(bar.maximum()), int(new_val))))
+            except Exception:
+                return False
+
+            try:
+                event.accept()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
     def _existing_case_folder_names(self) -> list[str]:
         try:
             runs_root = Path(getattr(self, "_runs_root", "") or "")
@@ -1961,6 +2255,156 @@ class MainWindow(QWidget):
             return sorted(set(names), key=str.casefold)
         except Exception:
             return []
+
+    def _runs_tree_index_is_dir(self, idx) -> bool:
+        try:
+            if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
+                return False
+            if getattr(self, "_runs_proxy", None) is not None and hasattr(self._runs_proxy, "mapToSource"):
+                src = self._runs_proxy.mapToSource(idx)
+                return bool(self._runs_model.isDir(src))
+            return bool(self._runs_model.isDir(idx))
+        except Exception:
+            return False
+
+    def _runs_tree_compare_prefix(self) -> str:
+        try:
+            model = self._runs_tree.model() if getattr(self, "_runs_tree", None) is not None else None
+            get_pref = getattr(model, "get_compare_prefix", None)
+            if callable(get_pref):
+                pref = str(get_pref() or "").strip()
+                if pref:
+                    return pref + (" " if not pref.endswith(" ") else "")
+        except Exception:
+            pass
+        return "↔ "
+
+    @staticmethod
+    def _norm_fs_path(path: str) -> str:
+        try:
+            return os.path.normcase(os.path.abspath(str(path or "")))
+        except Exception:
+            return str(path or "")
+
+    def _runs_tree_tooltip_payload_at(self, pos) -> dict[str, str]:
+        try:
+            tree = getattr(self, "_runs_tree", None)
+            if tree is None:
+                return {"text": "", "html": ""}
+
+            index = tree.indexAt(pos)
+            if index is None or not index.isValid():
+                return {"text": "", "html": ""}
+
+            text = str(index.data(Qt.DisplayRole) or "")
+            if not text:
+                return {"text": "", "html": ""}
+
+            delegate = tree.itemDelegateForIndex(index) or tree.itemDelegate()
+            option = QStyleOptionViewItem()
+            try:
+                option = tree.viewOptions()
+            except Exception:
+                pass
+
+            option.rect = tree.visualRect(index)
+            option.widget = tree
+            try:
+                if delegate is not None:
+                    delegate.initStyleOption(option, index)
+            except Exception:
+                pass
+
+            style = option.widget.style() if option.widget is not None else tree.style()
+            text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, option, option.widget)
+            avail = int(text_rect.width())
+            if avail <= 0:
+                return {"text": "", "html": ""}
+
+            fm = option.fontMetrics
+            path = self._runs_tree_index_to_path(index)
+            is_dir = self._runs_tree_index_is_dir(index)
+            model = tree.model()
+
+            is_compare_result_dir = False
+            try:
+                is_compare_fn = getattr(model, "is_compare_result_dir_path", None)
+                if is_dir and callable(is_compare_fn):
+                    is_compare_result_dir = bool(is_compare_fn(path))
+            except Exception:
+                pass
+
+            is_regular_run_dir = bool(
+                is_dir
+                and (not is_compare_result_dir)
+                and _RESULT_RUN_FOLDER_RE.match(Path(path).name or "")
+            )
+
+            is_compare_case_dir = False
+            try:
+                is_compare_case_fn = getattr(model, "is_compare_case_dir_path", None)
+                if is_dir and callable(is_compare_case_fn):
+                    is_compare_case_dir = bool(is_compare_case_fn(path))
+            except Exception:
+                pass
+
+            is_compare_run_dir = False
+            try:
+                is_compare_run_fn = getattr(model, "is_compare_run_dir_path", None)
+                if is_dir and callable(is_compare_run_fn):
+                    is_compare_run_dir = bool(is_compare_run_fn(path))
+            except Exception:
+                pass
+
+            active_norm = ""
+            seg_colors = []
+            try:
+                get_active = getattr(model, "get_active_compare_dir_norm", None)
+                if callable(get_active):
+                    active_norm = str(get_active() or "")
+            except Exception:
+                pass
+            try:
+                get_seg_colors = getattr(model, "get_active_compare_segment_colors", None)
+                if callable(get_seg_colors):
+                    seg_colors = list(get_seg_colors() or [])
+            except Exception:
+                pass
+
+            if is_regular_run_dir and isinstance(delegate, _CompareNameDelegate):
+                meta = str(delegate._run_meta_text(path) or "")
+                if meta:
+                    gap = int(fm.horizontalAdvance("   "))
+                    meta_w = int(fm.horizontalAdvance(meta))
+                    name_avail = max(0, avail - meta_w - gap)
+                    if fm.elidedText(text, Qt.ElideRight, name_avail) != text:
+                        return {"text": text, "html": ""}
+                    return {"text": "", "html": ""}
+
+            compare_prefix = self._runs_tree_compare_prefix()
+            if is_compare_case_dir and (not active_norm or self._norm_fs_path(path) != str(active_norm)):
+                pref_w = int(fm.horizontalAdvance(compare_prefix)) if compare_prefix else 0
+                name_avail = max(0, avail - pref_w)
+                if fm.elidedText(text, Qt.ElideRight, name_avail) != text:
+                    return {"text": text, "html": ""}
+                return {"text": "", "html": ""}
+
+            if active_norm and self._norm_fs_path(path) == str(active_norm) and text and (" vs " in text) and seg_colors:
+                shown_text = text[len(compare_prefix):] if compare_prefix and text.startswith(compare_prefix) else text
+                pref_w = int(fm.horizontalAdvance(compare_prefix)) if (is_compare_case_dir and compare_prefix) else 0
+                name_avail = max(0, avail - pref_w)
+                if int(fm.horizontalAdvance(shown_text)) > name_avail:
+                    rich_html = ""
+                    if is_compare_run_dir:
+                        rich_html = self._runs_tree_compare_tooltip_html(text, compare_prefix, seg_colors)
+                    return {"text": text, "html": rich_html}
+                return {"text": "", "html": ""}
+
+            if fm.elidedText(text, Qt.ElideRight, avail) != text:
+                return {"text": text, "html": ""}
+            return {"text": "", "html": ""}
+        except Exception:
+            return {"text": "", "html": ""}
 
     def _refresh_case_name_suggestions(self) -> None:
         try:
@@ -3002,6 +3446,9 @@ class MainWindow(QWidget):
         (auto-expand/select/preview).
         """
         try:
+            if self._handle_shift_wheel_horizontal_scroll(obj, event):
+                return True
+
             if event is not None and event.type() == QEvent.MouseButtonPress:
                 click_target = self._case_name_click_target(obj, event)
                 if self._case_name_popup.isVisible() and not self._is_case_name_popup_target(click_target):
@@ -3012,6 +3459,33 @@ class MainWindow(QWidget):
                     QTimer.singleShot(0, lambda: self._show_case_name_suggestions(force=True))
 
             if getattr(self, "_runs_tree", None) is not None and obj is self._runs_tree.viewport():
+                if event is not None and event.type() == QEvent.ToolTip:
+                    try:
+                        pos = event.position().toPoint()
+                    except Exception:
+                        pos = event.pos()
+                    payload = self._runs_tree_tooltip_payload_at(pos)
+                    text = str((payload or {}).get("text") or "")
+                    if text:
+                        idx = self._runs_tree.indexAt(pos)
+                        rect = self._runs_tree.visualRect(idx)
+                        self._show_runs_tree_tooltip(
+                            text,
+                            viewport_pos=pos,
+                            item_rect=rect,
+                            rich_html=str((payload or {}).get("html") or ""),
+                        )
+                    else:
+                        self._hide_runs_tree_tooltip()
+                    try:
+                        event.accept()
+                    except Exception:
+                        pass
+                    return True
+
+                if event is not None and event.type() in (QEvent.Leave, QEvent.Hide, QEvent.MouseButtonPress):
+                    self._hide_runs_tree_tooltip()
+
                 if event is not None and event.type() == QEvent.MouseButtonPress:
                     try:
                         self._runs_tree.setProperty("_tb_last_button", int(event.button()))
