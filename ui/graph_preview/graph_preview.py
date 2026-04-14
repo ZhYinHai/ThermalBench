@@ -2284,7 +2284,7 @@ class GraphPreview(QObject):
                     if obj is getattr(self, "_preview_header_tt_source", None):
                         self._hide_preview_header_tooltip()
 
-            if obj in header_widgets and event is not None and event.type() in (QEvent.Resize, QEvent.Show, QEvent.LayoutRequest):
+            if obj in header_widgets and event is not None and event.type() in (QEvent.Resize, QEvent.Show):
                 self._sync_preview_header_controls()
 
             if obj is getattr(self, "_preview_header_widget", None) and event is not None and event.type() in (QEvent.Hide, QEvent.Leave):
