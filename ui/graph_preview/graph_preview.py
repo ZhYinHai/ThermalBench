@@ -2171,12 +2171,32 @@ class GraphPreview(QObject):
 
     def preview_path(self, fpath: str) -> None:
         try:
-            self._exit_compare_mode()
             p = Path(fpath)
             self._set_preview_header_path(p)
             if is_csv_file(p) and self._preview_canvas is not None:
+                # Fast re-show: if the same CSV is already plotted, just
+                # make the canvas visible and refresh the header/layout.
+                if self._preview_csv_path == str(p) and (
+                    self._preview_df is not None
+                    or getattr(self, "_single_mode_multi_axis", False)
+                ):
+                    try:
+                        self._preview_label.clear()
+                        self._preview_label.hide()
+                    except Exception:
+                        pass
+                    try:
+                        self._preview_canvas.show()
+                    except Exception:
+                        pass
+                    self._sync_preview_header_controls()
+                    QTimer.singleShot(0, self._preview_relayout_and_redraw)
+                    return
+                self._exit_compare_mode()
                 self._plot_run_csv(str(p))
                 return
+
+            self._exit_compare_mode()
 
             if is_image_file(p):
                 if self._preview_canvas is not None:
@@ -2216,6 +2236,27 @@ class GraphPreview(QObject):
             try:
                 mp = Path(folder) / "compare_manifest.json"
                 if mp.exists() and mp.is_file():
+                    # Fast re-show: if this compare manifest is already plotted,
+                    # just make the canvas visible and refresh the header/layout.
+                    if (
+                        getattr(self, "_compare_mode", False)
+                        and getattr(self, "_compare_manifest_path", None) is not None
+                        and Path(self._compare_manifest_path).resolve() == mp.resolve()
+                        and getattr(self, "_compare_axes", None)
+                    ):
+                        self._set_preview_header_path(mp)
+                        try:
+                            self._preview_label.clear()
+                            self._preview_label.hide()
+                        except Exception:
+                            pass
+                        try:
+                            self._preview_canvas.show()
+                        except Exception:
+                            pass
+                        self._sync_preview_header_controls()
+                        QTimer.singleShot(0, self._preview_relayout_and_redraw)
+                        return
                     self._set_preview_header_path(mp)
                     self._plot_compare_manifest(mp)
                     return
@@ -4032,10 +4073,33 @@ class GraphPreview(QObject):
                 return
         except Exception:
             pass
-        _gp_preview_relayout_and_redraw(self)
         try:
+            if self._preview_canvas is None or self._preview_ax is None:
+                return
+            if not self._preview_canvas.isVisible():
+                return
+
+            # Single draw to obtain a renderer for measurement.
+            self._preview_canvas.draw()
+            renderer = self._preview_canvas.get_renderer()
+            if renderer is None:
+                return
+
+            # Measure tick-label width and adjust left margin.
+            left_pad_px = int(getattr(self, "_preview_left_tick_pad_px", 3) or 3)
+            try:
+                right_frac = float(self._preview_effective_right_frac())
+            except Exception:
+                right_frac = float(getattr(self, "_preview_right_frac", 0.995) or 0.995)
+            left_px = self._preview_required_left_margin_px(renderer, pad_px=left_pad_px)
+            self._preview_apply_axes_rect(right_frac=right_frac, left_margin_px=left_px)
+            self._preview_invalidate_interaction_cache()
+
+            # Additional single-slot layout adjustment.
             self._sync_preview_canvas_scroll_height(1)
             self._apply_single_slot_axis_layout(self._preview_ax)
+
+            # One final draw to render the corrected layout.
             self._preview_canvas.draw()
             try:
                 self._on_preview_draw()
@@ -5838,24 +5902,7 @@ class GraphPreview(QObject):
                 pass
 
             try:
-                self._preview_canvas.draw()
-                # draw_event should fire, but keep the explicit call as a safe fallback
-                try:
-                    self._on_preview_draw()
-                except Exception:
-                    pass
-                try:
-                    self._preview_relayout_and_redraw()
-                except Exception:
-                    pass
-                try:
-                    self._update_sticky_timeline(self._preview_ax)
-                except Exception:
-                    self._hide_sticky_timeline()
-                try:
-                    self._preview_canvas.draw()
-                except Exception:
-                    pass
+                self._preview_relayout_and_redraw()
             finally:
                 try:
                     c.setUpdatesEnabled(bool(was_updates))
@@ -6149,15 +6196,7 @@ class GraphPreview(QObject):
                 pass
 
             try:
-                self._preview_canvas.draw()
-                try:
-                    self._single_mode_relayout_and_redraw()
-                except Exception:
-                    pass
-                try:
-                    self._preview_canvas.draw()
-                except Exception:
-                    pass
+                self._single_mode_relayout_and_redraw()
             finally:
                 try:
                     c.setUpdatesEnabled(bool(was_updates))

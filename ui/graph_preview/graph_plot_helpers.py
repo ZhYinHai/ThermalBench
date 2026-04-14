@@ -105,7 +105,7 @@ def get_measurement_type_label(unit: str) -> str:
 
 def load_run_csv_dataframe(fpath: str) -> tuple[pd.DataFrame, list[str]]:
     """Load the run CSV and return (df_data, cols) exactly like the original code."""
-    df = pd.read_csv(fpath, header=0)
+    df = pd.read_csv(fpath, header=0, engine="c", low_memory=False)
     if df.shape[0] == 0:
         raise RuntimeError("Empty CSV")
 

@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QSize, QTimer, QObject, QThread, Signal, QEvent, QItemSelectionModel
+from PySide6.QtCore import Qt, QSize, QTimer, QObject, QThread, Signal, QEvent, QItemSelectionModel, QDir
 from PySide6.QtGui import QIcon, QPainter, QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QWidget,
@@ -959,6 +959,10 @@ class MainWindow(QWidget):
         runs_root = app_root() / "runs"
         self._runs_model = QFileSystemModel()
         try:
+            self._runs_model.setFilter(QDir.AllDirs | QDir.NoDotAndDotDot)
+        except Exception:
+            pass
+        try:
             self._runs_root = runs_root
             self._runs_model.setRootPath(str(self._runs_root))
         except Exception:
@@ -1632,9 +1636,11 @@ class MainWindow(QWidget):
         try:
             self._refresh_left_rail_icons()
             if index == getattr(self, "_page_results_index", -1):
-                # Let the UI finish switching tabs first, then select/plot.
+                # Apply splitter ratio synchronously (cheap), then defer
+                # the heavier select+plot to the next event-loop tick so
+                # the page switch paints immediately.
+                self._apply_results_split_ratio()
                 QTimer.singleShot(0, self.benchmark.select_latest_result)
-                QTimer.singleShot(0, self._apply_results_split_ratio)
         except Exception:
             pass
 

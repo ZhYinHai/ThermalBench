@@ -171,6 +171,34 @@ class BenchmarkController:
         self._update_remove_btn_state()
         self._update_compare_btn_state()
 
+        # Pre-scan latest result folder eagerly so it's cached
+        # before the user navigates to the results page.
+        try:
+            QTimer.singleShot(0, self._prescan_latest_folder)
+        except Exception:
+            pass
+
+    def _prescan_latest_folder(self) -> None:
+        """Eagerly cache the latest result folder and pre-warm the tree model."""
+        try:
+            if self._latest_cached_folder is None:
+                self._fast_find_latest_result_folder()
+
+            # Force QFileSystemModel to start loading the case folder
+            # (parent of the latest run) so its children are ready
+            # before the user opens the results page.
+            folder = self._latest_cached_folder
+            if folder is not None and self._runs_source_model is not None:
+                case_dir = folder.parent
+                try:
+                    idx = self._runs_source_model.index(str(case_dir))
+                    if idx.isValid() and self._runs_source_model.canFetchMore(idx):
+                        self._runs_source_model.fetchMore(idx)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _schedule_preview_target(self, *, fpath: str, is_dir: bool) -> None:
         try:
             self._pending_preview_target = str(fpath)
@@ -1931,7 +1959,8 @@ class BenchmarkController:
             if target_folder is None:
                 return
 
-            # 2) If current selection already points at that folder (or inside it), do nothing
+            # 2) If current selection already points at that folder (or inside it),
+            #    just refresh the header/canvas (it may have been hidden while on another page).
             try:
                 cur_idx = self._runs_tree.currentIndex()
                 cur_path_str = self._idx_to_path(cur_idx) if cur_idx is not None else ""
@@ -1940,6 +1969,10 @@ class BenchmarkController:
                 if cur_path and cur_path.exists():
                     cur_dir = cur_path if cur_path.is_dir() else cur_path.parent
                     if cur_dir.resolve() == target_folder.resolve():
+                        try:
+                            self._graph_preview.preview_folder(str(target_folder))
+                        except Exception:
+                            pass
                         return
             except Exception:
                 pass
@@ -1967,7 +2000,12 @@ class BenchmarkController:
             finally:
                 self._suppress_selection_preview = False
 
-            QTimer.singleShot(0, lambda: self._graph_preview.preview_folder(str(target_folder)))
+            # Preview immediately — no extra deferred tick needed since
+            # select_latest_result is already called from a deferred timer.
+            try:
+                self._graph_preview.preview_folder(str(target_folder))
+            except Exception:
+                pass
 
         except Exception:
             pass

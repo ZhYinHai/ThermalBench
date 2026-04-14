@@ -327,25 +327,27 @@ class RunsProxyModel(QSortFilterProxyModel):
     def _is_compare_run_dir_path(self, p: str) -> bool:
         """True if directory contains compare_manifest.json with type==compare."""
         try:
+            pn = self._norm_path(p)
+            key = f"run:{pn}"
+
+            cached = (self._compare_dir_cache or {}).get(key)
+            if cached is not None:
+                return bool(cached[1])
+
             dp = Path(p)
             if not dp.is_dir():
+                self._compare_dir_cache[key] = (0.0, False)
                 return False
 
             mp = dp / "compare_manifest.json"
             if not mp.is_file():
+                self._compare_dir_cache[key] = (0.0, False)
                 return False
-
-            pn = self._norm_path(p)
-            key = f"run:{pn}"
 
             try:
                 sig = float(mp.stat().st_mtime or 0.0)
             except Exception:
                 sig = 0.0
-
-            cached = (self._compare_dir_cache or {}).get(key)
-            if cached is not None and cached[0] == sig:
-                return bool(cached[1])
 
             is_compare = bool(self._manifest_is_compare(mp))
             self._compare_dir_cache[key] = (sig, is_compare)
@@ -356,16 +358,22 @@ class RunsProxyModel(QSortFilterProxyModel):
     def _is_compare_case_dir_path(self, p: str) -> bool:
         """True if directory has an immediate child directory that is a compare run dir."""
         try:
+            pn = self._norm_path(p)
+            key = f"case:{pn}"
+
+            cached = (self._compare_dir_cache or {}).get(key)
+            if cached is not None:
+                return bool(cached[1])
+
             dp = Path(p)
             if not dp.is_dir():
+                self._compare_dir_cache[key] = (0.0, False)
                 return False
 
             # If this is already a compare run dir, it's not a case dir.
             if (dp / "compare_manifest.json").is_file():
+                self._compare_dir_cache[key] = (0.0, False)
                 return False
-
-            pn = self._norm_path(p)
-            key = f"case:{pn}"
 
             child_sig = -1.0
             is_compare_case = False
@@ -389,10 +397,6 @@ class RunsProxyModel(QSortFilterProxyModel):
                 pass
 
             sig = float(child_sig)
-            cached = (self._compare_dir_cache or {}).get(key)
-            if cached is not None and cached[0] == sig:
-                return bool(cached[1])
-
             self._compare_dir_cache[key] = (sig, bool(is_compare_case))
             return bool(is_compare_case)
         except Exception:
