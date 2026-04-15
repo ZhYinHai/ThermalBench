@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
 )
 
 from ui.graph_preview.graph_plot_helpers import group_columns_by_unit, get_measurement_type_label
-from ui.widgets.ui_rounding import apply_rounded_corners
 from ui.widgets.ui_theme import resolve_effective_theme_mode
 
 
@@ -51,6 +50,7 @@ class LegendStatsPopup(QDialog):
         test_settings: Optional[dict] = None,
         theme_mode: Optional[str] = None,
         on_close: Optional[Callable[[], None]] = None,
+        measurement_title_for_unit: Optional[Callable[[str], str]] = None,
     ):
         super().__init__(parent)
 
@@ -58,7 +58,6 @@ class LegendStatsPopup(QDialog):
         self.setWindowFlag(Qt.Tool, True)
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.setModal(False)
-        apply_rounded_corners(self, 10)
 
         self._on_close = on_close
 
@@ -176,7 +175,7 @@ class LegendStatsPopup(QDialog):
 
         PAD = 14  # must match root.setContentsMargins(14,14,14,14)
         tree_wrap = QVBoxLayout()
-        tree_wrap.setContentsMargins(-PAD, 0, -PAD, 0)  # bleed into dialog padding
+        tree_wrap.setContentsMargins(-PAD, 0, 0, 0)  # bleed into dialog padding
         tree_wrap.setSpacing(0)
         tree_wrap.addWidget(self.tree, 1)
 
@@ -256,6 +255,81 @@ class LegendStatsPopup(QDialog):
         super().showEvent(event)
         # Re-run sizing on show to account for DPI/font rounding.
         QTimer.singleShot(0, self._autosize_to_content)
+
+    def _display_measurement_title(self, unit: str) -> str:
+        try:
+            cb = getattr(self, "_measurement_title_for_unit", None)
+            if callable(cb):
+                text = str(cb(unit) or "").strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+
+        try:
+            text = str(get_measurement_type_label(unit) or "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+        return str(unit or "Measurement").strip()
+
+    def _normalized_display_unit(self, unit: str) -> str:
+        try:
+            u = str(unit or "").strip()
+            if not u:
+                return ""
+
+            key = u.lower()
+            aliases = {
+                "°c": "°C",
+                "degc": "°C",
+                "c": "°C",
+                "w": "W",
+                "%": "%",
+                "rpm": "RPM",
+                "mb/s": "MB/s",
+                "mb": "MB",
+                "gb": "GB",
+                "mhz": "MHz",
+                "ghz": "GHz",
+                "v": "V",
+                "a": "A",
+            }
+            return aliases.get(key, u)
+        except Exception:
+            return str(unit or "").strip()
+
+
+    def _measurement_title_for_unit(self, unit: str, fallback: str = "") -> str:
+        try:
+            u = self._normalized_display_unit(unit)
+            key = u.lower()
+
+            label_map = {
+                "°c": "Temperature",
+                "w": "Power",
+                "%": "Utilization",
+                "rpm": "Fan Speed",
+                "mb/s": "Transfer Rate",
+                "mb": "Memory",
+                "gb": "Memory",
+                "mhz": "Clock",
+                "ghz": "Clock",
+                "v": "Voltage",
+                "a": "Current",
+            }
+
+            label = str(label_map.get(key) or get_measurement_type_label(unit) or fallback or "Measurement").strip()
+            if not u:
+                return label
+
+            return label if label.endswith(f"({u})") else f"{label} ({u})"
+        except Exception:
+            base = str(fallback or get_measurement_type_label(unit) or "Measurement").strip()
+            u = str(unit or "").strip()
+            return f"{base} ({u})" if u else base
 
     def _build_theme_palette(self) -> dict[str, str]:
         if self._theme_is_dark:
@@ -379,19 +453,19 @@ class LegendStatsPopup(QDialog):
 
             QTreeWidget QScrollBar:vertical {{
                 background: transparent;
-                width: 12px;
-                margin: 4px 2px 4px 2px;
+                width: 8px;
+                margin: 0px;
             }}
 
             QTreeWidget QScrollBar::groove:vertical {{
-                background: {self._theme['scroll_groove']};
-                border-radius: 6px;
+                background: transparent;
+                border-radius: 4px;
             }}
 
             QTreeWidget QScrollBar::handle:vertical {{
-                background: {self._theme['scroll_handle']};
-                border-radius: 6px;
-                min-height: 36px;
+                background: transparent;
+                border-radius: 4px;
+                min-height: 28px;
             }}
 
             QTreeWidget QScrollBar::add-line:vertical,
@@ -706,7 +780,13 @@ class LegendStatsPopup(QDialog):
                 try:
                     header = QTreeWidgetItem(self.tree)
                     header.setData(0, Qt.UserRole + 1, True)  # group header marker
-                    header.setText(0, str(get_measurement_type_label(unit)))
+                    header.setText(
+                        0,
+                        self._measurement_title_for_unit(
+                            unit,
+                            fallback=str(get_measurement_type_label(unit) or "Measurement"),
+                        ),
+                    )
                     header.setFlags(Qt.ItemIsEnabled)
                     f = QFont(self.tree.font())
                     f.setBold(True)

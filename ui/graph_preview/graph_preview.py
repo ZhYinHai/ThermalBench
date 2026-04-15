@@ -1020,6 +1020,7 @@ class GraphPreview(QObject):
             self._preview_header_subtitle_text = ""
         self._sync_preview_header_controls()
 
+
     def _copy_graph_to_clipboard(self) -> None:
         """Show a popup with checkboxes to select which graphs to copy to clipboard."""
         try:
@@ -1034,12 +1035,25 @@ class GraphPreview(QObject):
             graph_labels: list[str] = []
             if is_compare:
                 graph_labels = [str(s) for s in (getattr(self, "_compare_manifest_sensors", []) or [])]
+                # Fallback: try to reload compare manifest if sensors missing
+                if not graph_labels:
+                    mp = getattr(self, "_compare_manifest_path", None)
+                    if mp is not None:
+                        try:
+                            self._plot_compare_manifest(mp)
+                            graph_labels = [str(s) for s in (getattr(self, "_compare_manifest_sensors", []) or [])]
+                        except Exception:
+                            pass
+                if not graph_labels:
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.warning(copy_btn, "Copy Graph", "No compare sensors found. Compare manifest may be missing or invalid.")
+                    return
             elif is_multi:
                 for src_ax in (getattr(self, "_single_axes", []) or []):
                     st = (getattr(self, "_single_axis_state", {}) or {}).get(src_ax)
                     if st:
                         unit = str(st.get("unit", ""))
-                        graph_labels.append(str(get_measurement_type_label(unit) or unit or "Graph"))
+                        graph_labels.append(self._measurement_title_for_unit(unit, fallback="Graph"))
                     else:
                         graph_labels.append("Graph")
 
@@ -1182,12 +1196,6 @@ class GraphPreview(QObject):
             pass
 
     def _render_graph_to_clipboard(self, *, axis_indices: list[int] | None = None) -> None:
-        def _wrap_legend_label(label, max_chars=18):
-            # crude wrap: insert newline every max_chars
-            if len(label) <= max_chars:
-                return label
-            parts = [label[i:i+max_chars] for i in range(0, len(label), max_chars)]
-            return "\n".join(parts)
         """Render graph(s) as a static PNG with axis labels + legend, then copy to clipboard.
 
         axis_indices=None       -> all graphs in one image.
@@ -1195,10 +1203,34 @@ class GraphPreview(QObject):
         axis_indices=[0, 2]     -> selected subplots combined into one image.
         """
         import matplotlib.patheffects as pe
+        import textwrap
         from matplotlib.figure import Figure as _Fig
         from matplotlib.backends.backend_agg import FigureCanvasAgg
 
         try:
+            def _wrap_text(value: str, width: int) -> str:
+                s = str(value or "").strip()
+                if not s:
+                    return ""
+                try:
+                    return textwrap.fill(
+                        s,
+                        width=max(8, int(width)),
+                        break_long_words=False,
+                        break_on_hyphens=False,
+                    )
+                except Exception:
+                    return s
+
+            def _wrap_legend_label(value: str) -> str:
+                return _wrap_text(value, 24)
+
+            def _wrap_header_text(value: str) -> str:
+                return _wrap_text(value, 80)
+
+            def _wrap_axis_title(value: str) -> str:
+                return _wrap_text(value, 42)
+
             is_compare = bool(getattr(self, "_compare_mode", False))
             is_multi = bool(getattr(self, "_single_mode_multi_axis", False)) and not is_compare
 
@@ -1213,7 +1245,8 @@ class GraphPreview(QObject):
             subtitle_text = str(getattr(self, "_preview_header_subtitle_text", "") or "")
             suptitle = title_text
             if subtitle_text:
-                suptitle = f"{title_text}  \u2014  {subtitle_text}" if title_text else subtitle_text
+                suptitle = f"{title_text}  —  {subtitle_text}" if title_text else subtitle_text
+            suptitle = _wrap_header_text(suptitle)
 
             # ----- helper: apply axes style on the export figure -----
             def _style_ax(fig, ax):
@@ -1237,6 +1270,147 @@ class GraphPreview(QObject):
                     gl.set_linestyle(dot_dashes)
                     gl.set_alpha(0.9 if dark else 0.95)
 
+            def _style_legend_ax(ax):
+                ax.set_facecolor(fig_bg)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for side in ("left", "right", "top", "bottom"):
+                    ax.spines[side].set_visible(False)
+
+            def _draw_legend(ax, handles):
+                if not handles:
+                    return
+
+                wrapped_handles = []
+                for h in handles:
+                    try:
+                        wrapped_handles.append(
+                            Line2D(
+                                [0], [0],
+                                color=h.get_color(),
+                                lw=h.get_linewidth(),
+                                label=_wrap_legend_label(h.get_label()),
+                            )
+                        )
+                    except Exception:
+                        wrapped_handles.append(h)
+
+                leg = ax.legend(
+                    handles=wrapped_handles,
+                    loc="upper left",
+                    bbox_to_anchor=(0.02, 0.98),
+                    borderaxespad=0.0,
+                    fontsize=8,
+                    framealpha=0.7,
+                    facecolor=fig_bg,
+                    edgecolor=grid_color,
+                    labelcolor=label_color,
+                    handlelength=2.2,
+                    handletextpad=0.8,
+                    borderpad=0.9,
+                    labelspacing=0.65,
+                )
+                try:
+                    leg.get_frame().set_linewidth(0.8)
+                except Exception:
+                    pass
+
+            def _make_export_figure(plot_rows: int, *, legend_rows: int):
+                plot_rows = max(1, int(plot_rows))
+                legend_rows = max(1, int(legend_rows))
+
+                suptitle_lines = max(1, len(str(suptitle).splitlines())) if suptitle else 0
+
+                # Dedicated header band so long titles never bleed into the plot area.
+                header_h_in = 0.0
+                if suptitle_lines > 0:
+                    header_h_in = 0.45 + max(0, suptitle_lines - 1) * 0.24
+
+                plot_h_in = max(3.2 * plot_rows, 4.8) if plot_rows > 1 else 5.2
+                fig_h_in = plot_h_in + header_h_in
+
+                fig = _Fig(
+                    figsize=(12.8, fig_h_in),
+                    dpi=300,
+                    facecolor=fig_bg,
+                )
+                FigureCanvasAgg(fig)
+
+                if suptitle_lines > 0:
+                    outer = fig.add_gridspec(
+                        2,
+                        2,
+                        height_ratios=[header_h_in, plot_h_in],
+                        width_ratios=[82, 18],   # wider legend column
+                        hspace=0.03,
+                        wspace=0.04,
+                        left=0.055,
+                        right=0.965,             # extra right padding so legend never clips
+                        top=0.975,
+                        bottom=0.075,
+                    )
+
+                    header_ax = fig.add_subplot(outer[0, :])
+                    header_ax.set_facecolor(fig_bg)
+                    header_ax.set_xticks([])
+                    header_ax.set_yticks([])
+                    for side in ("left", "right", "top", "bottom"):
+                        header_ax.spines[side].set_visible(False)
+
+                    header_ax.text(
+                        0.0,
+                        1.0,
+                        suptitle,
+                        transform=header_ax.transAxes,
+                        ha="left",
+                        va="top",
+                        fontsize=12,
+                        color=label_color,
+                        fontweight=600,
+                        linespacing=1.15,
+                        clip_on=False,
+                    )
+
+                    # subtle divider so header and graph are clearly distinct
+                    try:
+                        header_ax.axhline(0.02, color=grid_color, linewidth=0.8, alpha=0.8)
+                    except Exception:
+                        pass
+
+                    plot_cell = outer[1, 0]
+                    legend_cell = outer[1, 1]
+                else:
+                    outer = fig.add_gridspec(
+                        1,
+                        2,
+                        width_ratios=[82, 18],
+                        wspace=0.04,
+                        left=0.055,
+                        right=0.965,
+                        top=0.965,
+                        bottom=0.075,
+                    )
+                    plot_cell = outer[0, 0]
+                    legend_cell = outer[0, 1]
+
+                plot_gs = plot_cell.subgridspec(plot_rows, 1, hspace=0.34)
+                plot_axes = []
+                share_ax = None
+                for i in range(plot_rows):
+                    ax = fig.add_subplot(plot_gs[i, 0], sharex=share_ax)
+                    if share_ax is None:
+                        share_ax = ax
+                    plot_axes.append(ax)
+
+                legend_gs = legend_cell.subgridspec(legend_rows, 1, hspace=0.34)
+                legend_axes = []
+                for i in range(legend_rows):
+                    lax = fig.add_subplot(legend_gs[i, 0])
+                    _style_legend_ax(lax)
+                    legend_axes.append(lax)
+
+                return fig, plot_axes, legend_axes
+
             # ----- helper: plot lines and return legend handles -----
             base_lw = 1.6
             glow_lw = base_lw + 1.2
@@ -1247,8 +1421,14 @@ class GraphPreview(QObject):
                 for c in cols:
                     y = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
                     colc = str(color_map.get(str(c), "#FFFFFF"))
-                    kw = dict(linewidth=base_lw, alpha=0.98, solid_capstyle="round",
-                              solid_joinstyle="round", antialiased=True, zorder=10)
+                    kw = dict(
+                        linewidth=base_lw,
+                        alpha=0.98,
+                        solid_capstyle="round",
+                        solid_joinstyle="round",
+                        antialiased=True,
+                        zorder=10,
+                    )
                     if is_dt:
                         ln = ax.plot_date(x_vals, y, "-", color=colc, **kw)[0]
                     else:
@@ -1271,7 +1451,6 @@ class GraphPreview(QObject):
                 run_labels = list(getattr(self, "_compare_run_labels", []) or [])
                 run_color_map = dict(getattr(self, "_compare_run_color_map", {}) or {})
 
-                # Determine which indices to render
                 if axis_indices is not None:
                     sel = [i for i in axis_indices if i < len(compare_axes)]
                     if not sel:
@@ -1280,20 +1459,15 @@ class GraphPreview(QObject):
                     sel = list(range(len(compare_axes)))
 
                 n = len(sel)
-                fig = _Fig(figsize=(12, max(3 * n, 4) if n > 1 else 5), dpi=300, facecolor=fig_bg)
-                FigureCanvasAgg(fig)
-                if n > 1:
-                    ax_arr = fig.subplots(nrows=n, ncols=1, sharex=True)
-                    fig_axes = list(np.ravel(ax_arr))
-                else:
-                    fig_axes = [fig.add_subplot(111)]
+                fig, fig_axes, legend_axes = _make_export_figure(n, legend_rows=1)
 
                 for plot_i, src_i in enumerate(sel):
                     src_ax = compare_axes[src_i]
                     st = axes_state.get(src_ax)
                     if not st:
                         continue
-                    dst_ax = fig_axes[plot_i] if plot_i < len(fig_axes) else fig_axes[-1]
+
+                    dst_ax = fig_axes[plot_i]
                     _style_ax(fig, dst_ax)
 
                     x_vals = np.asarray(st["x"], dtype=float)
@@ -1302,53 +1476,41 @@ class GraphPreview(QObject):
                     colors = st["colors"]
                     is_dt = bool(st.get("is_dt", True))
                     cmap_local = {str(c): str(clr) for c, clr in zip(cols, colors)}
+
                     _plot_cols(dst_ax, x_vals, df, cols, cmap_local, is_dt)
 
                     sensor_name = sensors[src_i] if src_i < len(sensors) else ""
                     unit = extract_unit_from_column(sensor_name) if sensor_name else ""
-                    dst_ax.set_ylabel(unit if unit else sensor_name, color=label_color, fontsize=10)
-                    dst_ax.set_title(sensor_name, fontsize=11, color=label_color, loc="left", pad=8)
+                    dst_ax.set_ylabel("")
+                    title_text_wrapped = _wrap_axis_title(sensor_name)  # or measurement_label
+                    title_lines = max(1, len(str(title_text_wrapped).splitlines()))
+                    dst_ax.set_title(
+                        title_text_wrapped,
+                        fontsize=11,
+                        color=label_color,
+                        loc="left",
+                        pad=8 + (title_lines - 1) * 10,
+                    )
 
                     if plot_i == n - 1:
                         apply_elapsed_time_formatter(dst_ax, is_dt=is_dt, x_vals=x_vals)
                         dst_ax.set_xlabel("Elapsed time", color=label_color, fontsize=10)
                         dst_ax.tick_params(axis="x", labelbottom=True, bottom=True)
+                    else:
+                        dst_ax.tick_params(axis="x", labelbottom=False, bottom=False)
 
-                # Build legend from run labels + colors
                 all_handles = []
                 for label in run_labels:
                     clr = run_color_map.get(str(label), "#FFFFFF")
-                    wrapped_label = _wrap_legend_label(str(label), max_chars=max(10, int(fig.get_figwidth() * 2)))
-                    all_handles.append(Line2D([0], [0], color=clr, lw=base_lw, label=wrapped_label))
+                    all_handles.append(Line2D([0], [0], color=clr, lw=base_lw, label=str(label)))
 
-                # Add legend to each subplot axis (never missing)
-                if all_handles:
-                    for ax in fig_axes:
-                        leg = ax.legend(
-                            handles=all_handles,
-                            loc="upper left",
-                            bbox_to_anchor=(1.0, 1),
-                            bbox_transform=fig.transFigure,
-                            borderaxespad=0.0,
-                            fontsize=8,
-                            framealpha=0.7,
-                            facecolor=fig_bg,
-                            edgecolor=grid_color,
-                            labelcolor=label_color,
-                            handletextpad=0.5,
-                            columnspacing=0.8,
-                        )
-                        # Limit legend width to 15% of figure
-                        fig_w = fig.get_figwidth() * fig.dpi
-                        leg.set_bbox_to_anchor((fig_w * 0.85, 1, fig_w * 0.15, None), transform=fig.transFigure)
-                        leg.set_in_layout(False)
+                _draw_legend(legend_axes[0], all_handles)
 
             # ================= MULTI-AXIS (single run) =================
             elif is_multi:
                 axis_state = getattr(self, "_single_axis_state", {}) or {}
                 single_axes = list(getattr(self, "_single_axes", []) or [])
 
-                # Determine which indices to render
                 if axis_indices is not None:
                     sel = [i for i in axis_indices if i < len(single_axes)]
                     if not sel:
@@ -1357,20 +1519,17 @@ class GraphPreview(QObject):
                     sel = list(range(len(single_axes)))
 
                 n = len(sel)
-                fig = _Fig(figsize=(12, max(3 * n, 4) if n > 1 else 5), dpi=300, facecolor=fig_bg)
-                FigureCanvasAgg(fig)
-                if n > 1:
-                    ax_arr = fig.subplots(nrows=n, ncols=1, sharex=True)
-                    fig_axes = list(np.ravel(ax_arr))
-                else:
-                    fig_axes = [fig.add_subplot(111)]
+                fig, fig_axes, legend_axes = _make_export_figure(n, legend_rows=n)
 
                 for plot_i, src_i in enumerate(sel):
                     src_ax = single_axes[src_i]
                     st = axis_state.get(src_ax)
                     if not st:
                         continue
-                    dst_ax = fig_axes[plot_i] if plot_i < len(fig_axes) else fig_axes[-1]
+
+                    dst_ax = fig_axes[plot_i]
+                    legend_ax = legend_axes[plot_i]
+
                     _style_ax(fig, dst_ax)
 
                     x_vals = np.asarray(st["x"], dtype=float)
@@ -1382,27 +1541,26 @@ class GraphPreview(QObject):
                     cmap_local = {str(c): str(clr) for c, clr in zip(cols, colors)}
 
                     handles = _plot_cols(dst_ax, x_vals, df, cols, cmap_local, is_dt)
-                    measurement_label = str(get_measurement_type_label(unit) or unit or "")
-                    dst_ax.set_ylabel(unit if unit else measurement_label, color=label_color, fontsize=10)
-                    dst_ax.set_title(measurement_label, fontsize=11, color=label_color, loc="left", pad=8)
+                    measurement_label = self._measurement_title_for_unit(unit)
+                    dst_ax.set_ylabel("")
+                    title_text_wrapped = _wrap_axis_title(measurement_label or "Graph")
+                    title_lines = max(1, len(str(title_text_wrapped).splitlines()))
+                    dst_ax.set_title(
+                        title_text_wrapped,
+                        fontsize=11,
+                        color=label_color,
+                        loc="left",
+                        pad=8 + (title_lines - 1) * 10,
+                    )
 
-                    if handles:
-                        dst_ax.legend(
-                            handles=handles,
-                            loc="upper left",
-                            bbox_to_anchor=(1.01, 1),
-                            borderaxespad=0.0,
-                            fontsize=8,
-                            framealpha=0.7,
-                            facecolor=fig_bg,
-                            edgecolor=grid_color,
-                            labelcolor=label_color,
-                        )
+                    _draw_legend(legend_ax, handles)
 
                     if plot_i == n - 1:
                         apply_elapsed_time_formatter(dst_ax, is_dt=is_dt, x_vals=x_vals)
                         dst_ax.set_xlabel("Elapsed time", color=label_color, fontsize=10)
                         dst_ax.tick_params(axis="x", labelbottom=True, bottom=True)
+                    else:
+                        dst_ax.tick_params(axis="x", labelbottom=False, bottom=False)
 
             # ================= SINGLE AXIS =================
             else:
@@ -1417,9 +1575,10 @@ class GraphPreview(QObject):
 
                 x_vals = np.asarray(x_vals, dtype=float)
 
-                fig = _Fig(figsize=(12, 5), dpi=300, facecolor=fig_bg)
-                FigureCanvasAgg(fig)
-                ax = fig.add_subplot(111)
+                fig, fig_axes, legend_axes = _make_export_figure(1, legend_rows=1)
+                ax = fig_axes[0]
+                legend_ax = legend_axes[0]
+
                 _style_ax(fig, ax)
 
                 handles = _plot_cols(ax, x_vals, df_all, active_cols, color_map, is_dt)
@@ -1431,37 +1590,37 @@ class GraphPreview(QObject):
                     if u:
                         unit_set.add(u)
                 y_label = ", ".join(sorted(unit_set)) if unit_set else measurement_label
-                ax.set_ylabel(y_label, color=label_color, fontsize=10)
-                ax.set_title(measurement_label, fontsize=11, color=label_color, loc="left", pad=8)
+                ax.set_ylabel("")
+                title_text_wrapped = _wrap_axis_title(measurement_label or "Graph")
+                title_lines = max(1, len(str(title_text_wrapped).splitlines()))
+                ax.set_title(
+                    title_text_wrapped,
+                    fontsize=11,
+                    color=label_color,
+                    loc="left",
+                    pad=8 + (title_lines - 1) * 10,
+                )
 
                 apply_elapsed_time_formatter(ax, is_dt=is_dt, x_vals=x_vals)
                 ax.set_xlabel("Elapsed time", color=label_color, fontsize=10)
                 ax.tick_params(axis="x", labelbottom=True, bottom=True)
 
-                if handles:
-                    ax.legend(
-                        handles=handles,
-                        loc="upper left",
-                        bbox_to_anchor=(1.01, 1),
-                        borderaxespad=0.0,
-                        fontsize=8,
-                        framealpha=0.7,
-                        facecolor=fig_bg,
-                        edgecolor=grid_color,
-                        labelcolor=label_color,
-                    )
-
-            # Common: suptitle + tight layout + render to clipboard
-            if suptitle:
-                fig.suptitle(suptitle, fontsize=12, color=label_color, fontweight=600, y=0.995)
+                _draw_legend(legend_ax, handles)
 
             try:
-                fig.tight_layout(rect=[0, 0, 1, 0.97] if suptitle else [0, 0, 1, 1])
+                fig.align_ylabels(fig_axes)
             except Exception:
                 pass
 
             buf = io.BytesIO()
-            fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), edgecolor="none")
+            fig.savefig(
+                buf,
+                format="png",
+                facecolor=fig.get_facecolor(),
+                edgecolor="none",
+                bbox_inches="tight",
+                pad_inches=0.08,
+            )
             buf.seek(0)
 
             qimg = QImage()
@@ -1476,7 +1635,6 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
-            # Brief visual feedback on the button
             copy_btn = getattr(self, "_preview_header_copy_btn", None)
             if copy_btn is not None:
                 try:
@@ -1486,8 +1644,9 @@ class GraphPreview(QObject):
                 except Exception:
                     pass
 
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
 
     def _apply_preview_surface_theme(self) -> None:
         try:
@@ -3069,6 +3228,82 @@ class GraphPreview(QObject):
             return [c for c in cols if c != amb]
         return cols
 
+    def _normalized_display_unit(self, unit: str) -> str:
+        try:
+            u = str(unit or "").strip()
+            if not u:
+                return ""
+
+            key = u.lower()
+            aliases = {
+                "°c": "°C",
+                "degc": "°C",
+                "c": "°C",
+                "w": "W",
+                "%": "%",
+                "rpm": "RPM",
+                "mb/s": "MB/s",
+                "mb": "MB",
+                "gb": "GB",
+                "mhz": "MHz",
+                "ghz": "GHz",
+                "v": "V",
+                "a": "A",
+            }
+            return aliases.get(key, u)
+        except Exception:
+            return str(unit or "").strip()
+
+
+    def _measurement_title_for_unit(self, unit: str, fallback: str = "") -> str:
+        try:
+            u = self._normalized_display_unit(unit)
+            key = u.lower()
+
+            label_map = {
+                "°c": "Temperature",
+                "w": "Power",
+                "%": "Utilization",
+                "rpm": "Fan Speed",
+                "mb/s": "Transfer Rate",
+                "mb": "Memory",
+                "gb": "Memory",
+                "mhz": "Clock",
+                "ghz": "Clock",
+                "v": "Voltage",
+                "a": "Current",
+            }
+
+            label = str(label_map.get(key) or get_measurement_type_label(unit) or fallback or "Measurement").strip()
+            if not u:
+                return label
+
+            if re.search(rf"\(\s*{re.escape(u)}\s*\)$", label, flags=re.IGNORECASE):
+                return label
+
+            return f"{label} ({u})"
+        except Exception:
+            base = str(fallback or get_measurement_type_label(unit) or "Measurement").strip()
+            u = str(unit or "").strip()
+            return f"{base} ({u})" if u else base
+
+    def _legend_stats_popup_title(self) -> str:
+        try:
+            cols = [str(c) for c in (self._effective_available_cols() or []) if str(c)]
+            if not cols:
+                cols = [str(c) for c in (self._preview_available_cols or []) if str(c)]
+            if not cols:
+                return self._preview_infer_stats_title()
+
+            groups = group_columns_by_unit(cols)
+            if len(groups) == 1:
+                unit = next(iter(groups.keys()))
+                return self._measurement_title_for_unit(unit)
+
+            return self._preview_infer_stats_title()
+        except Exception:
+            return self._preview_infer_stats_title()
+
     def _single_axis_measurement_label(self, cols: list[str] | None = None) -> str:
         try:
             probe_cols = [str(c) for c in (cols or self._effective_active_cols() or []) if str(c)]
@@ -3080,7 +3315,7 @@ class GraphPreview(QObject):
             groups = group_columns_by_unit(probe_cols)
             if len(groups) == 1:
                 unit = next(iter(groups.keys()))
-                return str(get_measurement_type_label(unit) or "").strip()
+                return self._measurement_title_for_unit(unit)
 
             first_col = str(probe_cols[0]).strip()
             if not first_col:
@@ -3088,7 +3323,7 @@ class GraphPreview(QObject):
             fallback_groups = group_columns_by_unit([first_col])
             if len(fallback_groups) == 1:
                 unit = next(iter(fallback_groups.keys()))
-                return str(get_measurement_type_label(unit) or "").strip()
+                return self._measurement_title_for_unit(unit)
         except Exception:
             pass
         return ""
@@ -4849,7 +5084,7 @@ class GraphPreview(QObject):
         top = self.parent.window() if hasattr(self.parent, "window") else self.parent
 
         stats_map = self._preview_get_stats_map()
-        title = self._preview_infer_stats_title()
+        title = self._legend_stats_popup_title()
         room_temp = self._preview_get_room_temperature()
         test_settings = self._preview_get_test_settings()
 
@@ -4868,6 +5103,7 @@ class GraphPreview(QObject):
             test_settings=test_settings,
             theme_mode=getattr(self, "_theme_mode", "dark"),
             on_close=self._on_legend_popup_closed,
+            measurement_title_for_unit=self._measurement_title_for_unit,
         )
 
         self._install_outside_click_closer()
@@ -6506,7 +6742,7 @@ class GraphPreview(QObject):
         # Plot each measurement type on its own axis
         for idx, (unit, group_cols) in enumerate(sorted_groups):
             ax = axes[idx]
-            measurement_label = get_measurement_type_label(unit)
+            measurement_label = self._measurement_title_for_unit(unit)
 
             self._apply_preview_axes_style(ax)
 
