@@ -2,6 +2,7 @@
 """Graph preview component for displaying CSV sensor data with interactive tooltips + Legend&Stats popup button."""
 
 from pathlib import Path
+import io
 import json
 import html
 import re
@@ -12,13 +13,18 @@ import numpy as np
 import pandas as pd
 
 from PySide6.QtCore import QTimer, Qt, QEvent, QObject
-from PySide6.QtGui import QPixmap, QFont
+from PySide6.QtGui import QImage, QPixmap, QFont
 from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QHBoxLayout,
     QLabel,
+    QMenu,
     QSizePolicy,
     QDialog,
     QPushButton,
     QToolTip,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -119,6 +125,8 @@ class GraphPreview(QObject):
         self._preview_header_zero_btn = None
         self._preview_header_delta_btn = None
         self._preview_header_legend_btn = None
+        self._preview_header_copy_btn = None
+        self._preview_header_preshow = False
         self._preview_header_title_text = ""
         self._preview_header_subtitle_text = ""
         self._preview_header_title_elided = False
@@ -764,9 +772,12 @@ class GraphPreview(QObject):
                 return
 
             try:
-                show_header = bool(self._preview_canvas is not None and self._preview_canvas.isVisible())
+                canvas_visible = bool(self._preview_canvas is not None and self._preview_canvas.isVisible())
             except Exception:
-                show_header = False
+                canvas_visible = False
+            if canvas_visible:
+                self._preview_header_preshow = False
+            show_header = canvas_visible or self._preview_header_preshow
 
             if not show_header:
                 self._hide_preview_header_tooltip()
@@ -878,6 +889,14 @@ class GraphPreview(QObject):
                 except Exception:
                     pass
 
+            copy_btn = getattr(self, "_preview_header_copy_btn", None)
+            if copy_btn is not None:
+                try:
+                    copy_btn.setStyleSheet(self._preview_header_button_stylesheet(active=False))
+                    copy_btn.setVisible(show_header)
+                except Exception:
+                    pass
+
             self._refresh_preview_header_tooltip()
         except Exception:
             pass
@@ -892,6 +911,7 @@ class GraphPreview(QObject):
         zero_btn: QPushButton | None = None,
         delta_btn: QPushButton | None = None,
         legend_btn: QPushButton | None = None,
+        copy_btn: QPushButton | None = None,
     ) -> None:
         try:
             self._preview_header_widget = header_widget
@@ -901,6 +921,7 @@ class GraphPreview(QObject):
             self._preview_header_zero_btn = zero_btn
             self._preview_header_delta_btn = delta_btn
             self._preview_header_legend_btn = legend_btn
+            self._preview_header_copy_btn = copy_btn
 
             for widget in (header_widget, title_label, subtitle_label):
                 if widget is not None:
@@ -926,6 +947,11 @@ class GraphPreview(QObject):
             if legend_btn is not None:
                 try:
                     legend_btn.clicked.connect(self.toggle_legend_popup)
+                except Exception:
+                    pass
+            if copy_btn is not None:
+                try:
+                    copy_btn.clicked.connect(self._copy_graph_to_clipboard)
                 except Exception:
                     pass
         except Exception:
@@ -993,6 +1019,475 @@ class GraphPreview(QObject):
             self._preview_header_title_text = ""
             self._preview_header_subtitle_text = ""
         self._sync_preview_header_controls()
+
+    def _copy_graph_to_clipboard(self) -> None:
+        """Show a popup with checkboxes to select which graphs to copy to clipboard."""
+        try:
+            copy_btn = getattr(self, "_preview_header_copy_btn", None)
+            if copy_btn is None:
+                return
+
+            # Determine available graphs
+            is_compare = bool(getattr(self, "_compare_mode", False))
+            is_multi = bool(getattr(self, "_single_mode_multi_axis", False)) and not is_compare
+
+            graph_labels: list[str] = []
+            if is_compare:
+                graph_labels = [str(s) for s in (getattr(self, "_compare_manifest_sensors", []) or [])]
+            elif is_multi:
+                for src_ax in (getattr(self, "_single_axes", []) or []):
+                    st = (getattr(self, "_single_axis_state", {}) or {}).get(src_ax)
+                    if st:
+                        unit = str(st.get("unit", ""))
+                        graph_labels.append(str(get_measurement_type_label(unit) or unit or "Graph"))
+                    else:
+                        graph_labels.append("Graph")
+
+            # Single-axis mode: only one graph, copy directly
+            if len(graph_labels) <= 1:
+                self._render_graph_to_clipboard(axis_indices=None)
+                return
+
+            # --- Build popup ---
+            dark = bool(getattr(self, "_theme_is_dark", True))
+            if dark:
+                bg, text, secondary = "#242424", "#EAEAEA", "#9A9A9A"
+                border, sep_color = "#3A3A3A", "rgba(255,255,255,0.10)"
+                hover_bg = "rgba(255,255,255,0.06)"
+                btn_bg, btn_border = "#2A2A2A", "#3A3A3A"
+                btn_hover_bg, btn_hover_border = "#333333", "#4A4A4A"
+                indicator_off, indicator_on = "#555555", "#9A9A9A"
+            else:
+                bg, text, secondary = "#FFFFFF", "#1A1A1A", "#5E5E5E"
+                border, sep_color = "#D0D0D0", "rgba(0,0,0,0.10)"
+                hover_bg = "rgba(0,0,0,0.06)"
+                btn_bg, btn_border = "#F5F5F5", "#D0D0D0"
+                btn_hover_bg, btn_hover_border = "#E8E8E8", "#B0B0B0"
+                indicator_off, indicator_on = "#C0C0C0", "#888888"
+
+            popup = QDialog(copy_btn, Qt.Popup | Qt.FramelessWindowHint)
+            popup.setAttribute(Qt.WA_DeleteOnClose)
+            popup.setStyleSheet(
+                f"QDialog {{ background: {bg}; border: 1px solid {border}; padding: 0; }}"
+            )
+
+            layout = QVBoxLayout(popup)
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(2)
+
+            # Header label
+            header = QLabel("Select graphs to copy")
+            header.setStyleSheet(
+                f"color: {secondary}; font-size: 10px; font-weight: 600;"
+                f" padding: 2px 4px 6px 4px; background: transparent; border: none;"
+            )
+            layout.addWidget(header)
+
+            cb_style = (
+                f"QCheckBox {{ color: {text}; font-size: 12px; padding: 6px 6px;"
+                f" background: transparent; border: none; border-radius: 0px; spacing: 8px; }}"
+                f"QCheckBox:hover {{ background: {hover_bg}; }}"
+                f"QCheckBox::indicator {{ width: 8px; height: 8px;"
+                f" border: 2px solid {indicator_off}; border-radius: 6px; background: transparent; }}"
+                f"QCheckBox::indicator:checked {{ background: {indicator_on};"
+                f" border-color: {indicator_on}; }}"
+            )
+
+            # "Select all" checkbox
+            select_all_cb = QCheckBox("Select all")
+            select_all_cb.setChecked(False)
+            select_all_cb.setStyleSheet(
+                cb_style.replace("font-size: 12px;", "font-size: 12px; font-weight: 600;")
+            )
+            layout.addWidget(select_all_cb)
+
+            # Separator
+            sep = QWidget()
+            sep.setFixedHeight(1)
+            sep.setStyleSheet(f"background: {sep_color}; border: none;")
+            layout.addWidget(sep)
+
+            # Individual graph checkboxes
+            checkboxes: list[QCheckBox] = []
+            for lbl in graph_labels:
+                cb = QCheckBox(lbl)
+                cb.setChecked(False)
+                cb.setStyleSheet(cb_style)
+                layout.addWidget(cb)
+                checkboxes.append(cb)
+
+            # Wire Select All <-> individual checkboxes
+            _updating_select_all = [False]
+
+            def _on_select_all_toggled(state):
+                _updating_select_all[0] = True
+                checked = select_all_cb.isChecked()
+                for cb in checkboxes:
+                    cb.setChecked(checked)
+                _updating_select_all[0] = False
+                copy_action_btn.setEnabled(checked)
+
+            def _on_individual_toggled(state=None):
+                if _updating_select_all[0]:
+                    return
+                all_checked = all(cb.isChecked() for cb in checkboxes)
+                any_checked = any(cb.isChecked() for cb in checkboxes)
+                _updating_select_all[0] = True
+                select_all_cb.setChecked(all_checked)
+                _updating_select_all[0] = False
+                copy_action_btn.setEnabled(any_checked)
+
+            select_all_cb.toggled.connect(_on_select_all_toggled)
+            for cb in checkboxes:
+                cb.toggled.connect(_on_individual_toggled)
+
+            # Bottom button row
+            btn_row = QHBoxLayout()
+            btn_row.setContentsMargins(0, 6, 0, 0)
+            btn_row.setSpacing(8)
+            btn_row.addStretch()
+
+            copy_action_btn = QPushButton("Copy")
+            copy_action_btn.setCursor(Qt.PointingHandCursor)
+            copy_action_btn.setFocusPolicy(Qt.NoFocus)
+            copy_action_btn.setEnabled(False)
+            copy_action_btn.setStyleSheet(
+                f"QPushButton {{ background: {btn_bg}; color: {text};"
+                f" border: 1px solid {btn_border}; border-radius: 6px;"
+                f" padding: 6px 20px; font-size: 12px; font-weight: 500; }}"
+                f"QPushButton:hover {{ background: {btn_hover_bg}; border-color: {btn_hover_border}; }}"
+                f"QPushButton:disabled {{ background: {sep_color}; color: {secondary}; border-color: {sep_color}; }}"
+            )
+
+            def _do_copy():
+                selected = [i for i, cb in enumerate(checkboxes) if cb.isChecked()]
+                popup.close()
+                if not selected:
+                    return
+                if len(selected) == len(graph_labels):
+                    self._render_graph_to_clipboard(axis_indices=None)
+                else:
+                    self._render_graph_to_clipboard(axis_indices=selected)
+
+            copy_action_btn.clicked.connect(_do_copy)
+            btn_row.addWidget(copy_action_btn)
+            layout.addLayout(btn_row)
+
+            # Position below the button
+            pos = copy_btn.mapToGlobal(copy_btn.rect().bottomLeft())
+            popup.adjustSize()
+            popup.move(pos)
+            popup.show()
+        except Exception:
+            pass
+
+    def _render_graph_to_clipboard(self, *, axis_indices: list[int] | None = None) -> None:
+        def _wrap_legend_label(label, max_chars=18):
+            # crude wrap: insert newline every max_chars
+            if len(label) <= max_chars:
+                return label
+            parts = [label[i:i+max_chars] for i in range(0, len(label), max_chars)]
+            return "\n".join(parts)
+        """Render graph(s) as a static PNG with axis labels + legend, then copy to clipboard.
+
+        axis_indices=None       -> all graphs in one image.
+        axis_indices=[0]        -> only the subplot at index 0.
+        axis_indices=[0, 2]     -> selected subplots combined into one image.
+        """
+        import matplotlib.patheffects as pe
+        from matplotlib.figure import Figure as _Fig
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+        try:
+            is_compare = bool(getattr(self, "_compare_mode", False))
+            is_multi = bool(getattr(self, "_single_mode_multi_axis", False)) and not is_compare
+
+            dark = bool(getattr(self, "_theme_is_dark", True))
+            fig_bg = str(self._preview_theme.get("figure_bg", "#121212"))
+            label_color = self._preview_label_color()
+            grid_color = str(getattr(self, "_preview_grid_color", "#3A3A3A"))
+            dot_dashes = getattr(self, "_preview_dot_dashes", (0, (2, 4)))
+            tick_color = "#BDBDBD" if dark else "#666666"
+
+            title_text = str(getattr(self, "_preview_header_title_text", "") or "")
+            subtitle_text = str(getattr(self, "_preview_header_subtitle_text", "") or "")
+            suptitle = title_text
+            if subtitle_text:
+                suptitle = f"{title_text}  \u2014  {subtitle_text}" if title_text else subtitle_text
+
+            # ----- helper: apply axes style on the export figure -----
+            def _style_ax(fig, ax):
+                ax.set_facecolor(fig_bg)
+                for side in ("left", "right"):
+                    ax.spines[side].set_visible(False)
+                for side in ("top", "bottom"):
+                    sp = ax.spines[side]
+                    sp.set_visible(True)
+                    sp.set_color(grid_color)
+                    sp.set_linewidth(0.9)
+                    sp.set_linestyle(dot_dashes)
+                    sp.set_alpha(0.9 if dark else 0.95)
+                ax.tick_params(axis="both", length=0)
+                ax.tick_params(axis="x", colors=tick_color)
+                ax.tick_params(axis="y", colors=tick_color)
+                ax.xaxis.label.set_color(label_color)
+                ax.yaxis.label.set_color(label_color)
+                ax.grid(True, which="major", axis="y", color=grid_color, linewidth=0.9)
+                for gl in ax.get_ygridlines():
+                    gl.set_linestyle(dot_dashes)
+                    gl.set_alpha(0.9 if dark else 0.95)
+
+            # ----- helper: plot lines and return legend handles -----
+            base_lw = 1.6
+            glow_lw = base_lw + 1.2
+            glow_alpha = 0.16
+
+            def _plot_cols(ax, x_vals, df, cols, color_map, is_dt):
+                handles = []
+                for c in cols:
+                    y = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+                    colc = str(color_map.get(str(c), "#FFFFFF"))
+                    kw = dict(linewidth=base_lw, alpha=0.98, solid_capstyle="round",
+                              solid_joinstyle="round", antialiased=True, zorder=10)
+                    if is_dt:
+                        ln = ax.plot_date(x_vals, y, "-", color=colc, **kw)[0]
+                    else:
+                        ln = ax.plot(x_vals, y, "-", color=colc, **kw)[0]
+                    try:
+                        ln.set_path_effects([
+                            pe.Stroke(linewidth=glow_lw, foreground=colc, alpha=glow_alpha),
+                            pe.Normal(),
+                        ])
+                    except Exception:
+                        pass
+                    handles.append(Line2D([0], [0], color=colc, lw=base_lw, label=str(c)))
+                return handles
+
+            # ================= COMPARE MODE =================
+            if is_compare:
+                axes_state = getattr(self, "_compare_axis_state", {}) or {}
+                sensors = list(getattr(self, "_compare_manifest_sensors", []) or [])
+                compare_axes = list(getattr(self, "_compare_axes", []) or [])
+                run_labels = list(getattr(self, "_compare_run_labels", []) or [])
+                run_color_map = dict(getattr(self, "_compare_run_color_map", {}) or {})
+
+                # Determine which indices to render
+                if axis_indices is not None:
+                    sel = [i for i in axis_indices if i < len(compare_axes)]
+                    if not sel:
+                        return
+                else:
+                    sel = list(range(len(compare_axes)))
+
+                n = len(sel)
+                fig = _Fig(figsize=(12, max(3 * n, 4) if n > 1 else 5), dpi=300, facecolor=fig_bg)
+                FigureCanvasAgg(fig)
+                if n > 1:
+                    ax_arr = fig.subplots(nrows=n, ncols=1, sharex=True)
+                    fig_axes = list(np.ravel(ax_arr))
+                else:
+                    fig_axes = [fig.add_subplot(111)]
+
+                for plot_i, src_i in enumerate(sel):
+                    src_ax = compare_axes[src_i]
+                    st = axes_state.get(src_ax)
+                    if not st:
+                        continue
+                    dst_ax = fig_axes[plot_i] if plot_i < len(fig_axes) else fig_axes[-1]
+                    _style_ax(fig, dst_ax)
+
+                    x_vals = np.asarray(st["x"], dtype=float)
+                    df = st["df"]
+                    cols = st["cols"]
+                    colors = st["colors"]
+                    is_dt = bool(st.get("is_dt", True))
+                    cmap_local = {str(c): str(clr) for c, clr in zip(cols, colors)}
+                    _plot_cols(dst_ax, x_vals, df, cols, cmap_local, is_dt)
+
+                    sensor_name = sensors[src_i] if src_i < len(sensors) else ""
+                    unit = extract_unit_from_column(sensor_name) if sensor_name else ""
+                    dst_ax.set_ylabel(unit if unit else sensor_name, color=label_color, fontsize=10)
+                    dst_ax.set_title(sensor_name, fontsize=11, color=label_color, loc="left", pad=8)
+
+                    if plot_i == n - 1:
+                        apply_elapsed_time_formatter(dst_ax, is_dt=is_dt, x_vals=x_vals)
+                        dst_ax.set_xlabel("Elapsed time", color=label_color, fontsize=10)
+                        dst_ax.tick_params(axis="x", labelbottom=True, bottom=True)
+
+                # Build legend from run labels + colors
+                all_handles = []
+                for label in run_labels:
+                    clr = run_color_map.get(str(label), "#FFFFFF")
+                    wrapped_label = _wrap_legend_label(str(label), max_chars=max(10, int(fig.get_figwidth() * 2)))
+                    all_handles.append(Line2D([0], [0], color=clr, lw=base_lw, label=wrapped_label))
+
+                # Add legend to each subplot axis (never missing)
+                if all_handles:
+                    for ax in fig_axes:
+                        leg = ax.legend(
+                            handles=all_handles,
+                            loc="upper left",
+                            bbox_to_anchor=(1.0, 1),
+                            bbox_transform=fig.transFigure,
+                            borderaxespad=0.0,
+                            fontsize=8,
+                            framealpha=0.7,
+                            facecolor=fig_bg,
+                            edgecolor=grid_color,
+                            labelcolor=label_color,
+                            handletextpad=0.5,
+                            columnspacing=0.8,
+                        )
+                        # Limit legend width to 15% of figure
+                        fig_w = fig.get_figwidth() * fig.dpi
+                        leg.set_bbox_to_anchor((fig_w * 0.85, 1, fig_w * 0.15, None), transform=fig.transFigure)
+                        leg.set_in_layout(False)
+
+            # ================= MULTI-AXIS (single run) =================
+            elif is_multi:
+                axis_state = getattr(self, "_single_axis_state", {}) or {}
+                single_axes = list(getattr(self, "_single_axes", []) or [])
+
+                # Determine which indices to render
+                if axis_indices is not None:
+                    sel = [i for i in axis_indices if i < len(single_axes)]
+                    if not sel:
+                        return
+                else:
+                    sel = list(range(len(single_axes)))
+
+                n = len(sel)
+                fig = _Fig(figsize=(12, max(3 * n, 4) if n > 1 else 5), dpi=300, facecolor=fig_bg)
+                FigureCanvasAgg(fig)
+                if n > 1:
+                    ax_arr = fig.subplots(nrows=n, ncols=1, sharex=True)
+                    fig_axes = list(np.ravel(ax_arr))
+                else:
+                    fig_axes = [fig.add_subplot(111)]
+
+                for plot_i, src_i in enumerate(sel):
+                    src_ax = single_axes[src_i]
+                    st = axis_state.get(src_ax)
+                    if not st:
+                        continue
+                    dst_ax = fig_axes[plot_i] if plot_i < len(fig_axes) else fig_axes[-1]
+                    _style_ax(fig, dst_ax)
+
+                    x_vals = np.asarray(st["x"], dtype=float)
+                    df = st["df"]
+                    cols = st["cols"]
+                    colors = st["colors"]
+                    is_dt = bool(st.get("is_dt", True))
+                    unit = str(st.get("unit", ""))
+                    cmap_local = {str(c): str(clr) for c, clr in zip(cols, colors)}
+
+                    handles = _plot_cols(dst_ax, x_vals, df, cols, cmap_local, is_dt)
+                    measurement_label = str(get_measurement_type_label(unit) or unit or "")
+                    dst_ax.set_ylabel(unit if unit else measurement_label, color=label_color, fontsize=10)
+                    dst_ax.set_title(measurement_label, fontsize=11, color=label_color, loc="left", pad=8)
+
+                    if handles:
+                        dst_ax.legend(
+                            handles=handles,
+                            loc="upper left",
+                            bbox_to_anchor=(1.01, 1),
+                            borderaxespad=0.0,
+                            fontsize=8,
+                            framealpha=0.7,
+                            facecolor=fig_bg,
+                            edgecolor=grid_color,
+                            labelcolor=label_color,
+                        )
+
+                    if plot_i == n - 1:
+                        apply_elapsed_time_formatter(dst_ax, is_dt=is_dt, x_vals=x_vals)
+                        dst_ax.set_xlabel("Elapsed time", color=label_color, fontsize=10)
+                        dst_ax.tick_params(axis="x", labelbottom=True, bottom=True)
+
+            # ================= SINGLE AXIS =================
+            else:
+                df_all = getattr(self, "_preview_df_all", None)
+                x_vals = getattr(self, "_preview_x", None)
+                is_dt = bool(getattr(self, "_preview_is_dt", True))
+                color_map = dict(getattr(self, "_preview_color_map", {}) or {})
+                active_cols = list(self._effective_active_cols())
+
+                if df_all is None or x_vals is None or not active_cols:
+                    return
+
+                x_vals = np.asarray(x_vals, dtype=float)
+
+                fig = _Fig(figsize=(12, 5), dpi=300, facecolor=fig_bg)
+                FigureCanvasAgg(fig)
+                ax = fig.add_subplot(111)
+                _style_ax(fig, ax)
+
+                handles = _plot_cols(ax, x_vals, df_all, active_cols, color_map, is_dt)
+
+                measurement_label = str(self._single_axis_measurement_label() or "")
+                unit_set = set()
+                for c in active_cols:
+                    u = extract_unit_from_column(c)
+                    if u:
+                        unit_set.add(u)
+                y_label = ", ".join(sorted(unit_set)) if unit_set else measurement_label
+                ax.set_ylabel(y_label, color=label_color, fontsize=10)
+                ax.set_title(measurement_label, fontsize=11, color=label_color, loc="left", pad=8)
+
+                apply_elapsed_time_formatter(ax, is_dt=is_dt, x_vals=x_vals)
+                ax.set_xlabel("Elapsed time", color=label_color, fontsize=10)
+                ax.tick_params(axis="x", labelbottom=True, bottom=True)
+
+                if handles:
+                    ax.legend(
+                        handles=handles,
+                        loc="upper left",
+                        bbox_to_anchor=(1.01, 1),
+                        borderaxespad=0.0,
+                        fontsize=8,
+                        framealpha=0.7,
+                        facecolor=fig_bg,
+                        edgecolor=grid_color,
+                        labelcolor=label_color,
+                    )
+
+            # Common: suptitle + tight layout + render to clipboard
+            if suptitle:
+                fig.suptitle(suptitle, fontsize=12, color=label_color, fontweight=600, y=0.995)
+
+            try:
+                fig.tight_layout(rect=[0, 0, 1, 0.97] if suptitle else [0, 0, 1, 1])
+            except Exception:
+                pass
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", facecolor=fig.get_facecolor(), edgecolor="none")
+            buf.seek(0)
+
+            qimg = QImage()
+            qimg.loadFromData(buf.read())
+            clipboard = QApplication.clipboard()
+            if clipboard is not None:
+                clipboard.setImage(qimg)
+
+            buf.close()
+            try:
+                fig.clear()
+            except Exception:
+                pass
+
+            # Brief visual feedback on the button
+            copy_btn = getattr(self, "_preview_header_copy_btn", None)
+            if copy_btn is not None:
+                try:
+                    prev_text = copy_btn.text()
+                    copy_btn.setText("Copied!")
+                    QTimer.singleShot(1500, lambda: copy_btn.setText(prev_text))
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
 
     def _apply_preview_surface_theme(self) -> None:
         try:

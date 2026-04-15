@@ -1447,12 +1447,14 @@ class MainWindow(QWidget):
         preview_header_meta_layout.addWidget(self._preview_header_subtitle)
         preview_header_layout.addWidget(preview_header_meta, 1)
 
+        self._preview_copy_btn = QPushButton("Copy Graph")
         self._preview_zero_btn = QPushButton("AutoY")
         self._preview_delta_btn = QPushButton("T")
         self._preview_legend_btn = QPushButton("≡ Legend & stats")
-        for btn in (self._preview_zero_btn, self._preview_delta_btn, self._preview_legend_btn):
+        for btn in (self._preview_copy_btn, self._preview_zero_btn, self._preview_delta_btn, self._preview_legend_btn):
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFocusPolicy(Qt.NoFocus)
+        preview_header_layout.addWidget(self._preview_copy_btn)
         preview_header_layout.addWidget(self._preview_zero_btn)
         preview_header_layout.addWidget(self._preview_delta_btn)
         preview_header_layout.addWidget(self._preview_legend_btn)
@@ -1473,6 +1475,7 @@ class MainWindow(QWidget):
                 zero_btn=self._preview_zero_btn,
                 delta_btn=self._preview_delta_btn,
                 legend_btn=self._preview_legend_btn,
+                copy_btn=self._preview_copy_btn,
             )
         except Exception:
             pass
@@ -1671,6 +1674,20 @@ class MainWindow(QWidget):
                         sep = getattr(gp, "_preview_header_separator", None)
                         if sep is not None:
                             sep.setVisible(True)
+                        # Tell the sync function to keep the header
+                        # visible until the canvas catches up.
+                        gp._preview_header_preshow = True
+                        # Show header buttons immediately so they don't
+                        # lag behind the title/subtitle on first launch.
+                        for _attr in (
+                            "_preview_header_copy_btn",
+                            "_preview_header_zero_btn",
+                            "_preview_header_delta_btn",
+                            "_preview_header_legend_btn",
+                        ):
+                            _btn = getattr(gp, _attr, None)
+                            if _btn is not None:
+                                _btn.setVisible(True)
                 except Exception:
                     pass
                 # Defer the heavier canvas relayout to the next tick.
