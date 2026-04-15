@@ -12,7 +12,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from PySide6.QtCore import QTimer, Qt, QEvent, QObject
+from PySide6.QtCore import QTimer, Qt, QEvent, QObject, QEasingCurve, QPropertyAnimation
 from PySide6.QtGui import QImage, QPixmap, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QToolTip,
     QVBoxLayout,
     QWidget,
+    QGraphicsOpacityEffect,
 )
 
 from matplotlib.figure import Figure
@@ -155,6 +156,7 @@ class GraphPreview(QObject):
         self._delta_btn_text = None
         self._delta_btn_bbox = None
         self._temp_delta_mode = False
+        self._delta_toggle_enabled = False
 
         # Zero-based Y toggle button (left of ΔT)
         self._zero_btn_text = None
@@ -189,6 +191,13 @@ class GraphPreview(QObject):
         self._qt_tt_mode = "UR"
         self._qt_tt_margin_px = 4
         self._qt_last_mouse_xy = None  # (qt_x, qt_y) used for smoother anchoring
+
+        # --- Graph transition animation (used by ΔT and 0Y/AutoY)
+        self._graph_anim_overlay: Optional[QLabel] = None
+        self._graph_anim_effect: Optional[QGraphicsOpacityEffect] = None
+        self._graph_anim_fade: Optional[QPropertyAnimation] = None
+        self._graph_anim_duration_ms = 350
+        self._pending_replot_transition_pixmap: Optional[QPixmap] = None
 
         # --- Qt tooltip movement animation (single + compare)
         # IMPORTANT: compare mode has MULTIPLE tooltips, so animation must be per-widget.
@@ -292,7 +301,7 @@ class GraphPreview(QObject):
                     try:
                         if (
                             self._is_over_zero_y_button(ev.pos().x(), ev.pos().y())
-                            or self._is_over_delta_button(ev.pos().x(), ev.pos().y())
+                            or (self._delta_toggle_is_enabled() and self._is_over_delta_button(ev.pos().x(), ev.pos().y()))
                             or self._is_over_ls_button(ev.pos().x(), ev.pos().y())
                         ):
                             if not self._hovering_ls_btn:
@@ -738,16 +747,48 @@ class GraphPreview(QObject):
             pass
         return fallback
 
-    def _preview_header_button_stylesheet(self, *, active: bool) -> str:
+    def _preview_header_button_stylesheet(self, *, active: bool, enabled: bool = True) -> str:
+        if not enabled:
+            dark = bool(getattr(self, "_theme_is_dark", True))
+            bg_color = "rgba(56, 56, 56, 0.16)" if dark else "rgba(235, 235, 235, 0.70)"
+            border_color = "rgba(150, 150, 150, 0.28)" if dark else "rgba(170, 170, 170, 0.60)"
+            text_color = "rgba(230, 230, 230, 0.42)" if dark else "rgba(90, 90, 90, 0.55)"
+            return (
+                "QPushButton {"
+                f" background: {bg_color};"
+                f" color: {text_color};"
+                f" border: 1px solid {border_color};"
+                " border-radius: 10px;"
+                " padding: 4px 10px;"
+                " font-weight: 500;"
+                " }"
+                "QPushButton:hover {"
+                f" border-color: {border_color};"
+                " }"
+                "QPushButton:pressed {"
+                f" background: {bg_color};"
+                " }"
+            )
+
         text_color = self._preview_css_rgba(self._preview_theme.get("secondary_text", "#BDBDBD"), "#BDBDBD")
         border_color = self._preview_css_rgba(self._preview_theme.get("grid", "#3A3A3A"), "#3A3A3A")
         bg_color = "transparent"
         font_weight = "500"
         if active:
-            bg_color = self._preview_css_rgba(self._preview_theme.get("button_active_fill", (0.25, 0.25, 0.25, 0.35)), "rgba(64, 64, 64, 0.35)")
-            border_color = self._preview_css_rgba(self._preview_theme.get("button_active_border", (0.55, 0.55, 0.55, 0.85)), border_color)
-            text_color = self._preview_css_rgba(self._preview_theme.get("button_active_text", (1, 1, 1, 0.98)), text_color)
+            bg_color = self._preview_css_rgba(
+                self._preview_theme.get("button_active_fill", (0.25, 0.25, 0.25, 0.35)),
+                "rgba(64, 64, 64, 0.35)"
+            )
+            border_color = self._preview_css_rgba(
+                self._preview_theme.get("button_active_border", (0.55, 0.55, 0.55, 0.85)),
+                border_color
+            )
+            text_color = self._preview_css_rgba(
+                self._preview_theme.get("button_active_text", (1, 1, 1, 0.98)),
+                text_color
+            )
             font_weight = "700"
+
         return (
             "QPushButton {"
             f" background: {bg_color};"
@@ -874,8 +915,17 @@ class GraphPreview(QObject):
             delta_btn = getattr(self, "_preview_header_delta_btn", None)
             if delta_btn is not None:
                 try:
-                    delta_btn.setText("ΔT" if bool(getattr(self, "_temp_delta_mode", False)) else "T")
-                    delta_btn.setStyleSheet(self._preview_header_button_stylesheet(active=bool(getattr(self, "_temp_delta_mode", False))))
+                    delta_enabled = bool(self._delta_toggle_is_enabled())
+                    delta_active = bool(getattr(self, "_temp_delta_mode", False))
+                    delta_btn.setText("ΔT" if (delta_active or not delta_enabled) else "T")
+                    delta_btn.setEnabled(delta_enabled)
+                    delta_btn.setToolTip("" if delta_enabled else "Delta T unavailable: no logged ambient temperature for this result.")
+                    delta_btn.setStyleSheet(
+                        self._preview_header_button_stylesheet(
+                            active=delta_active,
+                            enabled=delta_enabled,
+                        )
+                    )
                     delta_btn.setVisible(show_header)
                 except Exception:
                     pass
@@ -1222,6 +1272,128 @@ class GraphPreview(QObject):
                 except Exception:
                     return s
 
+            def _format_elapsed_label(total_seconds: float) -> str:
+                try:
+                    s = max(0, int(round(float(total_seconds))))
+                except Exception:
+                    s = 0
+                h = s // 3600
+                m = (s % 3600) // 60
+                sec = s % 60
+                return f"{h}:{m:02d}:{sec:02d}" if h > 0 else f"{m}:{sec:02d}"
+
+            def _even_tick_seconds(total_seconds: float, target_labels: int = 5) -> list[float]:
+                """
+                Always includes 0 and total_seconds.
+                Interior ticks are spread evenly.
+                Reduces label count automatically if rounding would create duplicate labels.
+                """
+                try:
+                    total_seconds = max(0.0, float(total_seconds))
+                except Exception:
+                    total_seconds = 0.0
+
+                if total_seconds <= 0.0:
+                    return [0.0]
+
+                # Start with a reasonable number of labels.
+                # For very short ranges, do not request more whole-second labels than possible.
+                max_unique_second_labels = max(2, int(np.floor(total_seconds)) + 1)
+                n = max(2, min(int(target_labels), max_unique_second_labels))
+
+                while n >= 2:
+                    tick_secs = np.linspace(0.0, total_seconds, num=n)
+                    labels = [_format_elapsed_label(s) for s in tick_secs]
+
+                    # Keep shrinking until rounded labels are unique.
+                    if len(labels) == len(set(labels)):
+                        return [float(s) for s in tick_secs]
+
+                    n -= 1
+
+                return [0.0, float(total_seconds)]
+
+            def _format_elapsed_label(total_seconds: float) -> str:
+                try:
+                    s = max(0, int(round(float(total_seconds))))
+                except Exception:
+                    s = 0
+                h = s // 3600
+                m = (s % 3600) // 60
+                sec = s % 60
+                return f"{h}:{m:02d}:{sec:02d}" if h > 0 else f"{m}:{sec:02d}"
+
+
+            def _nice_tick_step_seconds(total_seconds: float, target_ticks: int = 5) -> int:
+                steps = [
+                    1, 2, 5, 10, 15, 30,
+                    60, 120, 300, 600, 900, 1800,
+                    3600, 7200, 10800, 21600,
+                ]
+                try:
+                    total_seconds = max(1.0, float(total_seconds))
+                    raw = total_seconds / max(2, int(target_ticks))
+                    for step in steps:
+                        if step >= raw:
+                            return int(step)
+                    return int(steps[-1])
+                except Exception:
+                    return 60
+
+            def _apply_export_elapsed_axis(ax, x_vals, is_dt: bool) -> None:
+                try:
+                    x_arr = np.asarray(x_vals, dtype=float)
+                    if x_arr.size == 0:
+                        return
+
+                    x0 = float(x_arr[0])
+                    x1 = float(x_arr[-1])
+
+                    # Exact graph bounds: start at origin, end at final sample.
+                    ax.set_xlim(x0, x1)
+                    try:
+                        ax.margins(x=0)
+                    except Exception:
+                        pass
+
+                    total_seconds = (x1 - x0) * 86400.0 if is_dt else (x1 - x0)
+                    total_seconds = max(0.0, float(total_seconds))
+
+                    tick_secs = _even_tick_seconds(total_seconds, target_labels=5)
+
+                    if is_dt:
+                        ticks = [x0 + (s / 86400.0) for s in tick_secs]
+                    else:
+                        ticks = [x0 + s for s in tick_secs]
+
+                    labels = [_format_elapsed_label(s) for s in tick_secs]
+
+                    ax.set_xticks(ticks)
+                    ax.set_xticklabels(labels)
+                    ax.tick_params(axis="x", pad=6)
+
+                    # Keep edge labels visible inside the export.
+                    xtl = ax.get_xticklabels()
+                    for i, lbl in enumerate(xtl):
+                        try:
+                            lbl.set_clip_on(False)
+                            if i == 0:
+                                lbl.set_horizontalalignment("left")
+                            elif i == len(xtl) - 1:
+                                lbl.set_horizontalalignment("right")
+                            else:
+                                lbl.set_horizontalalignment("center")
+                        except Exception:
+                            pass
+
+                except Exception:
+                    try:
+                        if len(x_vals) > 0:
+                            ax.set_xlim(float(x_vals[0]), float(x_vals[-1]))
+                            ax.margins(x=0)
+                    except Exception:
+                        pass
+
             def _wrap_legend_label(value: str) -> str:
                 return _wrap_text(value, 24)
 
@@ -1393,13 +1565,10 @@ class GraphPreview(QObject):
                     plot_cell = outer[0, 0]
                     legend_cell = outer[0, 1]
 
-                plot_gs = plot_cell.subgridspec(plot_rows, 1, hspace=0.34)
+                plot_gs = plot_cell.subgridspec(plot_rows, 1, hspace=0.48)
                 plot_axes = []
-                share_ax = None
                 for i in range(plot_rows):
-                    ax = fig.add_subplot(plot_gs[i, 0], sharex=share_ax)
-                    if share_ax is None:
-                        share_ax = ax
+                    ax = fig.add_subplot(plot_gs[i, 0])
                     plot_axes.append(ax)
 
                 legend_gs = legend_cell.subgridspec(legend_rows, 1, hspace=0.34)
@@ -1480,24 +1649,22 @@ class GraphPreview(QObject):
                     _plot_cols(dst_ax, x_vals, df, cols, cmap_local, is_dt)
 
                     sensor_name = sensors[src_i] if src_i < len(sensors) else ""
-                    unit = extract_unit_from_column(sensor_name) if sensor_name else ""
-                    dst_ax.set_ylabel("")
-                    title_text_wrapped = _wrap_axis_title(sensor_name)  # or measurement_label
-                    title_lines = max(1, len(str(title_text_wrapped).splitlines()))
-                    dst_ax.set_title(
-                        title_text_wrapped,
-                        fontsize=11,
-                        color=label_color,
-                        loc="left",
-                        pad=8 + (title_lines - 1) * 10,
-                    )
 
-                    if plot_i == n - 1:
-                        apply_elapsed_time_formatter(dst_ax, is_dt=is_dt, x_vals=x_vals)
-                        dst_ax.set_xlabel("Elapsed time", color=label_color, fontsize=10)
-                        dst_ax.tick_params(axis="x", labelbottom=True, bottom=True)
-                    else:
-                        dst_ax.tick_params(axis="x", labelbottom=False, bottom=False)
+                    dst_ax.set_ylabel(
+                        str(sensor_name or "Graph"),
+                        color=label_color,
+                        fontsize=10,
+                        rotation=90,
+                        labelpad=18,
+                    )
+                    try:
+                        dst_ax.yaxis.set_label_position("left")
+                    except Exception:
+                        pass
+
+                    _apply_export_elapsed_axis(dst_ax, x_vals, is_dt)
+                    dst_ax.set_xlabel("Elapsed time", color=label_color, fontsize=10)
+                    dst_ax.tick_params(axis="x", labelbottom=True, bottom=True)
 
                 all_handles = []
                 for label in run_labels:
@@ -1541,26 +1708,25 @@ class GraphPreview(QObject):
                     cmap_local = {str(c): str(clr) for c, clr in zip(cols, colors)}
 
                     handles = _plot_cols(dst_ax, x_vals, df, cols, cmap_local, is_dt)
-                    measurement_label = self._measurement_title_for_unit(unit)
-                    dst_ax.set_ylabel("")
-                    title_text_wrapped = _wrap_axis_title(measurement_label or "Graph")
-                    title_lines = max(1, len(str(title_text_wrapped).splitlines()))
-                    dst_ax.set_title(
-                        title_text_wrapped,
-                        fontsize=11,
+                    measurement_label = self._measurement_title_for_unit(unit, fallback="Graph")
+
+                    dst_ax.set_ylabel(
+                        measurement_label,
                         color=label_color,
-                        loc="left",
-                        pad=8 + (title_lines - 1) * 10,
+                        fontsize=10,
+                        rotation=90,
+                        labelpad=18,
                     )
+                    try:
+                        dst_ax.yaxis.set_label_position("left")
+                    except Exception:
+                        pass
 
                     _draw_legend(legend_ax, handles)
 
-                    if plot_i == n - 1:
-                        apply_elapsed_time_formatter(dst_ax, is_dt=is_dt, x_vals=x_vals)
-                        dst_ax.set_xlabel("Elapsed time", color=label_color, fontsize=10)
-                        dst_ax.tick_params(axis="x", labelbottom=True, bottom=True)
-                    else:
-                        dst_ax.tick_params(axis="x", labelbottom=False, bottom=False)
+                    _apply_export_elapsed_axis(dst_ax, x_vals, is_dt)
+                    dst_ax.set_xlabel("Elapsed time", color=label_color, fontsize=10)
+                    dst_ax.tick_params(axis="x", labelbottom=True, bottom=True)
 
             # ================= SINGLE AXIS =================
             else:
@@ -1583,25 +1749,20 @@ class GraphPreview(QObject):
 
                 handles = _plot_cols(ax, x_vals, df_all, active_cols, color_map, is_dt)
 
-                measurement_label = str(self._single_axis_measurement_label() or "")
-                unit_set = set()
-                for c in active_cols:
-                    u = extract_unit_from_column(c)
-                    if u:
-                        unit_set.add(u)
-                y_label = ", ".join(sorted(unit_set)) if unit_set else measurement_label
-                ax.set_ylabel("")
-                title_text_wrapped = _wrap_axis_title(measurement_label or "Graph")
-                title_lines = max(1, len(str(title_text_wrapped).splitlines()))
-                ax.set_title(
-                    title_text_wrapped,
-                    fontsize=11,
+                measurement_label = str(self._single_axis_measurement_label() or "Graph")
+                ax.set_ylabel(
+                    measurement_label,
                     color=label_color,
-                    loc="left",
-                    pad=8 + (title_lines - 1) * 10,
+                    fontsize=10,
+                    rotation=90,
+                    labelpad=18,
                 )
+                try:
+                    ax.yaxis.set_label_position("left")
+                except Exception:
+                    pass
 
-                apply_elapsed_time_formatter(ax, is_dt=is_dt, x_vals=x_vals)
+                _apply_export_elapsed_axis(ax, x_vals, is_dt)
                 ax.set_xlabel("Elapsed time", color=label_color, fontsize=10)
                 ax.tick_params(axis="x", labelbottom=True, bottom=True)
 
@@ -1827,6 +1988,147 @@ class GraphPreview(QObject):
             }
             if not self._qt_move_timer.isActive():
                 self._qt_move_timer.start()
+        except Exception:
+            pass
+
+    def _ensure_graph_transition_overlay(self) -> Optional[QLabel]:
+        try:
+            if self._preview_canvas is None:
+                return None
+
+            ov = getattr(self, "_graph_anim_overlay", None)
+            if ov is not None:
+                try:
+                    if ov.parentWidget() is self._preview_canvas:
+                        return ov
+                except Exception:
+                    pass
+                try:
+                    ov.hide()
+                    ov.deleteLater()
+                except Exception:
+                    pass
+
+            ov = QLabel(self._preview_canvas)
+            ov.setObjectName("PreviewGraphTransitionOverlay")
+            ov.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            ov.setScaledContents(True)
+            ov.hide()
+
+            self._graph_anim_overlay = ov
+            return ov
+        except Exception:
+            return None
+
+    def _cancel_graph_transition(self) -> None:
+        try:
+            anim = getattr(self, "_graph_anim_fade", None)
+            if anim is not None:
+                anim.stop()
+        except Exception:
+            pass
+
+        try:
+            ov = getattr(self, "_graph_anim_overlay", None)
+            if ov is not None:
+                ov.hide()
+                ov.clear()
+                ov.setGraphicsEffect(None)
+        except Exception:
+            pass
+
+        self._graph_anim_fade = None
+        self._graph_anim_effect = None
+
+    def _capture_graph_transition_before(self) -> Optional[QPixmap]:
+        try:
+            self._cancel_graph_transition()
+        except Exception:
+            pass
+
+        try:
+            if self._preview_canvas is None or not self._preview_canvas.isVisible():
+                return None
+            pm = self._preview_canvas.grab()
+            if pm is None or pm.isNull():
+                return None
+            return pm
+        except Exception:
+            return None
+
+    def _start_graph_transition(self, before: Optional[QPixmap], *, duration_ms: Optional[int] = None) -> None:
+        try:
+            if before is None or before.isNull():
+                return
+            if self._preview_canvas is None or not self._preview_canvas.isVisible():
+                return
+
+            ov = self._ensure_graph_transition_overlay()
+            if ov is None:
+                return
+
+            ov.setGeometry(self._preview_canvas.rect())
+
+            try:
+                target_size = ov.size()
+                pm = before if before.size() == target_size else before.scaled(
+                    target_size,
+                    Qt.IgnoreAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            except Exception:
+                pm = before
+
+            ov.setPixmap(pm)
+
+            eff = QGraphicsOpacityEffect(ov)
+            eff.setOpacity(1.0)
+            ov.setGraphicsEffect(eff)
+
+            ov.show()
+            ov.raise_()
+
+            anim = QPropertyAnimation(eff, b"opacity", ov)
+            anim.setDuration(max(1, int(duration_ms or getattr(self, "_graph_anim_duration_ms", 180) or 180)))
+            anim.setStartValue(1.0)
+            anim.setEndValue(0.0)
+            anim.setEasingCurve(QEasingCurve.OutCubic)
+
+            def _done():
+                try:
+                    ov.hide()
+                    ov.clear()
+                    ov.setGraphicsEffect(None)
+                except Exception:
+                    pass
+                self._graph_anim_fade = None
+                self._graph_anim_effect = None
+
+            anim.finished.connect(_done)
+
+            self._graph_anim_effect = eff
+            self._graph_anim_fade = anim
+            anim.start()
+        except Exception:
+            pass
+
+    def _commit_graph_transition(self, before: Optional[QPixmap], *, duration_ms: Optional[int] = None) -> None:
+        try:
+            if self._preview_canvas is not None and self._preview_canvas.isVisible():
+                self._preview_canvas.draw()
+                try:
+                    self._preview_canvas.update()
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                if self._preview_canvas is not None:
+                    self._preview_canvas.draw_idle()
+            except Exception:
+                pass
+
+        try:
+            self._start_graph_transition(before, duration_ms=duration_ms)
         except Exception:
             pass
 
@@ -3200,6 +3502,175 @@ class GraphPreview(QObject):
             qt_y=qt_y,
         )
 
+    def _delta_toggle_is_enabled(self) -> bool:
+        try:
+            return bool(getattr(self, "_delta_toggle_enabled", False))
+        except Exception:
+            return False
+
+
+    def _set_delta_toggle_enabled(self, enabled: bool) -> None:
+        try:
+            self._delta_toggle_enabled = bool(enabled)
+            if not self._delta_toggle_enabled:
+                self._temp_delta_mode = False
+        except Exception:
+            pass
+
+        try:
+            self._update_delta_button_visual()
+        except Exception:
+            pass
+        try:
+            self._sync_preview_header_controls()
+        except Exception:
+            pass
+
+
+    def _has_non_ambient_temperature_series(self, df: Optional[pd.DataFrame]) -> bool:
+        try:
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return False
+
+            temp_idxs = [int(i) for i in (self._temperature_column_indices(df) or [])]
+            if not temp_idxs:
+                return False
+
+            amb_col = self._find_ambient_col(df)
+            amb_idx_set = set()
+            if amb_col:
+                amb_idx_set = {
+                    int(i) for i, c in enumerate(list(df.columns))
+                    if str(c) == str(amb_col)
+                }
+
+            return any(i not in amb_idx_set for i in temp_idxs)
+        except Exception:
+            return False
+
+
+    def _has_logged_ambient_for_df(
+        self,
+        df_raw: Optional[pd.DataFrame],
+        *,
+        run_dir: Optional[Path] = None,
+    ) -> bool:
+        """
+        Logged ambient only.
+        Do not count avg_temperature.json as logged ambient.
+        """
+        try:
+            if isinstance(df_raw, pd.DataFrame) and not df_raw.empty:
+                amb_col = self._find_ambient_col(df_raw)
+                if amb_col and amb_col in df_raw.columns:
+                    try:
+                        ser = pd.to_numeric(df_raw[amb_col], errors="coerce")
+                        if bool(ser.notna().any()):
+                            return True
+                    except Exception:
+                        pass
+
+            if run_dir is None:
+                try:
+                    p = getattr(self, "_preview_csv_path", None)
+                    if p:
+                        run_dir = Path(str(p)).parent
+                except Exception:
+                    run_dir = None
+
+            if run_dir is None:
+                return False
+
+            aw = Path(run_dir) / "ambient_window.csv"
+            if not aw.exists() or not aw.is_file():
+                return False
+
+            try:
+                amb_df = pd.read_csv(str(aw), header=0)
+            except Exception:
+                return False
+
+            if not isinstance(amb_df, pd.DataFrame) or amb_df.empty:
+                return False
+
+            cols = {str(c).strip().lower(): str(c) for c in list(amb_df.columns)}
+            v_col = cols.get("ambient_c") or cols.get("ambient") or cols.get("value")
+            if not v_col:
+                return False
+
+            try:
+                ser = pd.to_numeric(amb_df[v_col], errors="coerce")
+                return bool(ser.notna().any())
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+
+    def _delta_toggle_available_for_df(
+        self,
+        df_raw: Optional[pd.DataFrame],
+        *,
+        run_dir: Optional[Path] = None,
+    ) -> bool:
+        try:
+            return bool(
+                self._has_non_ambient_temperature_series(df_raw)
+                and self._has_logged_ambient_for_df(df_raw, run_dir=run_dir)
+            )
+        except Exception:
+            return False
+
+
+    def _compare_manifest_delta_available(
+        self,
+        manifest_path: Path,
+        manifest: Optional[dict] = None,
+    ) -> bool:
+        """
+        Delta is only available in compare mode if every compared run has logged
+        ambient data and at least one non-ambient temperature series.
+        """
+        try:
+            m = manifest if isinstance(manifest, dict) else json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            return False
+
+        runs_rel = [str(r) for r in (m.get("runs") or []) if str(r).strip()]
+        if not runs_rel:
+            return False
+
+        try:
+            runs_root = manifest_path.parents[2]
+        except Exception:
+            runs_root = manifest_path.parent
+
+        any_ok = False
+        for rel in runs_rel:
+            try:
+                p = Path(*str(rel).replace("\\", "/").split("/"))
+            except Exception:
+                p = Path(str(rel))
+
+            rd = runs_root / p
+            csvp = rd / "run_window.csv"
+            if not csvp.exists() or not csvp.is_file():
+                return False
+
+            try:
+                df_all, _ = load_run_csv_dataframe(str(csvp))
+            except Exception:
+                return False
+
+            if not self._delta_toggle_available_for_df(df_all, run_dir=rd):
+                return False
+
+            any_ok = True
+
+        return any_ok
+
     def _ambient_col_for_current_result(self) -> Optional[str]:
         """Ambient column name for this result (from raw df when available)."""
         try:
@@ -3700,67 +4171,6 @@ class GraphPreview(QObject):
         except Exception:
             return None
 
-        try:
-            # Performance: avoid df.astype(float64) on the whole dataframe.
-            # Only temperature columns need delta applied.
-            df_disp = df_raw.copy(deep=False)
-
-            try:
-                amb_arr = pd.to_numeric(df_raw.iloc[:, amb_idx], errors="coerce").to_numpy(dtype=float, copy=False)
-            except Exception:
-                amb_arr = np.asarray(pd.to_numeric(df_raw.iloc[:, amb_idx], errors="coerce").to_numpy(), dtype=float)
-
-            temp_idxs2 = [int(i) for i in list(temp_idxs) if int(i) != int(amb_idx)]
-            if not temp_idxs2:
-                return df_disp
-
-            # Vectorized delta for all temperature columns at once.
-            try:
-                y_mat = df_raw.iloc[:, temp_idxs2].to_numpy(dtype=float, copy=False)
-            except Exception:
-                # Fallback: per-column numeric coercion, then numpy.
-                cols_temp = [df_raw.columns[int(i)] for i in temp_idxs2]
-                tmp = df_raw.loc[:, cols_temp].apply(lambda s: pd.to_numeric(s, errors="coerce"))
-                y_mat = np.asarray(tmp.to_numpy(), dtype=float)
-
-            try:
-                delta_mat = y_mat - amb_arr.reshape((-1, 1))
-            except Exception:
-                delta_mat = y_mat - amb_arr[:, None]
-
-            # Avoid pandas dtype-incompatible in-place assignment warnings when
-            # temperature columns are int and delta values are float.
-            # We also need to preserve duplicate column names, so we keep using
-            # positional indices; the trick is to temporarily replace column
-            # labels with unique integer labels so we can do a label-based
-            # whole-column replacement that allows dtype upcast.
-            try:
-                delta_mat = np.asarray(delta_mat, dtype=float)
-
-                cols_orig = df_disp.columns
-                df_disp.columns = range(int(df_disp.shape[1]))
-                df_disp.loc[:, temp_idxs2] = delta_mat
-                df_disp.columns = cols_orig
-            except Exception:
-                # Last-resort: assign columns one by one.
-                try:
-                    cols_orig = df_disp.columns
-                    df_disp.columns = range(int(df_disp.shape[1]))
-                    for j, col_i in enumerate(temp_idxs2):
-                        try:
-                            df_disp.loc[:, int(col_i)] = np.asarray(delta_mat[:, int(j)], dtype=float)
-                        except Exception:
-                            continue
-                finally:
-                    try:
-                        df_disp.columns = cols_orig
-                    except Exception:
-                        pass
-
-            return df_disp
-        except Exception:
-            return df_raw
-
     def _delta_display_is_applied(self) -> bool:
         """Best-effort sanity check that delta mode is actually applied to the display DF.
 
@@ -3823,8 +4233,8 @@ class GraphPreview(QObject):
                 return
 
             is_on = bool(getattr(self, "_temp_delta_mode", False))
+            is_enabled = bool(self._delta_toggle_is_enabled())
 
-            # Cache defaults so we can restore them when toggling off.
             try:
                 if not hasattr(self, "_delta_btn_default_color"):
                     self._delta_btn_default_color = self._delta_btn_text.get_color()
@@ -3833,28 +4243,46 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
-            label = "ΔT" if is_on else "T"
+            label = "ΔT" if (is_on or not is_enabled) else "T"
             try:
                 self._delta_btn_text.set_text(label)
             except Exception:
                 pass
 
             try:
-                if is_on:
-                    # High-contrast, obvious "active" state.
-                    # Subtle gray highlight (requested): slightly gray border + semi-transparent gray fill.
+                if not is_enabled:
+                    if bool(getattr(self, "_theme_is_dark", True)):
+                        fc = (0.22, 0.22, 0.22, 0.16)
+                        ec = (0.55, 0.55, 0.55, 0.26)
+                        tc = (1.0, 1.0, 1.0, 0.38)
+                    else:
+                        fc = (0.92, 0.92, 0.92, 0.70)
+                        ec = (0.62, 0.62, 0.62, 0.55)
+                        tc = (0.10, 0.10, 0.10, 0.45)
+
+                    self._delta_btn_text.set_bbox(
+                        dict(boxstyle="round,pad=0.35", fc=fc, ec=ec, lw=1.0)
+                    )
+                    try:
+                        self._delta_btn_text.set_color(tc)
+                        self._delta_btn_text.set_fontweight("normal")
+                    except Exception:
+                        pass
+
+                elif is_on:
                     fc = self._preview_theme.get("button_active_fill", (0.25, 0.25, 0.25, 0.35))
                     ec = self._preview_theme.get("button_active_border", (0.55, 0.55, 0.55, 0.85))
                     self._delta_btn_text.set_bbox(
                         dict(boxstyle="round,pad=0.45", fc=fc, ec=ec, lw=1.6)
                     )
                     try:
-                        self._delta_btn_text.set_color(self._preview_theme.get("button_active_text", (1, 1, 1, 0.98)))
+                        self._delta_btn_text.set_color(
+                            self._preview_theme.get("button_active_text", (1, 1, 1, 0.98))
+                        )
                         self._delta_btn_text.set_fontweight("bold")
                     except Exception:
                         pass
                 else:
-                    # Minimal styling when inactive.
                     self._delta_btn_text.set_bbox(
                         dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.0), ec=(0, 0, 0, 0.0))
                     )
@@ -3869,6 +4297,7 @@ class GraphPreview(QObject):
                 pass
         except Exception:
             pass
+
         try:
             self._sync_preview_header_controls()
         except Exception:
@@ -3992,8 +4421,9 @@ class GraphPreview(QObject):
 
     def _handle_delta_click(self, qt_x: int, qt_y: int) -> bool:
         try:
-            # After certain navigation/replot paths, the cached bbox may not be ready yet
-            # (draw event hasn't fired). Refresh it once on click so the button remains usable.
+            if not self._delta_toggle_is_enabled():
+                return False
+
             try:
                 if self._delta_btn_bbox is None and self._delta_btn_text is not None and self._preview_canvas is not None:
                     try:
@@ -4016,15 +4446,15 @@ class GraphPreview(QObject):
             return False
 
     def toggle_delta_mode(self) -> bool:
+        if not self._delta_toggle_is_enabled():
+            return False
         try:
+            before = self._capture_graph_transition_before()
 
             self._temp_delta_mode = not bool(getattr(self, "_temp_delta_mode", False))
 
-            # Immediate visual feedback before heavy plotting.
             try:
                 self._update_delta_button_visual()
-                if self._preview_canvas is not None:
-                    self._preview_canvas.draw_idle()
             except Exception:
                 pass
 
@@ -4053,6 +4483,11 @@ class GraphPreview(QObject):
                     self._hide_compare_hover_all()
             except Exception:
                 pass
+            try:
+                if getattr(self, "_single_mode_multi_axis", False):
+                    self._hide_single_hover_all()
+            except Exception:
+                pass
 
             # Compare mode: rebuild compare plots using the active manifest so ΔT works.
             try:
@@ -4062,6 +4497,7 @@ class GraphPreview(QObject):
                         mp2 = Path(str(mp))
                         if mp2.exists() and mp2.is_file():
                             self._plot_compare_manifest(mp2)
+                            self._commit_graph_transition(before)
                             return True
             except Exception:
                 pass
@@ -4069,12 +4505,16 @@ class GraphPreview(QObject):
             # Fast path: update plotted values in-place (no full replot).
             try:
                 if self._apply_temp_delta_mode_to_current_plot():
+                    self._commit_graph_transition(before)
                     return True
             except Exception:
                 pass
 
             # Fallback: heavy work.
-            self._schedule_replot_current_result_for_display_mode(delay_ms=0)
+            self._schedule_replot_current_result_for_display_mode(
+                delay_ms=0,
+                transition_before=before,
+            )
             return True
         except Exception:
             return False
@@ -4300,14 +4740,12 @@ class GraphPreview(QObject):
 
     def toggle_zero_y_mode(self) -> bool:
         try:
+            before = self._capture_graph_transition_before()
 
             self._zero_y_mode = not bool(getattr(self, "_zero_y_mode", False))
 
-            # Immediate visual feedback.
             try:
                 self._update_zero_y_button_visual()
-                if self._preview_canvas is not None:
-                    self._preview_canvas.draw_idle()
             except Exception:
                 pass
 
@@ -4319,16 +4757,48 @@ class GraphPreview(QObject):
                 self._hide_preview_hover(hard=True)
             except Exception:
                 pass
+            try:
+                if getattr(self, "_compare_mode", False):
+                    self._hide_compare_hover_all()
+            except Exception:
+                pass
+            try:
+                if getattr(self, "_single_mode_multi_axis", False):
+                    self._hide_single_hover_all()
+            except Exception:
+                pass
 
-            # Fast path: 0Y only affects y-limits; rescale existing plots without rebuilding lines.
+            # Compare mode has its own subplot/render pipeline.
+            try:
+                if getattr(self, "_compare_mode", False):
+                    mp = getattr(self, "_compare_manifest_path", None)
+                    if mp is not None:
+                        mp2 = Path(str(mp))
+                        if mp2.exists() and mp2.is_file():
+                            self._plot_compare_manifest(mp2)
+                            self._commit_graph_transition(before)
+                            return True
+            except Exception:
+                pass
+
+            # Single / single-multi-axis fast path.
             self._apply_zero_y_mode_to_current_plot()
+            self._commit_graph_transition(before)
             return True
         except Exception:
             return False
 
-    def _schedule_replot_current_result_for_display_mode(self, *, delay_ms: int = 0) -> None:
+    def _schedule_replot_current_result_for_display_mode(
+        self,
+        *,
+        delay_ms: int = 0,
+        transition_before: Optional[QPixmap] = None,
+    ) -> None:
         """Debounce heavy replots so repeated toggles collapse and UI can repaint first."""
         try:
+            if transition_before is not None:
+                self._pending_replot_transition_pixmap = transition_before
+
             if self._replot_timer is None:
                 t = QTimer(self.parent)
                 t.setSingleShot(True)
@@ -4342,16 +4812,21 @@ class GraphPreview(QObject):
         except Exception:
             try:
                 self._replot_current_result_for_display_mode()
+                self._commit_graph_transition(transition_before)
             except Exception:
                 pass
 
     def _replot_current_result_for_display_mode_debounced(self) -> None:
+        before = getattr(self, "_pending_replot_transition_pixmap", None)
+        self._pending_replot_transition_pixmap = None
+
         try:
             if bool(getattr(self, "_replot_in_progress", False)):
                 return
             self._replot_in_progress = True
             try:
                 self._replot_current_result_for_display_mode()
+                self._commit_graph_transition(before)
             finally:
                 self._replot_in_progress = False
         except Exception:
@@ -5103,7 +5578,6 @@ class GraphPreview(QObject):
             test_settings=test_settings,
             theme_mode=getattr(self, "_theme_mode", "dark"),
             on_close=self._on_legend_popup_closed,
-            measurement_title_for_unit=self._measurement_title_for_unit,
         )
 
         self._install_outside_click_closer()
@@ -5220,6 +5694,7 @@ class GraphPreview(QObject):
             run_tables=run_tables,
             theme_mode=getattr(self, "_theme_mode", "dark"),
             on_close=self._on_legend_popup_closed,
+            measurement_title_for_unit=self._measurement_title_for_unit,
         )
 
         self._install_outside_click_closer()
@@ -5693,6 +6168,13 @@ class GraphPreview(QObject):
         except Exception:
             m = {}
 
+        try:
+            self._set_delta_toggle_enabled(
+                self._compare_manifest_delta_available(manifest_path, manifest=m)
+            )
+        except Exception:
+            self._set_delta_toggle_enabled(False)
+
         sensors = [str(s) for s in (m.get("sensors") or []) if str(s).strip()]
         runs_rel = [str(r) for r in (m.get("runs") or []) if str(r).strip()]
 
@@ -5708,7 +6190,7 @@ class GraphPreview(QObject):
 
         # ΔT mode: ambient(t) - ambient(t) == 0, so hide the ambient subplot entirely.
         try:
-            if bool(getattr(self, "_temp_delta_mode", False)) and sensors:
+            if self._delta_toggle_is_enabled() and bool(getattr(self, "_temp_delta_mode", False)) and sensors:
                 sensors = [s for s in sensors if not _is_ambient_sensor_name(s)]
         except Exception:
             pass
@@ -6185,7 +6667,8 @@ class GraphPreview(QObject):
                 # Button hover: match single-mode cursor behavior and avoid showing tooltips.
                 try:
                     if (
-                        self._is_over_delta_button(ev.pos().x(), ev.pos().y())
+                        self._is_over_zero_y_button(ev.pos().x(), ev.pos().y())
+                        or (self._delta_toggle_is_enabled() and self._is_over_delta_button(ev.pos().x(), ev.pos().y()))
                         or self._is_over_ls_button(ev.pos().x(), ev.pos().y())
                     ):
                         if not self._hovering_ls_btn:
@@ -6430,6 +6913,15 @@ class GraphPreview(QObject):
 
         # Keep raw for baseline computations; build a display df for plotting.
         self._preview_df_all_raw = df_data[cols]
+        try:
+            self._set_delta_toggle_enabled(
+                self._delta_toggle_available_for_df(
+                    self._preview_df_all_raw,
+                    run_dir=Path(fpath).parent,
+                )
+            )
+        except Exception:
+            self._set_delta_toggle_enabled(False)
         self._preview_df_all_delta = None
         try:
             df_disp = self._build_display_df() or self._preview_df_all_raw
@@ -6977,7 +7469,11 @@ class GraphPreview(QObject):
                 try:
                     if hasattr(ev, 'pos') and ev.pos():
                         x, y = ev.pos().x(), ev.pos().y()
-                        if self._is_over_delta_button(int(x), int(y)) or self._is_over_ls_button(int(x), int(y)):
+                        if (
+                            self._is_over_zero_y_button(int(x), int(y))
+                            or (self._delta_toggle_is_enabled() and self._is_over_delta_button(int(x), int(y)))
+                            or self._is_over_ls_button(int(x), int(y))
+                        ):
                             if not self._hovering_ls_btn:
                                 self._hovering_ls_btn = True
                                 self._preview_canvas.setCursor(Qt.PointingHandCursor)

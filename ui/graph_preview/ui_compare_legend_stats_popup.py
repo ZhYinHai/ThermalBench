@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import html
 from collections import OrderedDict
-from typing import Optional
+from typing import Optional, Callable
 
 from PySide6.QtCore import Qt, QTimer, QMimeData
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPixmap
@@ -133,6 +133,7 @@ class CompareLegendStatsPopup(QDialog):
         run_tables: list[dict],
         theme_mode: Optional[str] = None,
         on_close=None,
+        measurement_title_for_unit: Optional[Callable[[str], str]] = None,
     ):
         super().__init__(parent)
 
@@ -155,6 +156,7 @@ class CompareLegendStatsPopup(QDialog):
         self._theme_is_dark = self._theme_mode == "dark"
         self._theme = self._build_theme_palette()
         self._apply_fixed_dialog_size()
+        self._measurement_title_for_unit_cb = measurement_title_for_unit
 
         root = QVBoxLayout(self)
         root.setSizeConstraint(QLayout.SetDefaultConstraint)
@@ -377,6 +379,25 @@ class CompareLegendStatsPopup(QDialog):
         except Exception:
             pass
         super().closeEvent(event)
+
+    def _display_measurement_title(self, unit: str) -> str:
+        try:
+            cb = getattr(self, "_measurement_title_for_unit_cb", None)
+            if callable(cb):
+                text = str(cb(unit) or "").strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+
+        try:
+            u = str(unit or "").strip()
+            label = str(get_measurement_type_label(unit) or "Measurement").strip()
+            if u and u.lower() not in label.lower():
+                return f"{label} ({u})"
+            return label
+        except Exception:
+            return str(unit or "Measurement").strip()
 
     def _build_theme_palette(self) -> dict[str, str]:
         if self._theme_is_dark:
@@ -906,7 +927,7 @@ class CompareLegendStatsPopup(QDialog):
                 if is_group_header:
                     current_group = (it.text(0) or "").strip()
                     if self._dt_only_mode:
-                        group_visible = bool(current_group.lower() == "temperature")
+                        group_visible = bool(current_group.lower().startswith("temperature"))
                         try:
                             it.setHidden(not group_visible)
                         except Exception:
@@ -1127,38 +1148,32 @@ class CompareLegendStatsPopup(QDialog):
         except Exception:
             return ""
 
-    def _measurement_group_order(self) -> list[str]:
-        return [
-            "Temperature",
-            "Power (W)",
-            "RPM",
-            "Voltage (V)",
-            "Percentage (%)",
-            "Clock (MHz)",
-            "Timing (T)",
-        ]
-
     def _ordered_groups(self) -> list[tuple[str, list[str]]]:
-        # Preserve sensor order within a unit by feeding sensors in their existing order.
         groups = group_columns_by_unit(list(self._sensors)) if self._sensors else {}
 
-        # Convert to label -> cols for easier ordering
-        label_to_cols: dict[str, list[str]] = {}
-        for unit, cols in (groups or {}).items():
-            label = str(get_measurement_type_label(unit))
-            label_to_cols.setdefault(label, []).extend([str(c) for c in (cols or [])])
+        def sort_key(item: tuple[str, list[str]]):
+            unit = str(item[0] or "")
+            base = str(get_measurement_type_label(unit) or "").strip().lower()
+
+            order_map = {
+                "temperature": 0,
+                "power": 1,
+                "rpm": 2,
+                "voltage": 3,
+                "percentage": 4,
+                "clock": 5,
+                "timing": 6,
+            }
+            return (order_map.get(base, 99), self._display_measurement_title(unit).lower())
 
         ordered: list[tuple[str, list[str]]] = []
-        seen = set()
-        for lab in self._measurement_group_order():
-            cols = label_to_cols.get(lab)
-            if cols:
-                ordered.append((lab, cols))
-                seen.add(lab)
-
-        # Any remaining labels (unknown units) sorted after
-        for lab in sorted([k for k in label_to_cols.keys() if k not in seen], key=lambda s: s.lower()):
-            ordered.append((lab, label_to_cols[lab]))
+        for unit, cols in sorted((groups or {}).items(), key=sort_key):
+            ordered.append(
+                (
+                    self._display_measurement_title(unit),
+                    [str(c) for c in (cols or [])],
+                )
+            )
 
         return ordered
 

@@ -50,7 +50,6 @@ class LegendStatsPopup(QDialog):
         test_settings: Optional[dict] = None,
         theme_mode: Optional[str] = None,
         on_close: Optional[Callable[[], None]] = None,
-        measurement_title_for_unit: Optional[Callable[[str], str]] = None,
     ):
         super().__init__(parent)
 
@@ -256,25 +255,6 @@ class LegendStatsPopup(QDialog):
         # Re-run sizing on show to account for DPI/font rounding.
         QTimer.singleShot(0, self._autosize_to_content)
 
-    def _display_measurement_title(self, unit: str) -> str:
-        try:
-            cb = getattr(self, "_measurement_title_for_unit", None)
-            if callable(cb):
-                text = str(cb(unit) or "").strip()
-                if text:
-                    return text
-        except Exception:
-            pass
-
-        try:
-            text = str(get_measurement_type_label(unit) or "").strip()
-            if text:
-                return text
-        except Exception:
-            pass
-
-        return str(unit or "Measurement").strip()
-
     def _normalized_display_unit(self, unit: str) -> str:
         try:
             u = str(unit or "").strip()
@@ -300,7 +280,6 @@ class LegendStatsPopup(QDialog):
             return aliases.get(key, u)
         except Exception:
             return str(unit or "").strip()
-
 
     def _measurement_title_for_unit(self, unit: str, fallback: str = "") -> str:
         try:
