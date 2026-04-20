@@ -2452,7 +2452,6 @@ class GraphPreview(QObject):
         except Exception:
             pass
 
-        # FINAL DRAW
         try:
             if self._preview_canvas is not None:
                 self._preview_canvas.draw()
@@ -2462,23 +2461,6 @@ class GraphPreview(QObject):
                     self._preview_canvas.draw_idle()
             except Exception:
                 pass
-
-        # IMPORTANT: refresh blit backgrounds so hover doesn't restore stale pre-toggle axes
-        try:
-            if getattr(self, "_compare_mode", False):
-                self._compare_last_idx = None
-                self._refresh_compare_backgrounds()
-            elif getattr(self, "_single_mode_multi_axis", False):
-                self._single_last_idx = None
-                self._refresh_single_backgrounds()
-            else:
-                self._preview_last_tt_idx = None
-                try:
-                    self._on_preview_draw()
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
         try:
             if callable(finish_cb):
@@ -4363,6 +4345,8 @@ class GraphPreview(QObject):
             u = self._normalized_display_unit(unit)
             key = u.lower()
 
+            is_temp = key in {"°c", "degc", "c"}
+
             label_map = {
                 "°c": "Temperature",
                 "w": "Power",
@@ -4377,7 +4361,13 @@ class GraphPreview(QObject):
                 "a": "Current",
             }
 
-            label = str(label_map.get(key) or get_measurement_type_label(unit) or fallback or "Measurement").strip()
+            label = str(
+                label_map.get(key) or get_measurement_type_label(unit) or fallback or "Measurement"
+            ).strip()
+
+            if is_temp and bool(getattr(self, "_temp_delta_mode", False)):
+                label = "Delta T"
+
             if not u:
                 return label
 
@@ -5117,9 +5107,11 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
-            # Preferred path: morph existing plotted artists.
+            # Fast morph updates the data, but not all text/title artists.
+            # Force one real rebuild so the visible label changes too.
             try:
                 if self._apply_temp_delta_mode_to_current_plot():
+                    self._schedule_replot_current_result_for_display_mode(delay_ms=0)
                     return True
             except Exception:
                 pass
@@ -8181,7 +8173,6 @@ class GraphPreview(QObject):
                             if not self._hovering_ls_btn:
                                 self._hovering_ls_btn = True
                                 self._preview_canvas.setCursor(Qt.PointingHandCursor)
-                            self._hide_single_hover_all()
                             return
                         else:
                             if self._hovering_ls_btn:
