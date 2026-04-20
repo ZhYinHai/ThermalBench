@@ -740,6 +740,60 @@ class GraphPreview(QObject):
         except Exception:
             self._hide_preview_header_tooltip()
 
+    def _refresh_hover_backgrounds_after_plot_change(self) -> None:
+        """
+        Rebuild hover/blit background caches after a real plot change
+        (for example 0Y/AutoY or ΔT/T morphs), so hover cannot restore
+        stale graph imagery.
+        """
+        try:
+            if self._preview_canvas is None:
+                return
+
+            # Compare mode: cache each subplot background from the CURRENT canvas.
+            if bool(getattr(self, "_compare_mode", False)):
+                for ax in list(getattr(self, "_compare_axes", []) or []):
+                    st = (getattr(self, "_compare_axis_state", {}) or {}).get(ax)
+                    if st is None:
+                        continue
+                    try:
+                        st["bg"] = self._preview_canvas.copy_from_bbox(ax.bbox)
+                    except Exception:
+                        st["bg"] = None
+                try:
+                    self._compare_last_idx = None
+                except Exception:
+                    pass
+                return
+
+            # Single-result multi-axis mode: same idea.
+            if bool(getattr(self, "_single_mode_multi_axis", False)):
+                for ax in list(getattr(self, "_single_axes", []) or []):
+                    st = (getattr(self, "_single_axis_state", {}) or {}).get(ax)
+                    if st is None:
+                        continue
+                    try:
+                        st["bg"] = self._preview_canvas.copy_from_bbox(ax.bbox)
+                    except Exception:
+                        st["bg"] = None
+                try:
+                    self._single_last_idx = None
+                except Exception:
+                    pass
+                return
+
+            # Legacy single-axis mode: let the normal draw hook rebuild caches.
+            try:
+                self._on_preview_draw()
+            except Exception:
+                pass
+            try:
+                self._preview_last_tt_idx = None
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _refresh_preview_header_tooltip(self) -> None:
         label = getattr(self, "_preview_header_tt_source", None)
         if label is None:
@@ -2356,7 +2410,7 @@ class GraphPreview(QObject):
 
             try:
                 if self._plot_morph_mode == "blit":
-                    self._plot_morph_timer.setInterval(33)  # ~30 fps
+                    self._plot_morph_timer.setInterval(16)  # ~60 fps
 
                     if self._preview_canvas is not None:
                         animated_lines = []
@@ -2390,7 +2444,7 @@ class GraphPreview(QObject):
                             except Exception:
                                 pass
                 else:
-                    self._plot_morph_timer.setInterval(40)  # slower but steadier for redraw mode
+                    self._plot_morph_timer.setInterval(24)  # ~40 fps for redraw mode
             except Exception:
                 pass
 
@@ -2447,14 +2501,20 @@ class GraphPreview(QObject):
         self._stop_plot_morph()
         self._plot_morph_bgs = {}
 
+        # Let per-mode finish callbacks update cached df/tooltip state first.
         try:
-            self._plot_morph_lock_interaction = False
+            if callable(finish_cb):
+                finish_cb()
         except Exception:
             pass
 
+        # IMPORTANT:
+        # Redraw the final graph state, then rebuild hover/blit backgrounds from
+        # that final state so hover cannot restore stale imagery.
         try:
             if self._preview_canvas is not None:
                 self._preview_canvas.draw()
+                self._refresh_hover_backgrounds_after_plot_change()
         except Exception:
             try:
                 if self._preview_canvas is not None:
@@ -2463,8 +2523,7 @@ class GraphPreview(QObject):
                 pass
 
         try:
-            if callable(finish_cb):
-                finish_cb()
+            self._plot_morph_lock_interaction = False
         except Exception:
             pass
 
@@ -4093,6 +4152,8 @@ class GraphPreview(QObject):
     # Legend&Stats button click logic
     # ---------------------------------------------------------------------
     def _is_over_ls_button(self, qt_x: int, qt_y: int) -> bool:
+        if not self._canvas_button_hit_testing_enabled():
+            return False
         return is_over_ls_button(
             canvas=self._preview_canvas,
             ls_btn_bbox=self._ls_btn_bbox,
@@ -4101,6 +4162,8 @@ class GraphPreview(QObject):
         )
 
     def _is_over_delta_button(self, qt_x: int, qt_y: int) -> bool:
+        if not self._canvas_button_hit_testing_enabled():
+            return False
         return is_over_button_bbox(
             canvas=self._preview_canvas,
             btn_bbox=self._delta_btn_bbox,
@@ -4109,6 +4172,8 @@ class GraphPreview(QObject):
         )
 
     def _is_over_zero_y_button(self, qt_x: int, qt_y: int) -> bool:
+        if not self._canvas_button_hit_testing_enabled():
+            return False
         return is_over_button_bbox(
             canvas=self._preview_canvas,
             btn_bbox=self._zero_btn_bbox,
@@ -4924,6 +4989,11 @@ class GraphPreview(QObject):
             self._sync_preview_header_controls()
         except Exception:
             pass
+        try:
+            if self._preview_canvas is not None and self._canvas_button_hit_testing_enabled():
+                self._preview_canvas.draw_idle()
+        except Exception:
+            pass
 
     def _update_zero_y_button_visual(self) -> None:
         try:
@@ -4975,6 +5045,11 @@ class GraphPreview(QObject):
             pass
         try:
             self._sync_preview_header_controls()
+        except Exception:
+            pass
+        try:
+            if self._preview_canvas is not None and self._canvas_button_hit_testing_enabled():
+                self._preview_canvas.draw_idle()
         except Exception:
             pass
 
@@ -5043,6 +5118,8 @@ class GraphPreview(QObject):
 
     def _handle_delta_click(self, qt_x: int, qt_y: int) -> bool:
         try:
+            if not self._canvas_button_hit_testing_enabled():
+                return False
             if not self._delta_toggle_is_enabled():
                 return False
 
@@ -5107,11 +5184,8 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
-            # Fast morph updates the data, but not all text/title artists.
-            # Force one real rebuild so the visible label changes too.
             try:
                 if self._apply_temp_delta_mode_to_current_plot():
-                    self._schedule_replot_current_result_for_display_mode(delay_ms=0)
                     return True
             except Exception:
                 pass
@@ -5188,14 +5262,15 @@ class GraphPreview(QObject):
             pass
 
     def _apply_temp_delta_mode_to_current_plot(self) -> bool:
-        """Apply current ΔT/T mode to the existing plot with a fast line morph."""
         try:
             if self._preview_canvas is None or self._preview_fig is None:
                 return False
             if not isinstance(getattr(self, "_preview_df_all_raw", None), pd.DataFrame):
                 return False
 
-            # Compare mode: only morph if subplot topology stays identical.
+            # -----------------------------
+            # Compare mode
+            # -----------------------------
             if getattr(self, "_compare_mode", False):
                 try:
                     target_sensors = list(self._compare_target_sensor_list_for_current_mode())
@@ -5231,8 +5306,8 @@ class GraphPreview(QObject):
                         lp = self._prepare_line_for_morph(ln, y1, target_visible=True)
                         if lp is not None:
                             line_payloads.append(lp)
-                        ylim_arrays.append(y1)
 
+                        ylim_arrays.append(y1)
                         try:
                             (st.get("series_data") or {})[name] = y1
                         except Exception:
@@ -5249,7 +5324,7 @@ class GraphPreview(QObject):
                         "ax": ax,
                         "lines": line_payloads,
                         "ylim0": tuple(ax.get_ylim()),
-                        "ylim1": tuple(ylim1),  # snapped at finish
+                        "ylim1": tuple(ylim1),
                         "animate_ylim": False,
                         "_target_df": target_df,
                     })
@@ -5263,29 +5338,42 @@ class GraphPreview(QObject):
                             ax = ap.get("ax")
                             st = (self._compare_axis_state or {}).get(ax)
                             target_df = ap.get("_target_df")
-                            if st is None or not isinstance(target_df, pd.DataFrame):
+                            if ax is None or not st or not isinstance(target_df, pd.DataFrame):
                                 continue
-                            st["df"] = target_df
+
+                            st["df"] = target_df.copy()
                             try:
-                                st["df_np"] = target_df.to_numpy(dtype=float, copy=False)
+                                st["df_np"] = st["df"].to_numpy(dtype=float, copy=False)
                             except Exception:
-                                st["df_np"] = np.asarray(target_df.to_numpy(), dtype=float)
-                    except Exception:
-                        pass
-                    try:
+                                st["df_np"] = np.asarray(st["df"].to_numpy(), dtype=float)
+
+                            st["cols"] = [str(c) for c in list(st["df"].columns)]
+                            st["colors"] = [
+                                str(self._compare_run_color_map.get(str(c), "#FFFFFF"))
+                                for c in st["cols"]
+                            ]
+
                         self._compare_last_idx = None
                         self._refresh_compare_backgrounds()
+                        if self._preview_canvas is not None:
+                            self._preview_canvas.draw_idle()
                     except Exception:
                         pass
 
-                return self._start_plot_morph(axis_payloads, finish_callback=_finish, duration_s=0.10)
+                return self._start_plot_morph(axis_payloads, finish_callback=_finish, duration_s=0.16)
 
+            # -----------------------------
+            # Shared display df
+            # -----------------------------
             df_disp = self._preview_get_display_df_for_current_mode()
             if not isinstance(df_disp, pd.DataFrame) or df_disp.empty:
                 return False
 
             self._preview_df_all = df_disp
 
+            # -----------------------------
+            # Single-result multi-axis mode
+            # -----------------------------
             if getattr(self, "_single_mode_multi_axis", False):
                 active_set = set(self._effective_active_cols())
                 zero_mode = bool(getattr(self, "_zero_y_mode", False))
@@ -5335,35 +5423,50 @@ class GraphPreview(QObject):
 
                 def _finish():
                     try:
-                        self._preview_df_all = df_disp
                         for ax, st in list((self._single_axis_state or {}).items()):
-                            lines = (st or {}).get("lines") or {}
-                            cols_all = [str(n) for n in list(lines.keys()) if str(n) in df_disp.columns]
-                            active_cols = [c for c in cols_all if c in set(self._effective_active_cols())]
+                            if not st:
+                                continue
+
+                            unit = str(st.get("unit", ""))
+                            all_unit_cols = [str(c) for c in list((st.get("lines") or {}).keys())]
+                            active_cols = [c for c in all_unit_cols if c in active_set]
 
                             st["cols"] = list(active_cols)
-                            st["colors"] = [str(self._preview_color_map.get(c, "#FFFFFF")) for c in active_cols]
+                            st["colors"] = [
+                                str(self._preview_color_map.get(str(c), "#FFFFFF"))
+                                for c in active_cols
+                            ]
 
-                            if active_cols:
-                                st["df"] = df_disp[active_cols].copy()
-                                try:
+                            try:
+                                if active_cols:
+                                    st["df"] = self._preview_df_all[active_cols].copy()
                                     st["df_np"] = st["df"].to_numpy(dtype=float, copy=False)
+                                else:
+                                    st["df"] = self._preview_df_all.iloc[:, 0:0].copy()
+                                    st["df_np"] = np.zeros((len(self._preview_df_all), 0), dtype=float)
+                            except Exception:
+                                pass
+
+                            # THIS is the missing label refresh
+                            title_text = st.get("title_text")
+                            if title_text is not None:
+                                try:
+                                    title_text.set_text(self._measurement_title_for_unit(unit))
                                 except Exception:
-                                    st["df_np"] = np.asarray(st["df"].to_numpy(), dtype=float)
-                            else:
-                                st["df"] = df_disp.iloc[:, 0:0].copy()
-                                st["df_np"] = np.zeros((int(len(self._preview_x or [])), 0), dtype=float)
-                    except Exception:
-                        pass
-                    try:
+                                    pass
+
                         self._single_last_idx = None
                         self._refresh_single_backgrounds()
+                        if self._preview_canvas is not None:
+                            self._preview_canvas.draw_idle()
                     except Exception:
                         pass
 
-                return self._start_plot_morph(axis_payloads, finish_callback=_finish, duration_s=0.10)
+                return self._start_plot_morph(axis_payloads, finish_callback=_finish, duration_s=0.16)
 
-            # Single axis
+            # -----------------------------
+            # Single-axis mode
+            # -----------------------------
             if not getattr(self, "_preview_lines", None):
                 return False
 
@@ -5422,10 +5525,11 @@ class GraphPreview(QObject):
                     self._fast_refresh_hover_cache_values_only(self._preview_df)
                     self._preview_last_tt_idx = None
                     self._preview_invalidate_interaction_cache()
-                    try:
-                        self._on_preview_draw()
-                    except Exception:
-                        pass
+                    self._update_single_axis_header()
+                    self._apply_single_axis_header_chrome()
+                    self._on_preview_draw()
+                    if self._preview_canvas is not None:
+                        self._preview_canvas.draw_idle()
                 except Exception:
                     pass
 
@@ -5438,7 +5542,7 @@ class GraphPreview(QObject):
                     "animate_ylim": False,
                 }],
                 finish_callback=_finish,
-                duration_s=0.10,
+                duration_s=0.16,
             )
         except Exception:
             return False
@@ -5447,6 +5551,8 @@ class GraphPreview(QObject):
         try:
             # After certain navigation/replot paths, the cached bbox may not be ready yet.
             # Refresh it once on click so the button remains usable.
+            if not self._canvas_button_hit_testing_enabled():
+                return False
             try:
                 if self._zero_btn_bbox is None and self._zero_btn_text is not None and self._preview_canvas is not None:
                     try:
@@ -5500,6 +5606,51 @@ class GraphPreview(QObject):
             return True
         except Exception:
             return False
+
+    def _header_preview_controls_active(self) -> bool:
+        try:
+            widgets = (
+                getattr(self, "_preview_header_zero_btn", None),
+                getattr(self, "_preview_header_delta_btn", None),
+                getattr(self, "_preview_header_legend_btn", None),
+                getattr(self, "_preview_header_copy_btn", None),
+            )
+            for w in widgets:
+                if w is not None:
+                    return True
+            return False
+        except Exception:
+            return False
+
+
+    def _canvas_button_hit_testing_enabled(self) -> bool:
+        """
+        Canvas-drawn button hit testing is only safe in legacy single-axis mode.
+        In compare mode / multi-axis mode / sticky-header mode, real controls live
+        in the header, so canvas bbox hit-testing must be disabled.
+        """
+        try:
+            if bool(getattr(self, "_compare_mode", False)):
+                return False
+            if bool(getattr(self, "_single_mode_multi_axis", False)):
+                return False
+            if self._header_preview_controls_active():
+                return False
+        except Exception:
+            pass
+        return True
+
+
+    def _clear_canvas_button_hitboxes(self) -> None:
+        try:
+            self._ls_btn_text = None
+            self._ls_btn_bbox = None
+            self._delta_btn_text = None
+            self._delta_btn_bbox = None
+            self._zero_btn_text = None
+            self._zero_btn_bbox = None
+        except Exception:
+            pass
 
     def _schedule_replot_current_result_for_display_mode(
         self,
@@ -5584,6 +5735,8 @@ class GraphPreview(QObject):
                 pass
 
     def _handle_ls_click(self, qt_x: int, qt_y: int) -> bool:
+        if not self._canvas_button_hit_testing_enabled():
+            return False
         if not self._is_over_ls_button(qt_x, qt_y):
             return False
 
@@ -6824,6 +6977,7 @@ class GraphPreview(QObject):
         self._close_legend_popup()
         self._exit_compare_mode()
         self._hide_qt_tooltip()
+        self._clear_canvas_button_hitboxes()
 
         try:
             self._compare_manifest_path = Path(manifest_path)
@@ -7354,22 +7508,11 @@ class GraphPreview(QObject):
                 if self._preview_canvas is None or not self._compare_mode:
                     return
 
-                # Button hover: match single-mode cursor behavior and avoid showing tooltips.
+                # Compare mode uses header buttons, never canvas button hitboxes.
                 try:
-                    if (
-                        self._is_over_zero_y_button(ev.pos().x(), ev.pos().y())
-                        or (self._delta_toggle_is_enabled() and self._is_over_delta_button(ev.pos().x(), ev.pos().y()))
-                        or self._is_over_ls_button(ev.pos().x(), ev.pos().y())
-                    ):
-                        if not self._hovering_ls_btn:
-                            self._hovering_ls_btn = True
-                            self._preview_canvas.setCursor(Qt.PointingHandCursor)
-                        self._hide_compare_hover_all()
-                        return
-                    else:
-                        if self._hovering_ls_btn:
-                            self._hovering_ls_btn = False
-                            self._preview_canvas.setCursor(Qt.ArrowCursor)
+                    if self._hovering_ls_btn:
+                        self._hovering_ls_btn = False
+                        self._preview_canvas.setCursor(Qt.ArrowCursor)
                 except Exception:
                     pass
 
@@ -7864,6 +8007,7 @@ class GraphPreview(QObject):
         if self._preview_canvas is None or self._preview_fig is None:
             return
 
+        self._clear_canvas_button_hitboxes()
         self._single_mode_multi_axis = True
         self._ls_btn_text = None
         self._ls_btn_bbox = None
@@ -8012,8 +8156,9 @@ class GraphPreview(QObject):
                 vline = None
 
             # Add measurement label above the axes (left), so it doesn't collide with plot content.
+            title_text = None
             try:
-                ax.text(
+                title_text = ax.text(
                     0.0,
                     float(getattr(self, "_preview_title_axes_y", 1.02)),
                     str(measurement_label),
@@ -8026,7 +8171,7 @@ class GraphPreview(QObject):
                     clip_on=False,
                 )
             except Exception:
-                pass
+                title_text = None
 
             # Sticky header owns preview controls for multi-axis mode.
 
@@ -8058,6 +8203,7 @@ class GraphPreview(QObject):
                 "vline": vline,
                 "bg": None,
                 "qt_tt": _make_single_tt(),
+                "title_text": title_text,
             }
             self._single_axis_vlines[ax] = vline
 
