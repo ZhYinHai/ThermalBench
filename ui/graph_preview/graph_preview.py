@@ -208,23 +208,24 @@ class GraphPreview(QObject):
         self._plot_morph_timer.setInterval(16)  # ~60 fps
         self._plot_morph_timer.timeout.connect(self._plot_morph_tick)
 
-        self._plot_morph_duration_s = 0.12
+        self._plot_morph_duration_s = 0.10
         self._plot_morph_t0 = 0.0
         self._plot_morph_axes: list[dict] = []
         self._plot_morph_finish = None
 
         # Morph performance budget
         self._plot_morph_mode = "blit"   # "blit" or "redraw"
-        self._plot_morph_max_points_per_line = 1200
-        self._plot_morph_max_total_points = 8000
+        self._plot_morph_max_points_per_line = 320
+        self._plot_morph_max_total_points = 2400
         self._plot_morph_disable_glow = True
         self._plot_morph_reduce_antialias = True
+        self._plot_morph_lock_interaction = False
 
         # Blit backgrounds for morph animation
         self._plot_morph_bgs: dict[object, object] = {}
 
         # Lower default timer pressure
-        self._plot_morph_timer.setInterval(20)  # ~50 fps instead of 60+
+        self._plot_morph_timer.setInterval(33)  # ~30 fps, steadier under heavy load
 
         # --- Qt tooltip movement animation (single + compare)
         # IMPORTANT: compare mode has MULTIPLE tooltips, so animation must be per-widget.
@@ -2259,24 +2260,95 @@ class GraphPreview(QObject):
             except Exception:
                 pass
 
-            total_points = 0
+            # Hide all interaction overlays before starting the tween.
+            try:
+                self._plot_morph_lock_interaction = True
+            except Exception:
+                pass
+            try:
+                self._hide_preview_hover(hard=True)
+            except Exception:
+                pass
+            try:
+                self._hide_compare_hover_all()
+            except Exception:
+                pass
+            try:
+                self._hide_single_hover_all()
+            except Exception:
+                pass
+
+            line_count = 0
             has_ylim_anim = False
             for ap in axis_payloads:
                 has_ylim_anim = has_ylim_anim or bool(ap.get("animate_ylim", False))
+                line_count += int(len(ap.get("lines", []) or []))
+
+            # Adaptive animation LOD:
+            # shrink each animated line further based on total line count.
+            if line_count > 0:
+                try:
+                    per_line_budget = max(
+                        48,
+                        min(
+                            int(getattr(self, "_plot_morph_max_points_per_line", 320) or 320),
+                            int(getattr(self, "_plot_morph_max_total_points", 2400) or 2400) // max(1, line_count),
+                        ),
+                    )
+                except Exception:
+                    per_line_budget = 96
+
+                for ap in axis_payloads:
+                    new_lines = []
+                    for lp in list(ap.get("lines", []) or []):
+                        try:
+                            y0 = np.asarray(lp.get("y0", []), dtype=float)
+                            x_anim = np.asarray(lp.get("x_anim", []), dtype=float)
+                            dy = np.asarray(lp.get("dy", []), dtype=float)
+                            y1_anim = np.asarray(lp.get("y1_anim", []), dtype=float)
+
+                            n = int(len(y0))
+                            if n > per_line_budget:
+                                idx = self._plot_morph_sample_indices(n, per_line_budget)
+                                lp = dict(lp)
+                                lp["x_anim"] = x_anim[idx]
+                                lp["y0"] = y0[idx]
+                                lp["dy"] = dy[idx]
+                                lp["y1_anim"] = y1_anim[idx]
+
+                                try:
+                                    ln = lp["line"]
+                                    ln.set_xdata(lp["x_anim"])
+                                    ln.set_ydata(lp["y0"])
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        new_lines.append(lp)
+
+                    ap["lines"] = new_lines
+
+            total_points = 0
+            for ap in axis_payloads:
                 for lp in list(ap.get("lines", []) or []):
                     try:
                         total_points += int(len(lp.get("y0", [])))
                     except Exception:
                         pass
 
-            # Hard budget: skip morph if too heavy.
-            if total_points > int(getattr(self, "_plot_morph_max_total_points", 12000) or 12000):
+            # Hard budget: skip morph if still too heavy.
+            if total_points > int(getattr(self, "_plot_morph_max_total_points", 2400) or 2400):
+                try:
+                    self._plot_morph_lock_interaction = False
+                except Exception:
+                    pass
                 return False
 
             self._plot_morph_axes = list(axis_payloads)
             self._plot_morph_finish = finish_callback
             self._plot_morph_t0 = float(time.time())
-            self._plot_morph_duration_s = float(duration_s or 0.20)
+            self._plot_morph_duration_s = float(duration_s or 0.10)
             self._plot_morph_bgs = {}
 
             # y-limit animation needs redraws; line-only morph can use blit.
@@ -2284,7 +2356,7 @@ class GraphPreview(QObject):
 
             try:
                 if self._plot_morph_mode == "blit":
-                    self._plot_morph_timer.setInterval(20)  # ~50 fps
+                    self._plot_morph_timer.setInterval(33)  # ~30 fps
 
                     if self._preview_canvas is not None:
                         animated_lines = []
@@ -2318,7 +2390,7 @@ class GraphPreview(QObject):
                             except Exception:
                                 pass
                 else:
-                    self._plot_morph_timer.setInterval(33)  # ~30 fps for ylim tween
+                    self._plot_morph_timer.setInterval(40)  # slower but steadier for redraw mode
             except Exception:
                 pass
 
@@ -2327,6 +2399,10 @@ class GraphPreview(QObject):
                 self._plot_morph_timer.start()
             return True
         except Exception:
+            try:
+                self._plot_morph_lock_interaction = False
+            except Exception:
+                pass
             return False
 
     def _finish_plot_morph(self) -> None:
@@ -2372,6 +2448,12 @@ class GraphPreview(QObject):
         self._plot_morph_bgs = {}
 
         try:
+            self._plot_morph_lock_interaction = False
+        except Exception:
+            pass
+
+        # FINAL DRAW
+        try:
             if self._preview_canvas is not None:
                 self._preview_canvas.draw()
         except Exception:
@@ -2380,6 +2462,23 @@ class GraphPreview(QObject):
                     self._preview_canvas.draw_idle()
             except Exception:
                 pass
+
+        # IMPORTANT: refresh blit backgrounds so hover doesn't restore stale pre-toggle axes
+        try:
+            if getattr(self, "_compare_mode", False):
+                self._compare_last_idx = None
+                self._refresh_compare_backgrounds()
+            elif getattr(self, "_single_mode_multi_axis", False):
+                self._single_last_idx = None
+                self._refresh_single_backgrounds()
+            else:
+                self._preview_last_tt_idx = None
+                try:
+                    self._on_preview_draw()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         try:
             if callable(finish_cb):
@@ -2574,7 +2673,7 @@ class GraphPreview(QObject):
 
             idx = self._plot_morph_sample_indices(
                 len(y1_full),
-                int(getattr(self, "_plot_morph_max_points_per_line", 1200) or 1200),
+                int(getattr(self, "_plot_morph_max_points_per_line", 320) or 320),
             )
 
             x_anim = x_full[idx]
@@ -2722,7 +2821,7 @@ class GraphPreview(QObject):
 
             return self._start_plot_morph(
                 axis_payloads,
-                duration_s=0.12,
+                duration_s=0.10,
             )
         except Exception:
             return False
@@ -5187,7 +5286,7 @@ class GraphPreview(QObject):
                     except Exception:
                         pass
 
-                return self._start_plot_morph(axis_payloads, finish_callback=_finish, duration_s=0.18)
+                return self._start_plot_morph(axis_payloads, finish_callback=_finish, duration_s=0.10)
 
             df_disp = self._preview_get_display_df_for_current_mode()
             if not isinstance(df_disp, pd.DataFrame) or df_disp.empty:
@@ -5270,7 +5369,7 @@ class GraphPreview(QObject):
                     except Exception:
                         pass
 
-                return self._start_plot_morph(axis_payloads, finish_callback=_finish, duration_s=0.18)
+                return self._start_plot_morph(axis_payloads, finish_callback=_finish, duration_s=0.10)
 
             # Single axis
             if not getattr(self, "_preview_lines", None):
@@ -5347,7 +5446,7 @@ class GraphPreview(QObject):
                     "animate_ylim": False,
                 }],
                 finish_callback=_finish,
-                duration_s=0.18,
+                duration_s=0.10,
             )
         except Exception:
             return False
@@ -5622,6 +5721,12 @@ class GraphPreview(QObject):
         - NEW: tooltip position animates smoothly between targets
         """
         try:
+            try:
+                if bool(getattr(self, "_plot_morph_lock_interaction", False)) or self._plot_morph_timer.isActive():
+                    return
+            except Exception:
+                pass
+
             if not getattr(self, "_app_is_active", True):
                 return
             if self._preview_ax is None:
@@ -7248,6 +7353,12 @@ class GraphPreview(QObject):
         # -----------------------------
         def _compare_mouse_move(ev):
             try:
+                try:
+                    if bool(getattr(self, "_plot_morph_lock_interaction", False)) or self._plot_morph_timer.isActive():
+                        return
+                except Exception:
+                    pass
+    
                 if self._preview_canvas is None or not self._compare_mode:
                     return
 
@@ -8041,6 +8152,12 @@ class GraphPreview(QObject):
         # Install custom mouse move handler for multi-axis mode
         def _single_multi_mouse_move(ev):
             try:
+                try:
+                    if bool(getattr(self, "_plot_morph_lock_interaction", False)) or self._plot_morph_timer.isActive():
+                        return
+                except Exception:
+                    pass
+    
                 if self._preview_canvas is None or not self._single_mode_multi_axis:
                     return
 
@@ -8064,6 +8181,7 @@ class GraphPreview(QObject):
                             if not self._hovering_ls_btn:
                                 self._hovering_ls_btn = True
                                 self._preview_canvas.setCursor(Qt.PointingHandCursor)
+                            self._hide_single_hover_all()
                             return
                         else:
                             if self._hovering_ls_btn:
