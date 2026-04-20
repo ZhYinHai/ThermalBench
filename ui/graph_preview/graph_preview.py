@@ -208,10 +208,23 @@ class GraphPreview(QObject):
         self._plot_morph_timer.setInterval(16)  # ~60 fps
         self._plot_morph_timer.timeout.connect(self._plot_morph_tick)
 
-        self._plot_morph_duration_s = 0.16
+        self._plot_morph_duration_s = 0.12
         self._plot_morph_t0 = 0.0
         self._plot_morph_axes: list[dict] = []
         self._plot_morph_finish = None
+
+        # Morph performance budget
+        self._plot_morph_mode = "blit"   # "blit" or "redraw"
+        self._plot_morph_max_points_per_line = 1200
+        self._plot_morph_max_total_points = 8000
+        self._plot_morph_disable_glow = True
+        self._plot_morph_reduce_antialias = True
+
+        # Blit backgrounds for morph animation
+        self._plot_morph_bgs: dict[object, object] = {}
+
+        # Lower default timer pressure
+        self._plot_morph_timer.setInterval(20)  # ~50 fps instead of 60+
 
         # --- Qt tooltip movement animation (single + compare)
         # IMPORTANT: compare mode has MULTIPLE tooltips, so animation must be per-widget.
@@ -2228,91 +2241,6 @@ class GraphPreview(QObject):
         self._plot_morph_axes = []
         self._plot_morph_finish = None
 
-    def _compute_morph_ylim(
-        self,
-        arrays: list[np.ndarray],
-        *,
-        zero_mode: bool,
-    ) -> Optional[tuple[float, float]]:
-        try:
-            ys = []
-            for arr in arrays:
-                if arr is None:
-                    continue
-                a = np.asarray(arr, dtype=float)
-                a = a[np.isfinite(a)]
-                if a.size:
-                    ys.append(a)
-
-            if not ys:
-                return None
-
-            y_all = np.concatenate(ys)
-            ymin = float(np.nanmin(y_all))
-            ymax = float(np.nanmax(y_all))
-            if not (np.isfinite(ymin) and np.isfinite(ymax)):
-                return None
-
-            if zero_mode:
-                ymin0 = float(min(ymin, 0.0))
-                ymax0 = float(max(ymax, 0.0))
-                span0 = float(ymax0 - ymin0)
-                pad0 = 1.0 if span0 == 0.0 else 0.06 * span0
-                low = 0.0 if ymin >= 0.0 else (ymin0 - pad0)
-                high = 0.0 if ymax <= 0.0 else (ymax0 + pad0)
-                return (float(low), float(high))
-
-            pad = 1.0 if ymin == ymax else 0.06 * (ymax - ymin)
-            return (float(ymin - pad), float(ymax + pad))
-        except Exception:
-            return None
-
-    def _build_line_morph_payload(
-        self,
-        line,
-        target_y: np.ndarray,
-        *,
-        target_visible: bool,
-    ) -> Optional[dict]:
-        try:
-            try:
-                start_y = np.asarray(line.get_ydata(orig=False), dtype=float)
-            except Exception:
-                start_y = np.asarray(line.get_ydata(), dtype=float)
-
-            target_y = np.asarray(target_y, dtype=float)
-
-            if start_y.shape != target_y.shape:
-                return None
-
-            try:
-                base_alpha = float(line.get_alpha())
-                if not np.isfinite(base_alpha):
-                    base_alpha = 0.98
-            except Exception:
-                base_alpha = 0.98
-
-            start_visible = bool(line.get_visible())
-            start_alpha = float(base_alpha if start_visible else 0.0)
-            target_alpha = float(base_alpha if target_visible else 0.0)
-
-            try:
-                line.set_visible(True)
-            except Exception:
-                pass
-
-            return {
-                "line": line,
-                "y0": start_y,
-                "dy": (target_y - start_y),
-                "y1": target_y,
-                "a0": start_alpha,
-                "a1": target_alpha,
-                "vis1": bool(target_visible),
-            }
-        except Exception:
-            return None
-
     def _start_plot_morph(
         self,
         axis_payloads: list[dict],
@@ -2324,11 +2252,75 @@ class GraphPreview(QObject):
             if not axis_payloads:
                 return False
 
-            self._stop_plot_morph()
+            # Finish any running morph first so artists are restored cleanly.
+            try:
+                if self._plot_morph_timer.isActive():
+                    self._finish_plot_morph()
+            except Exception:
+                pass
+
+            total_points = 0
+            has_ylim_anim = False
+            for ap in axis_payloads:
+                has_ylim_anim = has_ylim_anim or bool(ap.get("animate_ylim", False))
+                for lp in list(ap.get("lines", []) or []):
+                    try:
+                        total_points += int(len(lp.get("y0", [])))
+                    except Exception:
+                        pass
+
+            # Hard budget: skip morph if too heavy.
+            if total_points > int(getattr(self, "_plot_morph_max_total_points", 12000) or 12000):
+                return False
+
             self._plot_morph_axes = list(axis_payloads)
             self._plot_morph_finish = finish_callback
             self._plot_morph_t0 = float(time.time())
             self._plot_morph_duration_s = float(duration_s or 0.20)
+            self._plot_morph_bgs = {}
+
+            # y-limit animation needs redraws; line-only morph can use blit.
+            self._plot_morph_mode = "redraw" if has_ylim_anim else "blit"
+
+            try:
+                if self._plot_morph_mode == "blit":
+                    self._plot_morph_timer.setInterval(20)  # ~50 fps
+
+                    if self._preview_canvas is not None:
+                        animated_lines = []
+
+                        # Mark animated lines so they are excluded from the cached background.
+                        for ap in self._plot_morph_axes:
+                            for lp in list(ap.get("lines", []) or []):
+                                try:
+                                    ln = lp["line"]
+                                    ln.set_animated(True)
+                                    animated_lines.append(ln)
+                                except Exception:
+                                    pass
+
+                        # Draw clean background without animated artists.
+                        self._preview_canvas.draw()
+
+                        for ap in self._plot_morph_axes:
+                            ax = ap.get("ax")
+                            if ax is None:
+                                continue
+                            try:
+                                self._plot_morph_bgs[ax] = self._preview_canvas.copy_from_bbox(ax.bbox)
+                            except Exception:
+                                pass
+
+                        # Restore normal state; manual draw_artist will handle them during tween.
+                        for ln in animated_lines:
+                            try:
+                                ln.set_animated(False)
+                            except Exception:
+                                pass
+                else:
+                    self._plot_morph_timer.setInterval(33)  # ~30 fps for ylim tween
+            except Exception:
+                pass
 
             self._plot_morph_tick()
             if self._plot_morph_axes:
@@ -2354,15 +2346,30 @@ class GraphPreview(QObject):
                 for lp in list(ap.get("lines", []) or []):
                     try:
                         ln = lp["line"]
-                        ln.set_ydata(lp["y1"])
+                        ln.set_xdata(lp["x_full"])
+                        ln.set_ydata(lp["y1_full"])
                         ln.set_alpha(float(lp["a1"]))
                         ln.set_visible(bool(lp["vis1"]))
+
+                        try:
+                            ln.set_path_effects(lp.get("restore_pe") or [])
+                        except Exception:
+                            pass
+                        try:
+                            ln.set_antialiased(bool(lp.get("restore_aa", True)))
+                        except Exception:
+                            pass
+                        try:
+                            ln.set_linewidth(float(lp.get("restore_lw", 1.6)))
+                        except Exception:
+                            pass
                     except Exception:
                         pass
         except Exception:
             pass
 
         self._stop_plot_morph()
+        self._plot_morph_bgs = {}
 
         try:
             if self._preview_canvas is not None:
@@ -2399,14 +2406,54 @@ class GraphPreview(QObject):
 
             e = self._ease_in_out_cubic(float(t))
 
+            if str(getattr(self, "_plot_morph_mode", "blit")) == "blit":
+                c = self._preview_canvas
+                if c is None:
+                    self._finish_plot_morph()
+                    return
+
+                for ap in payloads:
+                    ax = ap.get("ax")
+                    if ax is None:
+                        continue
+
+                    bg = self._plot_morph_bgs.get(ax)
+                    if bg is None:
+                        continue
+
+                    try:
+                        c.restore_region(bg)
+                    except Exception:
+                        continue
+
+                    for lp in list(ap.get("lines", []) or []):
+                        try:
+                            ln = lp["line"]
+                            y = lp["y0"] + (lp["dy"] * e)
+                            a = float(lp["a0"]) + (float(lp["a1"]) - float(lp["a0"])) * e
+                            ln.set_ydata(y)
+                            ln.set_alpha(a)
+                            ln.set_visible(bool(a > 0.001 or lp["vis1"]))
+                            ax.draw_artist(ln)
+                        except Exception:
+                            pass
+
+                    try:
+                        c.blit(ax.bbox)
+                    except Exception:
+                        pass
+                return
+
+            # redraw mode (used for quick ylim tween)
             for ap in payloads:
                 ax = ap.get("ax")
-                ylim0 = ap.get("ylim0")
-                ylim1 = ap.get("ylim1")
-                if ax is not None and ylim0 is not None and ylim1 is not None:
+                if ax is None:
+                    continue
+
+                if bool(ap.get("animate_ylim", False)):
                     try:
-                        y0a, y0b = float(ylim0[0]), float(ylim0[1])
-                        y1a, y1b = float(ylim1[0]), float(ylim1[1])
+                        y0a, y0b = float(ap["ylim0"][0]), float(ap["ylim0"][1])
+                        y1a, y1b = float(ap["ylim1"][0]), float(ap["ylim1"][1])
                         ax.set_ylim(
                             y0a + (y1a - y0a) * e,
                             y0b + (y1b - y0b) * e,
@@ -2449,302 +2496,234 @@ class GraphPreview(QObject):
         except Exception:
             return list(getattr(self, "_compare_manifest_sensors", []) or [])
 
-    def _animate_single_axis_to_display_df(self, df_disp: pd.DataFrame) -> bool:
+    @staticmethod
+    def _plot_morph_sample_indices(n: int, max_points: int) -> np.ndarray:
         try:
-            if self._preview_ax is None or not getattr(self, "_preview_lines", None):
-                return False
+            n = int(n)
+            max_points = max(8, int(max_points))
+            if n <= max_points:
+                return np.arange(n, dtype=int)
+            step = int(np.ceil((n - 1) / max(1, max_points - 1)))
+            idx = np.arange(0, n, step, dtype=int)
+            if idx.size == 0 or int(idx[-1]) != (n - 1):
+                idx = np.append(idx, n - 1)
+            return idx
+        except Exception:
+            return np.arange(max(0, int(n)), dtype=int)
 
-            amb = self._ambient_col_for_current_result()
-            active_set = set(self._effective_active_cols())
-            zero_mode = bool(getattr(self, "_zero_y_mode", False))
-
-            line_payloads = []
-            ylim_arrays = []
-
-            for name, ln in list(self._preview_lines.items()):
-                if name not in df_disp.columns:
+    def _collect_axis_target_ylim_from_arrays(
+        self,
+        arrays: list[np.ndarray],
+        *,
+        zero_mode: bool,
+    ) -> Optional[tuple[float, float]]:
+        try:
+            ys = []
+            for arr in arrays:
+                if arr is None:
                     continue
+                a = np.asarray(arr, dtype=float)
+                a = a[np.isfinite(a)]
+                if a.size:
+                    ys.append(a)
+            if not ys:
+                return None
 
-                try:
-                    y1 = pd.to_numeric(df_disp[name], errors="coerce").to_numpy(dtype=float)
-                except Exception:
-                    continue
+            y_all = np.concatenate(ys)
+            ymin = float(np.nanmin(y_all))
+            ymax = float(np.nanmax(y_all))
+            if not (np.isfinite(ymin) and np.isfinite(ymax)):
+                return None
 
-                vis1 = bool(name in active_set)
-                if amb and name == amb and bool(getattr(self, "_temp_delta_mode", False)):
-                    vis1 = False
+            if zero_mode:
+                ymin0 = float(min(ymin, 0.0))
+                ymax0 = float(max(ymax, 0.0))
+                span0 = float(ymax0 - ymin0)
+                pad0 = 1.0 if span0 == 0.0 else 0.06 * span0
+                low = 0.0 if ymin >= 0.0 else (ymin0 - pad0)
+                high = 0.0 if ymax <= 0.0 else (ymax0 + pad0)
+                return (float(low), float(high))
 
-                lp = self._build_line_morph_payload(ln, y1, target_visible=vis1)
-                if lp is not None:
-                    line_payloads.append(lp)
+            pad = 1.0 if ymin == ymax else 0.06 * (ymax - ymin)
+            return (float(ymin - pad), float(ymax + pad))
+        except Exception:
+            return None
 
-                try:
-                    self._preview_series_data[name] = y1
-                except Exception:
-                    pass
-
-                if vis1:
-                    ylim_arrays.append(y1)
-
-            ylim1 = self._compute_morph_ylim(ylim_arrays, zero_mode=zero_mode)
-            if ylim1 is None:
-                try:
-                    ylim1 = tuple(self._preview_ax.get_ylim())
-                except Exception:
-                    return False
+    def _prepare_line_for_morph(
+        self,
+        line,
+        target_y: np.ndarray,
+        *,
+        target_visible: bool,
+    ) -> Optional[dict]:
+        try:
+            try:
+                x_full = np.asarray(line.get_xdata(orig=False), dtype=float)
+            except Exception:
+                x_full = np.asarray(line.get_xdata(), dtype=float)
 
             try:
-                df_hover = df_disp[list(self._effective_active_cols())]
+                y0_full = np.asarray(line.get_ydata(orig=False), dtype=float)
             except Exception:
-                df_hover = df_disp
+                y0_full = np.asarray(line.get_ydata(), dtype=float)
 
-            def _finish():
+            y1_full = np.asarray(target_y, dtype=float)
+
+            if x_full.shape != y0_full.shape or y0_full.shape != y1_full.shape:
+                return None
+
+            idx = self._plot_morph_sample_indices(
+                len(y1_full),
+                int(getattr(self, "_plot_morph_max_points_per_line", 1200) or 1200),
+            )
+
+            x_anim = x_full[idx]
+            y0_anim = y0_full[idx]
+            y1_anim = y1_full[idx]
+
+            try:
+                base_alpha = float(line.get_alpha())
+                if not np.isfinite(base_alpha):
+                    base_alpha = 0.98
+            except Exception:
+                base_alpha = 0.98
+
+            try:
+                pe0 = line.get_path_effects()
+            except Exception:
+                pe0 = None
+            try:
+                aa0 = bool(line.get_antialiased())
+            except Exception:
                 try:
-                    self._preview_df_all = df_disp
-                    self._preview_df = df_hover
-                    self._preview_colors = [
-                        self._preview_color_map.get(c, "#FFFFFF")
-                        for c in list(self._effective_active_cols())
-                    ]
-                    self._fast_refresh_hover_cache_values_only(self._preview_df)
-                    self._preview_last_tt_idx = None
-                    self._preview_invalidate_interaction_cache()
-                    if self._preview_canvas is not None:
-                        self._preview_canvas.draw()
-                    try:
-                        self._on_preview_draw()
-                    except Exception:
-                        pass
+                    aa0 = bool(line.get_aa())
                 except Exception:
-                    pass
+                    aa0 = True
+            try:
+                lw0 = float(line.get_linewidth())
+            except Exception:
+                lw0 = 1.6
 
-            return self._start_plot_morph(
-                [{
+            # IMPORTANT: capture visibility BEFORE forcing visible for animation
+            try:
+                start_visible = bool(line.get_visible())
+            except Exception:
+                start_visible = True
+
+            a0 = float(base_alpha if start_visible else 0.0)
+            a1 = float(base_alpha if target_visible else 0.0)
+
+            # Cheapen the artist during the tween
+            try:
+                if bool(getattr(self, "_plot_morph_disable_glow", True)):
+                    line.set_path_effects([])
+            except Exception:
+                pass
+            try:
+                if bool(getattr(self, "_plot_morph_reduce_antialias", True)):
+                    line.set_antialiased(False)
+            except Exception:
+                pass
+            try:
+                line.set_linewidth(min(lw0, 1.3))
+            except Exception:
+                pass
+
+            # Use reduced vertex count during animation
+            try:
+                line.set_xdata(x_anim)
+                line.set_ydata(y0_anim)
+                line.set_visible(True)
+            except Exception:
+                pass
+
+            return {
+                "line": line,
+                "x_full": x_full,
+                "y1_full": y1_full,
+                "x_anim": x_anim,
+                "y0": y0_anim,
+                "dy": (y1_anim - y0_anim),
+                "y1_anim": y1_anim,
+                "a0": a0,
+                "a1": a1,
+                "vis1": bool(target_visible),
+                "restore_pe": pe0,
+                "restore_aa": aa0,
+                "restore_lw": lw0,
+            }
+        except Exception:
+            return None
+
+    def _animate_current_ylims_only(self) -> bool:
+        try:
+            zero_mode = bool(getattr(self, "_zero_y_mode", False))
+            axis_payloads = []
+
+            if getattr(self, "_compare_mode", False):
+                for ax in list(getattr(self, "_compare_axes", []) or []):
+                    st = (self._compare_axis_state or {}).get(ax)
+                    if not st:
+                        continue
+                    arrays = []
+                    for arr in list((st.get("series_data") or {}).values()):
+                        arrays.append(arr)
+                    ylim1 = self._collect_axis_target_ylim_from_arrays(arrays, zero_mode=zero_mode)
+                    if ylim1 is None:
+                        continue
+                    axis_payloads.append({
+                        "ax": ax,
+                        "lines": [],
+                        "ylim0": tuple(ax.get_ylim()),
+                        "ylim1": tuple(ylim1),
+                        "animate_ylim": True,
+                    })
+
+            elif getattr(self, "_single_mode_multi_axis", False):
+                active_set = set(self._effective_active_cols())
+                for ax in list(getattr(self, "_single_axes", []) or []):
+                    st = (self._single_axis_state or {}).get(ax)
+                    if not st:
+                        continue
+                    arrays = []
+                    for name, arr in list((st.get("series_data") or {}).items()):
+                        if name in active_set:
+                            arrays.append(arr)
+                    ylim1 = self._collect_axis_target_ylim_from_arrays(arrays, zero_mode=zero_mode)
+                    if ylim1 is None:
+                        continue
+                    axis_payloads.append({
+                        "ax": ax,
+                        "lines": [],
+                        "ylim0": tuple(ax.get_ylim()),
+                        "ylim1": tuple(ylim1),
+                        "animate_ylim": True,
+                    })
+
+            else:
+                if self._preview_ax is None:
+                    return False
+                arrays = []
+                for name in list(self._effective_active_cols()):
+                    arrays.append((self._preview_series_data or {}).get(name))
+                ylim1 = self._collect_axis_target_ylim_from_arrays(arrays, zero_mode=zero_mode)
+                if ylim1 is None:
+                    return False
+                axis_payloads.append({
                     "ax": self._preview_ax,
-                    "lines": line_payloads,
+                    "lines": [],
                     "ylim0": tuple(self._preview_ax.get_ylim()),
                     "ylim1": tuple(ylim1),
-                }],
-                finish_callback=_finish,
+                    "animate_ylim": True,
+                })
+
+            if not axis_payloads:
+                return False
+
+            return self._start_plot_morph(
+                axis_payloads,
+                duration_s=0.12,
             )
-        except Exception:
-            return False
-
-    def _animate_single_multi_axis_to_display_df(self, df_disp: pd.DataFrame) -> bool:
-        try:
-            if not getattr(self, "_single_mode_multi_axis", False):
-                return False
-            if not getattr(self, "_single_axis_state", None):
-                return False
-
-            active_set = set(self._effective_active_cols())
-            zero_mode = bool(getattr(self, "_zero_y_mode", False))
-            axis_payloads = []
-
-            for ax, st in list((self._single_axis_state or {}).items()):
-                lines = (st or {}).get("lines") or {}
-                series_data = (st or {}).get("series_data") or {}
-
-                line_payloads = []
-                ylim_arrays = []
-
-                for name, ln in list(lines.items()):
-                    if name not in df_disp.columns:
-                        continue
-
-                    try:
-                        y1 = pd.to_numeric(df_disp[name], errors="coerce").to_numpy(dtype=float)
-                    except Exception:
-                        continue
-
-                    vis1 = bool(name in active_set)
-                    lp = self._build_line_morph_payload(ln, y1, target_visible=vis1)
-                    if lp is not None:
-                        line_payloads.append(lp)
-
-                    try:
-                        series_data[name] = y1
-                    except Exception:
-                        pass
-
-                    if vis1:
-                        ylim_arrays.append(y1)
-
-                ylim1 = self._compute_morph_ylim(ylim_arrays, zero_mode=zero_mode)
-                if ylim1 is None:
-                    try:
-                        ylim1 = tuple(ax.get_ylim())
-                    except Exception:
-                        continue
-
-                axis_payloads.append(
-                    {
-                        "ax": ax,
-                        "lines": line_payloads,
-                        "ylim0": tuple(ax.get_ylim()),
-                        "ylim1": tuple(ylim1),
-                    }
-                )
-
-            if not axis_payloads:
-                return False
-
-            def _finish():
-                try:
-                    self._preview_df_all = df_disp
-                except Exception:
-                    pass
-
-                try:
-                    for ax, st in list((self._single_axis_state or {}).items()):
-                        lines = (st or {}).get("lines") or {}
-                        cols_all = [str(n) for n in list(lines.keys()) if str(n) in df_disp.columns]
-                        active_cols = [c for c in cols_all if c in set(self._effective_active_cols())]
-
-                        st["cols"] = list(active_cols)
-                        st["colors"] = [str(self._preview_color_map.get(c, "#FFFFFF")) for c in active_cols]
-
-                        if active_cols:
-                            st["df"] = df_disp[active_cols].copy()
-                            try:
-                                st["df_np"] = st["df"].to_numpy(dtype=float, copy=False)
-                            except Exception:
-                                st["df_np"] = np.asarray(st["df"].to_numpy(), dtype=float)
-                        else:
-                            st["df"] = df_disp.iloc[:, 0:0].copy()
-                            st["df_np"] = np.zeros((int(len(self._preview_x or [])), 0), dtype=float)
-                except Exception:
-                    pass
-
-                try:
-                    self._single_last_idx = None
-                except Exception:
-                    pass
-
-                try:
-                    self._preview_invalidate_interaction_cache()
-                except Exception:
-                    pass
-
-                try:
-                    if self._preview_canvas is not None:
-                        self._preview_canvas.draw()
-                    self._refresh_single_backgrounds()
-                except Exception:
-                    pass
-
-            return self._start_plot_morph(axis_payloads, finish_callback=_finish)
-        except Exception:
-            return False
-
-    def _apply_compare_display_mode_to_current_plot(self) -> bool:
-        try:
-            if not getattr(self, "_compare_mode", False):
-                return False
-            if not getattr(self, "_compare_axis_state", None):
-                return False
-
-            target_sensors = list(self._compare_target_sensor_list_for_current_mode())
-            current_sensors = list(getattr(self, "_compare_manifest_sensors", []) or [])
-
-            # True morph only if the same subplot topology remains.
-            if target_sensors != current_sensors:
-                return False
-
-            zero_mode = bool(getattr(self, "_zero_y_mode", False))
-            delta_mode = bool(getattr(self, "_temp_delta_mode", False))
-            axis_payloads = []
-
-            for ax in list(getattr(self, "_compare_axes", []) or []):
-                st = (self._compare_axis_state or {}).get(ax)
-                if not st:
-                    continue
-
-                target_df = st.get("df_delta") if delta_mode else st.get("df_raw")
-                if not isinstance(target_df, pd.DataFrame):
-                    return False
-
-                lines = st.get("lines") or {}
-                series_data = st.get("series_data") or {}
-
-                line_payloads = []
-                ylim_arrays = []
-
-                for name, ln in list(lines.items()):
-                    if name not in target_df.columns:
-                        continue
-
-                    try:
-                        y1 = pd.to_numeric(target_df[name], errors="coerce").to_numpy(dtype=float)
-                    except Exception:
-                        continue
-
-                    lp = self._build_line_morph_payload(ln, y1, target_visible=True)
-                    if lp is not None:
-                        line_payloads.append(lp)
-
-                    try:
-                        series_data[name] = y1
-                    except Exception:
-                        pass
-
-                    ylim_arrays.append(y1)
-
-                ylim1 = self._compute_morph_ylim(ylim_arrays, zero_mode=zero_mode)
-                if ylim1 is None:
-                    try:
-                        ylim1 = tuple(ax.get_ylim())
-                    except Exception:
-                        continue
-
-                axis_payloads.append(
-                    {
-                        "ax": ax,
-                        "lines": line_payloads,
-                        "ylim0": tuple(ax.get_ylim()),
-                        "ylim1": tuple(ylim1),
-                        "_target_df": target_df,
-                    }
-                )
-
-            if not axis_payloads:
-                return False
-
-            def _finish():
-                try:
-                    for ap in axis_payloads:
-                        ax = ap.get("ax")
-                        st = (self._compare_axis_state or {}).get(ax)
-                        target_df = ap.get("_target_df")
-                        if st is None or not isinstance(target_df, pd.DataFrame):
-                            continue
-
-                        st["df"] = target_df
-                        try:
-                            st["df_np"] = target_df.to_numpy(dtype=float, copy=False)
-                        except Exception:
-                            st["df_np"] = np.asarray(target_df.to_numpy(), dtype=float)
-                except Exception:
-                    pass
-
-                try:
-                    self._compare_last_idx = None
-                except Exception:
-                    pass
-
-                try:
-                    self._preview_invalidate_interaction_cache()
-                except Exception:
-                    pass
-
-                try:
-                    if self._preview_canvas is not None:
-                        self._preview_canvas.draw()
-                    self._refresh_compare_backgrounds()
-                except Exception:
-                    pass
-
-            return self._start_plot_morph(axis_payloads, finish_callback=_finish)
         except Exception:
             return False
 
@@ -3221,12 +3200,6 @@ class GraphPreview(QObject):
                     self._preview_canvas.draw_idle()
             except Exception:
                 pass
-        try:
-            if self._preview_canvas is not None:
-                # restore background + hide vlines quickly
-                self._compare_blit_vlines_only()
-        except Exception:
-            pass
 
     def _refresh_compare_backgrounds(self) -> None:
         try:
@@ -5124,16 +5097,97 @@ class GraphPreview(QObject):
             pass
 
     def _apply_temp_delta_mode_to_current_plot(self) -> bool:
-        """Apply current ΔT/T mode to the existing plot with line morph when possible."""
+        """Apply current ΔT/T mode to the existing plot with a fast line morph."""
         try:
             if self._preview_canvas is None or self._preview_fig is None:
                 return False
             if not isinstance(getattr(self, "_preview_df_all_raw", None), pd.DataFrame):
                 return False
 
-            # Compare mode: morph only if subplot topology stays the same.
+            # Compare mode: only morph if subplot topology stays identical.
             if getattr(self, "_compare_mode", False):
-                return self._apply_compare_display_mode_to_current_plot()
+                try:
+                    target_sensors = list(self._compare_target_sensor_list_for_current_mode())
+                    current_sensors = list(getattr(self, "_compare_manifest_sensors", []) or [])
+                    if target_sensors != current_sensors:
+                        return False
+                except Exception:
+                    return False
+
+                axis_payloads = []
+                zero_mode = bool(getattr(self, "_zero_y_mode", False))
+
+                for ax in list(getattr(self, "_compare_axes", []) or []):
+                    st = (self._compare_axis_state or {}).get(ax)
+                    if not st:
+                        continue
+
+                    target_df = st.get("df_delta") if bool(getattr(self, "_temp_delta_mode", False)) else st.get("df_raw")
+                    if not isinstance(target_df, pd.DataFrame):
+                        return False
+
+                    line_payloads = []
+                    ylim_arrays = []
+
+                    for name, ln in list((st.get("lines") or {}).items()):
+                        if name not in target_df.columns:
+                            continue
+                        try:
+                            y1 = pd.to_numeric(target_df[name], errors="coerce").to_numpy(dtype=float)
+                        except Exception:
+                            continue
+
+                        lp = self._prepare_line_for_morph(ln, y1, target_visible=True)
+                        if lp is not None:
+                            line_payloads.append(lp)
+                        ylim_arrays.append(y1)
+
+                        try:
+                            (st.get("series_data") or {})[name] = y1
+                        except Exception:
+                            pass
+
+                    ylim1 = self._collect_axis_target_ylim_from_arrays(ylim_arrays, zero_mode=zero_mode)
+                    if ylim1 is None:
+                        try:
+                            ylim1 = tuple(ax.get_ylim())
+                        except Exception:
+                            continue
+
+                    axis_payloads.append({
+                        "ax": ax,
+                        "lines": line_payloads,
+                        "ylim0": tuple(ax.get_ylim()),
+                        "ylim1": tuple(ylim1),  # snapped at finish
+                        "animate_ylim": False,
+                        "_target_df": target_df,
+                    })
+
+                if not axis_payloads:
+                    return False
+
+                def _finish():
+                    try:
+                        for ap in axis_payloads:
+                            ax = ap.get("ax")
+                            st = (self._compare_axis_state or {}).get(ax)
+                            target_df = ap.get("_target_df")
+                            if st is None or not isinstance(target_df, pd.DataFrame):
+                                continue
+                            st["df"] = target_df
+                            try:
+                                st["df_np"] = target_df.to_numpy(dtype=float, copy=False)
+                            except Exception:
+                                st["df_np"] = np.asarray(target_df.to_numpy(), dtype=float)
+                    except Exception:
+                        pass
+                    try:
+                        self._compare_last_idx = None
+                        self._refresh_compare_backgrounds()
+                    except Exception:
+                        pass
+
+                return self._start_plot_morph(axis_payloads, finish_callback=_finish, duration_s=0.18)
 
             df_disp = self._preview_get_display_df_for_current_mode()
             if not isinstance(df_disp, pd.DataFrame) or df_disp.empty:
@@ -5142,9 +5196,159 @@ class GraphPreview(QObject):
             self._preview_df_all = df_disp
 
             if getattr(self, "_single_mode_multi_axis", False):
-                return self._animate_single_multi_axis_to_display_df(df_disp)
+                active_set = set(self._effective_active_cols())
+                zero_mode = bool(getattr(self, "_zero_y_mode", False))
+                axis_payloads = []
 
-            return self._animate_single_axis_to_display_df(df_disp)
+                for ax, st in list((self._single_axis_state or {}).items()):
+                    lines = (st or {}).get("lines") or {}
+                    series_data = (st or {}).get("series_data") or {}
+
+                    line_payloads = []
+                    ylim_arrays = []
+
+                    for name, ln in list(lines.items()):
+                        if name not in df_disp.columns:
+                            continue
+                        try:
+                            y1 = pd.to_numeric(df_disp[name], errors="coerce").to_numpy(dtype=float)
+                        except Exception:
+                            continue
+
+                        vis1 = bool(name in active_set)
+                        lp = self._prepare_line_for_morph(ln, y1, target_visible=vis1)
+                        if lp is not None:
+                            line_payloads.append(lp)
+
+                        series_data[name] = y1
+                        if vis1:
+                            ylim_arrays.append(y1)
+
+                    ylim1 = self._collect_axis_target_ylim_from_arrays(ylim_arrays, zero_mode=zero_mode)
+                    if ylim1 is None:
+                        try:
+                            ylim1 = tuple(ax.get_ylim())
+                        except Exception:
+                            continue
+
+                    axis_payloads.append({
+                        "ax": ax,
+                        "lines": line_payloads,
+                        "ylim0": tuple(ax.get_ylim()),
+                        "ylim1": tuple(ylim1),
+                        "animate_ylim": False,
+                    })
+
+                if not axis_payloads:
+                    return False
+
+                def _finish():
+                    try:
+                        self._preview_df_all = df_disp
+                        for ax, st in list((self._single_axis_state or {}).items()):
+                            lines = (st or {}).get("lines") or {}
+                            cols_all = [str(n) for n in list(lines.keys()) if str(n) in df_disp.columns]
+                            active_cols = [c for c in cols_all if c in set(self._effective_active_cols())]
+
+                            st["cols"] = list(active_cols)
+                            st["colors"] = [str(self._preview_color_map.get(c, "#FFFFFF")) for c in active_cols]
+
+                            if active_cols:
+                                st["df"] = df_disp[active_cols].copy()
+                                try:
+                                    st["df_np"] = st["df"].to_numpy(dtype=float, copy=False)
+                                except Exception:
+                                    st["df_np"] = np.asarray(st["df"].to_numpy(), dtype=float)
+                            else:
+                                st["df"] = df_disp.iloc[:, 0:0].copy()
+                                st["df_np"] = np.zeros((int(len(self._preview_x or [])), 0), dtype=float)
+                    except Exception:
+                        pass
+                    try:
+                        self._single_last_idx = None
+                        self._refresh_single_backgrounds()
+                    except Exception:
+                        pass
+
+                return self._start_plot_morph(axis_payloads, finish_callback=_finish, duration_s=0.18)
+
+            # Single axis
+            if not getattr(self, "_preview_lines", None):
+                return False
+
+            amb = self._ambient_col_for_current_result()
+            active_set = set(self._effective_active_cols())
+            zero_mode = bool(getattr(self, "_zero_y_mode", False))
+
+            line_payloads = []
+            ylim_arrays = []
+
+            for name, ln in list(self._preview_lines.items()):
+                if name not in df_disp.columns:
+                    continue
+
+                try:
+                    y1 = pd.to_numeric(df_disp[name], errors="coerce").to_numpy(dtype=float)
+                except Exception:
+                    continue
+
+                vis1 = bool(name in active_set)
+                if amb and name == amb and bool(getattr(self, "_temp_delta_mode", False)):
+                    vis1 = False
+
+                lp = self._prepare_line_for_morph(ln, y1, target_visible=vis1)
+                if lp is not None:
+                    line_payloads.append(lp)
+
+                try:
+                    self._preview_series_data[name] = y1
+                except Exception:
+                    pass
+
+                if vis1:
+                    ylim_arrays.append(y1)
+
+            ylim1 = self._collect_axis_target_ylim_from_arrays(ylim_arrays, zero_mode=zero_mode)
+            if ylim1 is None:
+                try:
+                    ylim1 = tuple(self._preview_ax.get_ylim())
+                except Exception:
+                    return False
+
+            try:
+                df_hover = df_disp[list(self._effective_active_cols())]
+            except Exception:
+                df_hover = df_disp
+
+            def _finish():
+                try:
+                    self._preview_df_all = df_disp
+                    self._preview_df = df_hover
+                    self._preview_colors = [
+                        self._preview_color_map.get(c, "#FFFFFF")
+                        for c in list(self._effective_active_cols())
+                    ]
+                    self._fast_refresh_hover_cache_values_only(self._preview_df)
+                    self._preview_last_tt_idx = None
+                    self._preview_invalidate_interaction_cache()
+                    try:
+                        self._on_preview_draw()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            return self._start_plot_morph(
+                [{
+                    "ax": self._preview_ax,
+                    "lines": line_payloads,
+                    "ylim0": tuple(self._preview_ax.get_ylim()),
+                    "ylim1": tuple(ylim1),
+                    "animate_ylim": False,
+                }],
+                finish_callback=_finish,
+                duration_s=0.18,
+            )
         except Exception:
             return False
 
@@ -5254,33 +5458,29 @@ class GraphPreview(QObject):
                 pass
 
     def _apply_zero_y_mode_to_current_plot(self) -> None:
-        """Apply current zero-y mode to already-plotted axes with morph animation when possible."""
+        """Apply current zero-y mode with a lightweight ylim-only tween."""
         try:
             if self._preview_canvas is None:
                 return
 
-            # Compare mode
-            if getattr(self, "_compare_mode", False):
-                if self._apply_compare_display_mode_to_current_plot():
+            try:
+                if self._animate_current_ylims_only():
                     return
-
-            # Single / single-multi-axis
-            df_disp = self._preview_get_display_df_for_current_mode()
-            if not isinstance(df_disp, pd.DataFrame) or df_disp.empty:
-                df_disp = self._preview_df_all if isinstance(self._preview_df_all, pd.DataFrame) else None
-
-            if isinstance(df_disp, pd.DataFrame):
-                if getattr(self, "_single_mode_multi_axis", False):
-                    if self._animate_single_multi_axis_to_display_df(df_disp):
-                        return
-                else:
-                    if self._animate_single_axis_to_display_df(df_disp):
-                        return
+            except Exception:
+                pass
 
             # Fallback
             if getattr(self, "_single_mode_multi_axis", False):
                 self._single_apply_active_series()
                 return
+
+            if getattr(self, "_compare_mode", False):
+                mp = getattr(self, "_compare_manifest_path", None)
+                if mp is not None:
+                    mp2 = Path(str(mp))
+                    if mp2.exists() and mp2.is_file():
+                        self._plot_compare_manifest(mp2)
+                        return
 
             self._preview_autoscale_y_to_active()
             self._preview_relayout_and_redraw()
