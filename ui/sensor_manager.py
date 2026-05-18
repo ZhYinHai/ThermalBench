@@ -12,6 +12,7 @@ from core.hwinfo_csv import read_hwinfo_headers, sensor_leafs_from_header, make_
 from core.hwinfo_metadata import build_precise_group_map, load_sensor_map, save_sensor_map
 from core.hwinfo_status import try_open_hwinfo_sm2
 from core.resources import resource_path
+from core.bundled_tools import resolve_hwinfo_csv
 
 from .dialogs import SensorPickerDialog, SPD_MAX_TOKEN, SelectedSensorsDialog
 
@@ -58,7 +59,23 @@ class SensorManager:
         self._csv_last_change_ts = None
         self._csv_exists = False
         self._csv_updating = False
+        self._csv_header_ready = False
         self._csv_update_window = 2.0
+        self._csv_last_path = ""
+        self._csv_unique_leafs: list[str] | None = None  # current CSV columns, used for cache validation
+        self._csv_leafs: list[str] | None = None          # base labels (before dedup), used for SM2 matching
+
+        try:
+            fixed_csv = resolve_hwinfo_csv()
+            self._hwinfo_edit.setText(fixed_csv)
+            self._hwinfo_edit.setReadOnly(True)
+            self._hwinfo_edit.setToolTip(
+                "Fixed HWiNFO log file.\n"
+                "Configure HWiNFO sensor logging to write here:\n"
+                f"{fixed_csv}"
+            )
+        except Exception:
+            pass
 
         # Start monitoring timers
         self._csv_timer = QTimer(self.parent)
@@ -88,12 +105,97 @@ class SensorManager:
         dot.style().polish(dot)
         dot.update()
 
+    def _fixed_hwinfo_csv_path(self) -> str:
+        path = resolve_hwinfo_csv()
+
+        try:
+            if self._hwinfo_edit.text().strip() != path:
+                self._hwinfo_edit.setText(path)
+        except Exception:
+            pass
+
+        return path
+
+    def _hwinfo_csv_not_ready_message(self, path: str) -> str:
+        return (
+            "The HWiNFO CSV exists, but it does not contain a valid sensor header yet.\n\n"
+            "This usually means HWiNFO is open, but sensor logging has not actually started.\n\n"
+            "Do this in HWiNFO:\n"
+            "1. Open the Sensors window.\n"
+            "2. Click the logging/start-log button.\n"
+            "3. Choose this exact CSV path:\n\n"
+            f"{path}\n\n"
+            "Keep HWiNFO running while using ThermalBench."
+        )
+
+    def _read_hwinfo_header_or_warn(self) -> list[str] | None:
+        path = self._fixed_hwinfo_csv_path()
+
+        if not path:
+            QMessageBox.warning(
+                self.parent,
+                "HWiNFO CSV not configured",
+                "ThermalBench could not resolve the fixed HWiNFO CSV path.",
+            )
+            return None
+
+        p = Path(path)
+
+        if not p.exists():
+            QMessageBox.warning(
+                self.parent,
+                "HWiNFO CSV not found",
+                "The HWiNFO CSV file does not exist yet.\n\n"
+                "Open HWiNFO and start sensor logging to this exact path:\n\n"
+                f"{path}",
+            )
+            return None
+
+        try:
+            if p.stat().st_size <= 0:
+                QMessageBox.warning(
+                    self.parent,
+                    "HWiNFO CSV is empty",
+                    self._hwinfo_csv_not_ready_message(path),
+                )
+                return None
+        except Exception:
+            pass
+
+        try:
+            header = read_hwinfo_headers(path)
+        except Exception as e:
+            QMessageBox.warning(
+                self.parent,
+                "HWiNFO CSV not ready",
+                self._hwinfo_csv_not_ready_message(path) + f"\n\nDetails:\n{e}",
+            )
+            return None
+
+        if not header:
+            QMessageBox.warning(
+                self.parent,
+                "HWiNFO CSV header is empty",
+                self._hwinfo_csv_not_ready_message(path),
+            )
+            return None
+
+        return header
+
     def refresh_csv_status(self) -> None:
-        """Check if HWiNFO CSV file exists and is being updated."""
-        path = self._hwinfo_edit.text().strip()
+        """Check if the fixed HWiNFO CSV exists, has a header, and is being updated."""
+        path = self._fixed_hwinfo_csv_path()
+
+        if path != self._csv_last_path:
+            self._csv_last_path = path
+            self._csv_last_mtime = None
+            self._csv_last_size = None
+            self._csv_last_change_ts = None
 
         csv_exists = False
         csv_updating = False
+        csv_header_ready = False
+
         try:
             if path and os.path.exists(path):
                 st = os.stat(path)
@@ -104,30 +206,159 @@ class SensorManager:
                 if self._csv_last_mtime is None:
                     self._csv_last_mtime = mtime
                     self._csv_last_size = size
+                    # Do not set _csv_last_change_ts here — first poll only establishes
+                    # the baseline. A change (file growth) must be detected on a subsequent
+                    # poll before the CSV is considered "actively logging".
                 else:
                     if (mtime != self._csv_last_mtime) or (size != self._csv_last_size):
+                        # Only count as "updating" when the file has GROWN.
+                        # HWiNFO always appends rows, so growth is a reliable signal of
+                        # active logging. Ignoring mtime-only or size-decrease changes
+                        # avoids false positives from OneDrive/cloud-sync touching the
+                        # file, or from HWiNFO starting a new session (which truncates
+                        # then re-writes, showing a temporary size decrease).
+                        if size > (self._csv_last_size or 0):
+                            self._csv_last_change_ts = now
                         self._csv_last_mtime = mtime
                         self._csv_last_size = size
-                        self._csv_last_change_ts = now
 
                 csv_exists = True
+
+                if size > 0:
+                    try:
+                        header = read_hwinfo_headers(path)
+                        csv_header_ready = bool(header)
+                        if csv_header_ready and header:
+                            try:
+                                leafs, _ = sensor_leafs_from_header(header)
+                                self._csv_leafs = leafs
+                                self._csv_unique_leafs = make_unique(leafs)
+                            except Exception:
+                                pass
+                    except Exception:
+                        csv_header_ready = False
+
                 csv_updating = bool(
-                    self._csv_last_change_ts and (now - self._csv_last_change_ts) <= self._csv_update_window
+                    self._csv_last_change_ts
+                    and (now - self._csv_last_change_ts) <= self._csv_update_window
                 )
         except Exception:
             csv_exists = False
             csv_updating = False
+            csv_header_ready = False
 
-        self._set_dot_state(self._csv_dot, ok=(csv_exists and csv_updating))
+        self._set_dot_state(self._csv_dot, ok=(csv_exists and csv_header_ready and csv_updating))
+
+        if csv_exists and csv_header_ready and csv_updating:
+            self._csv_dot.setToolTip(f"CSV active:\n{path}")
+        elif csv_exists and not csv_header_ready:
+            self._csv_dot.setToolTip(
+                "CSV found, but it does not contain a valid HWiNFO header yet.\n"
+                "Start HWiNFO sensor logging to:\n"
+                f"{path}"
+            )
+        elif csv_exists:
+            self._csv_dot.setToolTip(
+                "CSV found, but it is not being updated.\n"
+                "Start HWiNFO sensor logging to:\n"
+                f"{path}"
+            )
+        else:
+            self._csv_dot.setToolTip(
+                "CSV not found.\n"
+                "Open HWiNFO and configure sensor logging to:\n"
+                f"{path}"
+            )
 
         self._csv_exists = csv_exists
         self._csv_updating = csv_updating
+        self._csv_header_ready = csv_header_ready
         self._update_run_button_state()
 
     def refresh_sm2_status(self) -> None:
-        """Check if HWiNFO shared memory is accessible."""
-        sm2_state, _sm2_msg = try_open_hwinfo_sm2()
-        self._set_dot_state(self._sm2_dot, ok=(sm2_state is True))
+        """Check whether the sensor picker will show a grouped or flat list."""
+        grouped, source = self._resolve_grouping_source()
+        self._set_dot_state(self._sm2_dot, ok=grouped)
+        if grouped and source == "sm2":
+            self._sm2_dot.setToolTip(
+                "Sensors are grouped by device in the sensor picker.\n"
+                "HWiNFO Shared Memory is active and reporting multiple device groups."
+            )
+        elif grouped and source == "cache":
+            self._sm2_dot.setToolTip(
+                "Sensors are grouped by device in the sensor picker.\n"
+                "(Group data is from a cached mapping — Shared Memory may not be active.)"
+            )
+        else:
+            self._sm2_dot.setToolTip(
+                "Sensors appear as a flat ungrouped list in the sensor picker.\n"
+                "To fix: open HWiNFO → open the Sensors window → Settings → General → "
+                "enable Shared Memory Support, then restart HWiNFO logging."
+            )
+
+    def _resolve_grouping_source(self) -> tuple[bool, str]:
+        """Return (is_grouped, source) reflecting what the sensor picker will actually show.
+
+        Mirrors the picker's own lookup order: cache first, then live SM2.
+        Returns source as 'sm2', 'cache', or 'none'.
+        """
+        # Check live SM2 first (fastest path when HWiNFO is running)
+        if self._sm2_has_real_groups():
+            return True, "sm2"
+        # Fall back to the same cache the picker uses — but only when the cached
+        # header_unique still matches the current CSV columns.  If it doesn't
+        # match (different machine, reinstall, or CSV not yet read) the picker
+        # would also miss the cache and show a flat list, so the dot must agree.
+        try:
+            from core.resources import resource_path  # noqa: PLC0415
+            from core.hwinfo_metadata import load_sensor_map  # noqa: PLC0415
+            payload = load_sensor_map(resource_path("resources", "sensor_map.json"))
+            if payload and payload.get("schema") == 1:
+                current_unique = self._csv_unique_leafs
+                if current_unique and payload.get("header_unique") == current_unique:
+                    groups = {g for g in payload.get("mapping", {}).values() if g and g != "Other"}
+                    if len(groups) >= 2:
+                        return True, "cache"
+        except Exception:
+            pass
+        return False, "none"
+
+    def _sm2_has_real_groups(self) -> bool:
+        """Return True only when live SM2 produces ≥2 distinct non-Other groups
+        for the sensors that are actually present in the current CSV.
+
+        Checking raw SM2 group names is not enough: HWiNFO creates the SM2
+        segment whenever the Sensors window is open (regardless of the
+        'Shared Memory Support' setting on some versions), so the segment can
+        be accessible with real device names while the label-to-CSV matching
+        inside build_precise_group_map still fails and the picker shows a flat
+        list.  We replicate the same matching step here so the dot and the
+        picker always agree.
+        """
+        csv_leafs = self._csv_leafs
+        if not csv_leafs:
+            return False
+        try:
+            from core.hwinfo_metadata import _read_sm2_entries  # noqa: PLC0415
+            entries = _read_sm2_entries()
+            # Build label -> [group, ...] exactly as build_precise_group_map does.
+            label_to_groups: dict[str, list[str]] = {}
+            for lbl, grp in entries:
+                label_to_groups.setdefault(lbl, []).append(grp)
+            # Walk the base CSV labels and collect which non-Other groups they map to.
+            occ: dict[str, int] = {}
+            matched_groups: set[str] = set()
+            for base in csv_leafs:
+                k = occ.get(base, 0)
+                occ[base] = k + 1
+                grp_list = label_to_groups.get(base, [])
+                if k < len(grp_list):
+                    g = grp_list[k]
+                    if g and g != "Other":
+                        matched_groups.add(g)
+            return len(matched_groups) >= 2
+        except Exception:
+            return False
 
     def refresh_sensors_summary(self) -> None:
         """Update the sensors summary display."""
@@ -154,13 +385,15 @@ class SensorManager:
 
     def open_selected_sensors_view(self) -> None:
         """Open dialog showing currently selected sensors."""
-        hwinfo_path = self._hwinfo_edit.text().strip()
+        header = self._read_hwinfo_header_or_warn()
+        if header is None:
+            return
+
         try:
-            header = read_hwinfo_headers(hwinfo_path)
             csv_leafs, has_spd = sensor_leafs_from_header(header)
             csv_unique_leafs = make_unique(csv_leafs)
         except Exception as e:
-            QMessageBox.critical(self.parent, "Cannot read HWiNFO CSV", str(e))
+            QMessageBox.critical(self.parent, "Cannot read HWiNFO sensors", str(e))
             return
 
         try:
@@ -179,13 +412,15 @@ class SensorManager:
 
     def open_sensor_picker(self) -> None:
         """Open sensor picker dialog for user to select sensors."""
-        hwinfo_path = self._hwinfo_edit.text().strip()
+        header = self._read_hwinfo_header_or_warn()
+        if header is None:
+            return
+
         try:
-            header = read_hwinfo_headers(hwinfo_path)
             csv_leafs, has_spd = sensor_leafs_from_header(header)
             csv_unique_leafs = make_unique(csv_leafs)
         except Exception as e:
-            QMessageBox.critical(self.parent, "Cannot read HWiNFO CSV", str(e))
+            QMessageBox.critical(self.parent, "Cannot read HWiNFO sensors", str(e))
             return
 
         try:
@@ -250,7 +485,7 @@ class SensorManager:
         Returns:
             True if all requirements satisfied
         """
-        if not (self._csv_exists and self._csv_updating):
+        if not (self._csv_exists and self._csv_header_ready and self._csv_updating):
             return False
         if self.stress_cpu:
             if not prime_exe or not os.path.exists(prime_exe):
@@ -272,10 +507,23 @@ class SensorManager:
             List of reason strings
         """
         reasons = []
+        fixed_csv = self._fixed_hwinfo_csv_path()
+
         if not self._csv_exists:
-            reasons.append("HWiNFO CSV file not found (check path).")
+            reasons.append(
+                "HWiNFO CSV file not found. Click 'Open HWiNFO' and log sensors to:\n"
+                f"{fixed_csv}"
+            )
+        elif not self._csv_header_ready:
+            reasons.append(
+                "HWiNFO CSV exists but has no valid sensor header yet. Start HWiNFO sensor logging to:\n"
+                f"{fixed_csv}"
+            )
         elif not self._csv_updating:
-            reasons.append("HWiNFO CSV not being updated (HWiNFO not logging).")
+            reasons.append(
+                "HWiNFO CSV exists but is not being updated. Start HWiNFO sensor logging to:\n"
+                f"{fixed_csv}"
+            )
 
         if self.stress_cpu:
             if not prime_exe:

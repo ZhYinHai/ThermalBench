@@ -111,6 +111,8 @@ def norm_hwinfo_text(s: str) -> str:
     s = s.replace("[\ufffdC]", "[\u00b0C]").replace("\ufffdC", "\u00b0C")
     s = s.replace("\u00c2\u00b0", "\u00b0")  # "Â°" -> "°"
     s = s.replace("[\u00c2\u00b0C]", "[\u00b0C]")
+    # Literal ASCII '?' used by some HWiNFO builds as broken degree symbol
+    s = s.replace("[?C]", "[\u00b0C]").replace("?C", "\u00b0C")
 
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("\u00a0", " ")
@@ -138,19 +140,23 @@ def read_raw_header(path: Path, encoding: str) -> List[str]:
 def parse_dt_series(date_s: pd.Series, time_s: pd.Series) -> pd.Series:
     """
     Fast, consistent parsing for HWiNFO:
-      Date: dd.mm.yyyy
+      Date: dd.mm.yyyy  (NL/EU)  or  yyyy/mm/dd  (TW/Asia)
       Time: hh:mm:ss.mmm (sometimes ss without leading zero)
     """
     time_fixed = time_s.map(normalize_time)
     s = date_s.astype(str) + " " + time_fixed.astype(str)
 
-    dt = pd.to_datetime(s, format="%d.%m.%Y %H:%M:%S.%f", errors="coerce")
-    if dt.notna().any():
-        return dt
-
-    dt = pd.to_datetime(s, format="%d.%m.%Y %H:%M:%S", errors="coerce")
-    if dt.notna().any():
-        return dt
+    for fmt in (
+        "%d.%m.%Y %H:%M:%S.%f",   # NL/EU: 06.05.2026 13:23:01.975
+        "%d.%m.%Y %H:%M:%S",       # NL/EU without ms
+        "%Y/%m/%d %H:%M:%S.%f",   # TW/Asia: 2026/05/06 13:23:01.975
+        "%Y/%m/%d %H:%M:%S",       # TW/Asia without ms
+        "%Y-%m-%d %H:%M:%S.%f",   # ISO fallback
+        "%Y-%m-%d %H:%M:%S",       # ISO fallback without ms
+    ):
+        dt = pd.to_datetime(s, format=fmt, errors="coerce")
+        if dt.notna().any():
+            return dt
 
     return pd.to_datetime(s, dayfirst=True, errors="coerce")
 

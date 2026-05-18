@@ -437,16 +437,23 @@ class LiveMonitorWidget(QFrame):
             # Rounded square swatch (Legend & Stats style)
             try:
                 size = 12
-                pm = QPixmap(size, size)
+                try:
+                    app = QApplication.instance()
+                    dpr = float(app.devicePixelRatio()) if app is not None else 1.0
+                except Exception:
+                    dpr = 1.0
+                phys_size = max(1, round(size * dpr))
+                pm = QPixmap(phys_size, phys_size)
                 pm.fill(Qt.transparent)
                 p = QPainter(pm)
                 try:
                     p.setRenderHint(QPainter.Antialiasing, True)
                     p.setPen(Qt.NoPen)
                     p.setBrush(qcol)
-                    p.drawRoundedRect(0, 0, size - 1, size - 1, 3, 3)
+                    p.drawRoundedRect(0, 0, phys_size - 1, phys_size - 1, 3 * dpr, 3 * dpr)
                 finally:
                     p.end()
+                pm.setDevicePixelRatio(dpr)
                 item.setIcon(0, QIcon(pm))
             except Exception:
                 pass

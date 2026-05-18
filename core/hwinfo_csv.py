@@ -7,8 +7,9 @@ import unicodedata
 def _norm_hwinfo_text(s: str) -> str:
     s = str(s)
 
-    # Fix broken degree symbol export: �C -> °C
-    s = s.replace("[�C]", "[°C]").replace("�C", "°C")
+    # Fix broken degree symbol export: �C -> °C, literal ?C -> °C
+    s = s.replace("[\uFFFDC]", "[°C]").replace("\uFFFDC", "°C")
+    s = s.replace("[?C]", "[°C]").replace("?C", "°C")
 
     # Normalize unicode + whitespace
     s = unicodedata.normalize("NFKC", s)

@@ -2,6 +2,54 @@ import os
 import sys
 
 
+def _enable_windows_dpi_awareness() -> None:
+    """Enable the highest DPI-awareness level available on Windows."""
+    if not sys.platform.startswith("win"):
+        return
+
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        # Windows 10+ per-monitor v2 (best rendering and sizing on mixed-DPI setups).
+        if hasattr(user32, "SetProcessDpiAwarenessContext"):
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+            if user32.SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2):
+                return
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+
+        shcore = ctypes.windll.shcore
+        PROCESS_PER_MONITOR_DPI_AWARE = 2
+        shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
+        return
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def _configure_qt_high_dpi() -> None:
+    """Configure Qt high-DPI behavior before QApplication is created."""
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QGuiApplication
+
+        QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+    except Exception:
+        pass
+
+
 def _configure_tls_ca_bundle() -> None:
     """Ensure Requests can find a CA bundle in frozen builds.
 
@@ -26,6 +74,8 @@ def _configure_tls_ca_bundle() -> None:
 
 
 def main() -> int:
+    _enable_windows_dpi_awareness()
+    _configure_qt_high_dpi()
     _configure_tls_ca_bundle()
 
     from PySide6.QtWidgets import QApplication
@@ -38,7 +88,7 @@ def main() -> int:
 
     # Apply saved theme early (no dark->light flash)
     settings = load_json(get_settings_path())
-    apply_theme(app, settings.get("theme", "dark"))
+    apply_theme(app, settings.get("theme", "device"))
 
     w = MainWindow()
     w.show()

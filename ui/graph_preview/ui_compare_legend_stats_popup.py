@@ -728,18 +728,22 @@ class CompareLegendStatsPopup(QDialog):
                 html_parts.append("</tr>")
             html_parts.append("</thead><tbody>")
 
-            # Rows in display order (including group headers)
+            # Rows in display order (including group headers).
+            # Group headers are buffered and only emitted when a visible sensor follows.
+            pending_group_text: str | None = None
+            pending_group_html: str | None = None
+
             for i in range(int(tree.topLevelItemCount())):
                 item = tree.topLevelItem(i)
                 if item is None:
                     continue
 
-                if dt_only:
-                    try:
-                        if item.isHidden():
-                            continue
-                    except Exception:
-                        pass
+                # Skip hidden items in all modes (sensor visibility is reflected via setHidden).
+                try:
+                    if item.isHidden():
+                        continue
+                except Exception:
+                    pass
 
                 is_group_header = False
                 try:
@@ -750,9 +754,12 @@ class CompareLegendStatsPopup(QDialog):
                 if is_group_header:
                     group_name = (item.text(0) or "").strip()
                     if not group_name:
+                        pending_group_text = None
+                        pending_group_html = None
                         continue
-                    text_lines.append("\t".join([group_name] + [""] * (col_count - 1)))
-                    html_parts.append(
+                    # Buffer — only emit when a visible sensor follows.
+                    pending_group_text = "\t".join([group_name] + [""] * (col_count - 1))
+                    pending_group_html = (
                         f"<tr><td colspan='{int(col_count)}' "
                         "style='padding:1px 8px;white-space:nowrap;background-color:#f3f3f3;"
                         f"border:1px solid black;font-size:{int(FONT_PX)}px;line-height:{int(LINE_PX)}px;font-weight:bold;'>"
@@ -760,6 +767,13 @@ class CompareLegendStatsPopup(QDialog):
                         "</td></tr>"
                     )
                     continue
+
+                # Sensor row — flush buffered group header first.
+                if pending_group_text is not None:
+                    text_lines.append(pending_group_text)
+                    html_parts.append(pending_group_html)
+                    pending_group_text = None
+                    pending_group_html = None
 
                 # Sensor row
                 sensor_name = (item.text(0) or "").strip()
@@ -1130,8 +1144,15 @@ class CompareLegendStatsPopup(QDialog):
     # -----------------
     def _make_color_icon(self, hex_color: str) -> QIcon:
         try:
-            pix = QPixmap(10, 10)
+            try:
+                app = QApplication.instance()
+                dpr = float(app.devicePixelRatio()) if app is not None else 1.0
+            except Exception:
+                dpr = 1.0
+            phys = max(1, round(10 * dpr))
+            pix = QPixmap(phys, phys)
             pix.fill(hex_color)
+            pix.setDevicePixelRatio(dpr)
             return QIcon(pix)
         except Exception:
             return QIcon()

@@ -5,13 +5,29 @@ import html
 from datetime import datetime
 from ctypes import wintypes
 
+_MONTHS_EN = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+def _month_key_to_label(month_key: str, include_year: bool = True) -> str:
+    """Return an English month name from a 'YYYY-MM' key, locale-independently."""
+    try:
+        y, m = month_key.split("-", 1)
+        name = _MONTHS_EN[int(m) - 1]
+        return f"{name} {y}" if include_year else name
+    except Exception:
+        return str(month_key)
+
 # ui/main_window.py
 import os
 import sys
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QSize, QTimer, QObject, QThread, Signal, QEvent, QItemSelectionModel, QDir
+from PySide6.QtCore import Qt, QSize, QTimer, QObject, QThread, Signal, QEvent, QItemSelectionModel, QRectF
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtGui import QIcon, QPainter, QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QWidget,
@@ -27,7 +43,6 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractScrollArea,
     QTreeView,
-    QFileSystemModel,
     QSplitter,
     QScrollArea,
     QToolButton,
@@ -45,7 +60,7 @@ from PySide6.QtWidgets import (
 
 from .widgets.ui_theme import apply_theme, resolve_effective_theme_mode, style_combobox_popup
 from .widgets.ui_widgets import CustomComboBox
-from .dialogs import HelpDialog, SettingsDialog
+from .dialogs import HelpDialog, HelpPanel, SettingsDialog
 from .widgets.ui_titlebar import TitleBar
 from .widgets.ui_time_spin import make_time_spin
 from .graph_preview import GraphPreview
@@ -66,6 +81,9 @@ from ui.graph_preview.ui_legend_stats_popup import LegendStatsPopup
 from ui.graph_preview.ui_dim_overlay import DimOverlay
 from ui.graph_preview.legend_popup_helpers import raise_center_and_focus
 
+from .month_grouped_runs_model import MonthGroupedRunsModel
+
+from core.app_paths import resolve_runs_root, migrate_legacy_runs_to_data_root
 from core.settings_store import get_settings_path, load_json, save_json
 from core.version import __version__
 from core.resources import app_root
@@ -78,7 +96,17 @@ from core.updater import (
     launch_installer,
     launch_installer_with_updater_ui,
 )
+from core.bundled_tools import (
+    resolve_furmark_exe,
+    resolve_prime95_exe,
+    resolve_hwinfo_exe,
+    resolve_hwinfo_csv,
+    launch_hwinfo,
+    hwinfo_dir,
+)
+from core.user_paths import thermalbench_runs_root
 
+from PySide6.QtWidgets import QGridLayout
 
 # Manual update checker (Windows-only)
 GITHUB_OWNER = "ZhYinHai"
@@ -155,9 +183,81 @@ class _CompareNameDelegate(QStyledItemDelegate):
     Activates only while RunsProxyModel reports an active compare directory.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, theme_mode: str = "dark"):
         super().__init__(parent)
         self._run_meta_cache: dict[str, tuple[float, str]] = {}
+        self._theme_mode = str(theme_mode or "dark").strip().lower() or "dark"
+        self._compare_prefix_svg = Path(__file__).parent.parent / "resources" / "icons" / "compare.svg"
+        self._compare_prefix_pixmap = QPixmap()
+        self._compare_prefix_icon_px = 14
+        self._rebuild_compare_prefix_icon()
+
+    def _compare_prefix_icon_color(self) -> QColor:
+        try:
+            effective_mode = resolve_effective_theme_mode(self._theme_mode, QApplication.instance())
+        except Exception:
+            effective_mode = "dark"
+        return QColor("#000000") if effective_mode == "light" else QColor("#FFFFFF")
+
+    def _rebuild_compare_prefix_icon(self) -> None:
+        self._compare_prefix_pixmap = QPixmap()
+        try:
+            if not self._compare_prefix_svg.is_file():
+                return
+
+            renderer = QSvgRenderer(str(self._compare_prefix_svg))
+            if not renderer.isValid():
+                return
+
+            # Scale the pixmap to physical pixels so the icon is crisp at any DPI.
+            try:
+                app = QApplication.instance()
+                dpr = float(app.devicePixelRatio()) if app is not None else 1.0
+            except Exception:
+                dpr = 1.0
+            if dpr <= 0:
+                dpr = 1.0
+
+            base_size = max(32, int(self._compare_prefix_icon_px) * 2)
+            phys_size = max(1, round(base_size * dpr))
+
+            src = QPixmap(phys_size, phys_size)
+            src.fill(Qt.transparent)
+
+            p = QPainter(src)
+            try:
+                renderer.render(p, QRectF(0.0, 0.0, float(phys_size), float(phys_size)))
+            finally:
+                p.end()
+
+            tinted = QPixmap(phys_size, phys_size)
+            tinted.fill(Qt.transparent)
+
+            p = QPainter(tinted)
+            try:
+                p.drawPixmap(0, 0, src)
+                p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+                p.fillRect(tinted.rect(), self._compare_prefix_icon_color())
+            finally:
+                p.end()
+
+            tinted.setDevicePixelRatio(dpr)
+            self._compare_prefix_pixmap = tinted
+        except Exception:
+            self._compare_prefix_pixmap = QPixmap()
+
+    def set_theme_mode(self, theme_mode: str) -> None:
+        try:
+            self._theme_mode = str(theme_mode or "dark").strip().lower() or "dark"
+            self._rebuild_compare_prefix_icon()
+
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "viewport"):
+                parent.viewport().update()
+            elif parent is not None:
+                parent.update()
+        except Exception:
+            pass
 
     @staticmethod
     def _norm_path(p: str) -> str:
@@ -165,6 +265,45 @@ class _CompareNameDelegate(QStyledItemDelegate):
             return os.path.normcase(os.path.abspath(str(p)))
         except Exception:
             return str(p or "")
+
+    def _compare_separator_text(self) -> str:
+        return " ↔ "
+
+    def _compare_prefix_draw_width(self, fm, text_rect, pref: str) -> int:
+        try:
+            if not self._compare_prefix_pixmap.isNull():
+                icon_size = min(self._compare_prefix_icon_px, max(10, int(text_rect.height()) - 4))
+                return icon_size + fm.horizontalAdvance(" ")
+        except Exception:
+            pass
+        return fm.horizontalAdvance(pref) if pref else 0
+
+    def _draw_compare_prefix_icon(self, painter: QPainter, text_rect, x: int, fm, pref: str, opt) -> int:
+        try:
+            if not self._compare_prefix_pixmap.isNull():
+                icon_size = min(self._compare_prefix_icon_px, max(10, int(text_rect.height()) - 4))
+                pm = self._compare_prefix_pixmap.scaled(
+                    icon_size,
+                    icon_size,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+                y = int(text_rect.y() + (text_rect.height() - pm.height()) // 2)
+                painter.drawPixmap(x, y, pm)
+                return x + pm.width() + fm.horizontalAdvance(" ")
+        except Exception:
+            pass
+
+        if pref:
+            painter.setPen(QColor(opt.palette.text().color()))
+            painter.drawText(
+                x,
+                text_rect.y() + (text_rect.height() + fm.ascent() - fm.descent()) // 2,
+                pref,
+            )
+            return x + fm.horizontalAdvance(pref)
+
+        return x
 
     def _run_meta_text(self, path: str) -> str:
         try:
@@ -229,7 +368,6 @@ class _CompareNameDelegate(QStyledItemDelegate):
             if not (callable(get_active) and callable(get_seg_colors)):
                 return super().paint(painter, option, index)
 
-            # Determine this index's filesystem path and whether it is a compare-result directory.
             path = None
             is_dir = False
             try:
@@ -273,14 +411,6 @@ class _CompareNameDelegate(QStyledItemDelegate):
             except Exception:
                 is_compare_case_dir = False
 
-            is_preview_current = False
-            try:
-                is_preview_fn = getattr(model, "is_preview_current_dir_path", None)
-                if callable(is_preview_fn):
-                    is_preview_current = bool(is_preview_fn(path))
-            except Exception:
-                is_preview_current = False
-
             is_compare_selected = False
             try:
                 is_compare_sel_fn = getattr(model, "is_compare_selected_dir_path", None)
@@ -289,7 +419,6 @@ class _CompareNameDelegate(QStyledItemDelegate):
             except Exception:
                 is_compare_selected = False
 
-            # Compare marker prefix (drawn by delegate so it can be colored).
             compare_prefix = "↔ "
             try:
                 get_pref = getattr(model, "get_compare_prefix", None)
@@ -322,7 +451,6 @@ class _CompareNameDelegate(QStyledItemDelegate):
 
             def _symbol_pen_color(opt: QStyleOptionViewItem) -> QColor:
                 try:
-                    # Prefer a subtle "secondary" role if available.
                     if not (opt.state & QStyle.State_Selected):
                         try:
                             link = opt.palette.color(QPalette.Link)
@@ -341,7 +469,6 @@ class _CompareNameDelegate(QStyledItemDelegate):
 
                     base = _selected_row_text_color(opt, secondary=True)
                     c = QColor(base)
-                    # Nudge toward higher contrast without introducing new theme colors.
                     if c.lightness() < 128:
                         c = c.lighter(165)
                     else:
@@ -367,6 +494,37 @@ class _CompareNameDelegate(QStyledItemDelegate):
                     c = QColor(option.palette.text().color())
                     c.setAlpha(150)
                     return c
+
+            def _paint_row_state_overlay(opt: QStyleOptionViewItem) -> None:
+                try:
+                    if not is_compare_selected:
+                        return
+
+                    base_text = QColor(opt.palette.color(QPalette.Text))
+                    light_mode = bool(base_text.isValid() and base_text.lightness() < 80)
+
+                    fill = QColor("#CDEECC") if light_mode else QColor("#1F4D2E")
+
+                    fill_rect = option.rect.adjusted(0, 0, 0, -1)
+                    try:
+                        if opt.widget is not None and hasattr(opt.widget, "viewport"):
+                            vp = opt.widget.viewport()
+                            if vp is not None:
+                                fill_rect = option.rect.adjusted(
+                                    -option.rect.x(),
+                                    0,
+                                    int(vp.width() - option.rect.right() - 1),
+                                    -1,
+                                )
+                    except Exception:
+                        fill_rect = option.rect.adjusted(0, 0, 0, -1)
+
+                    painter.save()
+                    painter.setClipRect(fill_rect)
+                    painter.fillRect(fill_rect, fill)
+                    painter.restore()
+                except Exception:
+                    pass
 
             def _paint_text_with_meta(txt: str, meta: str) -> None:
                 if not txt:
@@ -395,8 +553,7 @@ class _CompareNameDelegate(QStyledItemDelegate):
                 txt_elided = fm.elidedText(txt, Qt.ElideRight, avail)
 
                 x = text_rect.x()
-                txt_pen = _selected_row_text_color(opt)
-                painter.setPen(QColor(txt_pen))
+                painter.setPen(QColor(_selected_row_text_color(opt)))
                 painter.drawText(x, baseline, txt_elided)
                 x += fm.horizontalAdvance(txt_elided)
 
@@ -406,7 +563,6 @@ class _CompareNameDelegate(QStyledItemDelegate):
                     painter.drawText(x, baseline, meta)
 
                 painter.restore()
-                return
 
             def _paint_compare_prefix_and_text(txt: str) -> None:
                 if not txt:
@@ -432,50 +588,19 @@ class _CompareNameDelegate(QStyledItemDelegate):
                 x = text_rect.x()
 
                 pref = str(compare_prefix or "")
-                pref_w = fm.horizontalAdvance(pref) if pref else 0
+                shown_txt = txt[len(pref):] if pref and txt.startswith(pref) else txt
+                shown_txt = shown_txt.replace(" vs ", self._compare_separator_text())
+
+                pref_w = self._compare_prefix_draw_width(fm, text_rect, pref)
                 avail = max(0, int(text_rect.width() - pref_w))
-                txt_elided = fm.elidedText(txt, Qt.ElideRight, avail)
+                txt_elided = fm.elidedText(shown_txt, Qt.ElideRight, avail)
 
-                if pref:
-                    painter.setPen(_symbol_pen_color(opt))
-                    painter.drawText(x, baseline, pref)
-                    x += pref_w
+                x = self._draw_compare_prefix_icon(painter, text_rect, x, fm, pref, opt)
 
-                txt_pen = _selected_row_text_color(opt)
-                painter.setPen(QColor(txt_pen))
+                painter.setPen(QColor(_selected_row_text_color(opt)))
                 painter.drawText(x, baseline, txt_elided)
 
                 painter.restore()
-                return
-
-            def _paint_row_state_overlay(opt: QStyleOptionViewItem) -> None:
-                try:
-                    if not is_compare_selected:
-                        return
-
-                    base_text = QColor(opt.palette.color(QPalette.Text))
-                    light_mode = bool(base_text.isValid() and base_text.lightness() < 80)
-
-                    if light_mode:
-                        fill = QColor("#CDEECC")
-                    else:
-                        fill = QColor("#1F4D2E")
-
-                    fill_rect = option.rect.adjusted(0, 0, 0, -1)
-                    try:
-                        if opt.widget is not None and hasattr(opt.widget, "viewport"):
-                            vp = opt.widget.viewport()
-                            if vp is not None:
-                                fill_rect = option.rect.adjusted(-option.rect.x(), 0, int(vp.width() - option.rect.right() - 1), -1)
-                    except Exception:
-                        fill_rect = option.rect.adjusted(0, 0, 0, -1)
-
-                    painter.save()
-                    painter.setClipRect(fill_rect)
-                    painter.fillRect(fill_rect, fill)
-                    painter.restore()
-                except Exception:
-                    pass
 
             active_norm = get_active()
 
@@ -486,31 +611,25 @@ class _CompareNameDelegate(QStyledItemDelegate):
                     _paint_text_with_meta(txt, meta)
                     return
 
-            # If this is a compare-result directory but NOT the active compare selection,
-            # draw the compare marker symbol in a subtle color and keep the folder name normal.
             if is_compare_case_dir and (not active_norm or self._norm_path(path) != str(active_norm)):
                 txt = str(index.data(Qt.DisplayRole) or "")
                 _paint_compare_prefix_and_text(txt)
                 return
 
-            # Active compare selection: keep existing multi-color segment painting.
             if not active_norm or self._norm_path(path) != str(active_norm):
                 return super().paint(painter, option, index)
 
             txt = str(index.data(Qt.DisplayRole) or "")
             seg_colors = list(get_seg_colors() or [])
             if (not txt) or (" vs " not in txt) or (not seg_colors):
-                # Fallback: still show the compare marker in a consistent color.
                 if is_compare_case_dir:
                     _paint_compare_prefix_and_text(txt)
                     return
                 return super().paint(painter, option, index)
 
-            # Backward-compat: if any model still includes the prefix in DisplayRole, strip it.
             has_prefix = bool(compare_prefix and txt.startswith(compare_prefix))
-            txt_for_split = txt[len(compare_prefix) :] if has_prefix else txt
+            txt_for_split = txt[len(compare_prefix):] if has_prefix else txt
 
-            # Draw the item (selection/background/etc) but suppress default text.
             opt = QStyleOptionViewItem(option)
             self.initStyleOption(opt, index)
             opt.text = ""
@@ -520,7 +639,6 @@ class _CompareNameDelegate(QStyledItemDelegate):
             style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
             _paint_row_state_overlay(opt)
 
-            # Paint colored segments inside the text rect.
             text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, opt.widget)
             fm = opt.fontMetrics
             baseline = text_rect.y() + (text_rect.height() + fm.ascent() - fm.descent()) // 2
@@ -530,13 +648,9 @@ class _CompareNameDelegate(QStyledItemDelegate):
 
             x = text_rect.x()
 
-            # Only show the compare marker on the parent compare *case* folder, not the compare
-            # run folder that contains the manifest.
             pref = str(compare_prefix or "")
             if is_compare_case_dir and pref:
-                painter.setPen(_symbol_pen_color(opt))
-                painter.drawText(x, baseline, pref)
-                x += fm.horizontalAdvance(pref)
+                x = self._draw_compare_prefix_icon(painter, text_rect, x, fm, pref, opt)
 
             parts = txt_for_split.split(" vs ")
             for i, part in enumerate(parts):
@@ -547,8 +661,8 @@ class _CompareNameDelegate(QStyledItemDelegate):
                 x += fm.horizontalAdvance(part)
 
                 if i != (len(parts) - 1):
-                    sep = " vs "
-                    painter.setPen(_selected_row_text_color(opt))
+                    sep = self._compare_separator_text()
+                    painter.setPen(_symbol_pen_color(opt))
                     painter.drawText(x, baseline, sep)
                     x += fm.horizontalAdvance(sep)
 
@@ -677,6 +791,25 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
+    def _on_runs_tree_clicked(self, index) -> None:
+        try:
+            btn = self._runs_tree.property("_tb_last_button")
+            if btn is not None and int(btn) == int(Qt.RightButton):
+                return
+        except Exception:
+            pass
+
+        try:
+            handled = False
+            if hasattr(self, "benchmark") and hasattr(self.benchmark, "activate_results_index"):
+                handled = bool(self.benchmark.activate_results_index(index))
+            if handled:
+                return
+        except Exception:
+            pass
+
+        self._toggle_tree_item(index)
+
     def _rename_compare_folders_for_case_rename(self, *, old_case: str, new_case: str) -> None:
         """Rename compare-result directories whose names include a renamed case.
 
@@ -789,6 +922,9 @@ class MainWindow(QWidget):
         self.resize(DEFAULT_W, DEFAULT_H)
         self.setMinimumHeight(DEFAULT_H)
 
+        self._pending_latest_result_path = ""
+        self._pending_latest_result_month = ""
+
         # Enable custom titlebar by making window frameless
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self._resize_border_px = 8
@@ -803,9 +939,11 @@ class MainWindow(QWidget):
         self.setWindowTitle(f"ThermalBench v{__version__}")
 
         self.settings_path = get_settings_path("ThermalBench")
-        self.furmark_exe = ""
-        self.prime_exe = ""
-        self.theme_mode = "dark"
+        self.furmark_exe = resolve_furmark_exe("")
+        self.prime_exe = resolve_prime95_exe("")
+        self.hwinfo_exe = resolve_hwinfo_exe("")
+        self.hwinfo_csv = resolve_hwinfo_csv()
+        self.theme_mode = "device"
 
         # Push notifications (ntfy)
         # Store either a full topic URL (https://ntfy.sh/<topic>) or just a topic name.
@@ -843,7 +981,46 @@ class MainWindow(QWidget):
         self.log_min = make_time_spin(2, 24 * 60, 15)
         self.log_sec = make_time_spin(2, 59, 0)
 
-        self.hwinfo_edit = QLineEdit(r"C:\TempTesting\hwinfo.csv")
+        self.hwinfo_edit = QLineEdit(self.hwinfo_csv)
+        self.hwinfo_edit.setReadOnly(True)
+        self.hwinfo_edit.setToolTip(
+            "Fixed HWiNFO CSV path.\n"
+            "Configure HWiNFO sensor logging to write here:\n"
+            f"{self.hwinfo_csv}"
+        )
+
+        self.copy_hwinfo_path_btn = QToolButton(self.hwinfo_edit)
+        self.copy_hwinfo_path_btn.setText("Copy Path")
+        self.copy_hwinfo_path_btn.setToolTip(
+            "Copy the folder path to the clipboard.\n"
+            "Paste it into HWiNFO's sensor logging dialog so HWiNFO\n"
+            "can write hwinfo.csv to the correct folder."
+        )
+        self.copy_hwinfo_path_btn.setStyleSheet(
+            """
+            QToolButton {
+                background-color: rgba(128, 128, 128, 0.13);
+                border: 1px solid rgba(128, 128, 128, 0.22);
+                border-radius: 6px;
+                padding: 2px 8px;
+                font-size: 11px;
+            }
+            QToolButton:hover {
+                background-color: rgba(128, 128, 128, 0.22);
+                border: 1px solid rgba(128, 128, 128, 0.35);
+            }
+            QToolButton:pressed {
+                background-color: rgba(128, 128, 128, 0.35);
+            }
+            """
+        )
+        self.copy_hwinfo_path_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_hwinfo_path_btn.clicked.connect(self._copy_hwinfo_folder_path)
+        self.copy_hwinfo_path_btn.adjustSize()
+        self.hwinfo_edit.installEventFilter(self)
+        # Reserve space on the right so text doesn't slide under the button
+        _btn_w = self.copy_hwinfo_path_btn.sizeHint().width() + 5
+        self.hwinfo_edit.setTextMargins(0, 0, _btn_w, 0)
 
         # --- Status dots ---
         self.csv_dot = QLabel("●")
@@ -854,7 +1031,7 @@ class MainWindow(QWidget):
         self.sm2_dot = QLabel("●")
         self.sm2_dot.setObjectName("StatusDot")
         self.sm2_dot.setProperty("state", "bad")
-        self.sm2_dot.setToolTip("SM2: unknown")
+        self.sm2_dot.setToolTip("Sensor grouping: unknown")
 
         # FurMark dropdowns
         self.fur_demo_combo = CustomComboBox(mode=self.theme_mode)
@@ -905,8 +1082,13 @@ class MainWindow(QWidget):
         self.abort_btn.setEnabled(False)
         self.open_btn = QPushButton("Open Run Folder")
         self.open_btn.setEnabled(False)
-        self.pick_hwinfo_btn = QPushButton("Pick HWiNFO CSV…")
-        self.pick_hwinfo_btn.clicked.connect(self.pick_hwinfo)
+        self.pick_hwinfo_btn = QPushButton("Open HWiNFO")
+        self.pick_hwinfo_btn.setToolTip(
+            "Open bundled HWiNFO.\n"
+            "In HWiNFO, configure sensor logging to:\n"
+            f"{self.hwinfo_csv}"
+        )
+        self.pick_hwinfo_btn.clicked.connect(self.open_hwinfo)
 
         # Log box
         self.log = QTextEdit()
@@ -955,18 +1137,14 @@ class MainWindow(QWidget):
         )
         self.graph.set_theme_mode(self.theme_mode)
 
-        # Results tree setup
-        runs_root = app_root() / "runs"
-        self._runs_model = QFileSystemModel()
         try:
-            self._runs_model.setFilter(QDir.AllDirs | QDir.NoDotAndDotDot)
+            self._runs_migration_result = migrate_legacy_runs_to_data_root()
         except Exception:
-            pass
-        try:
-            self._runs_root = runs_root
-            self._runs_model.setRootPath(str(self._runs_root))
-        except Exception:
-            self._runs_model.setRootPath("")
+            self._runs_migration_result = None
+
+        runs_root = resolve_runs_root()
+        self._runs_root = runs_root
+        self._runs_source_model = MonthGroupedRunsModel(self._runs_root, self)
 
         self._runs_tree = QTreeView()
         self._runs_tree.setHeaderHidden(True)
@@ -990,7 +1168,6 @@ class MainWindow(QWidget):
             self._runs_tree.viewport().installEventFilter(self)
         except Exception:
             pass
-        self._apply_results_tree_theme()
 
         self.compare_btn = QPushButton("Compare")
         self.compare_btn.setEnabled(False)
@@ -1000,25 +1177,13 @@ class MainWindow(QWidget):
         self.remove_result_btn = None
 
         # Use proxy model if present
-        self._runs_proxy = None
-        try:
-            self._runs_proxy = RunsProxyModel(self)
-            self._runs_proxy.setSourceModel(self._runs_model)
-            self._runs_tree.setModel(self._runs_proxy)
-            try:
-                self._runs_tree.setRootIndex(self._runs_proxy.mapFromSource(self._runs_model.index(str(self._runs_root))))
-            except Exception:
-                pass
-        except Exception:
-            self._runs_tree.setModel(self._runs_model)
-            try:
-                self._runs_tree.setRootIndex(self._runs_model.index(str(self._runs_root)))
-            except Exception:
-                pass
+        self._runs_proxy = RunsProxyModel(self)
+        self._runs_proxy.setSourceModel(self._runs_source_model)
+        self._runs_tree.setModel(self._runs_proxy)
 
         # Multi-colored compare folder name when a compare result is selected.
         try:
-            self._runs_tree_compare_delegate = _CompareNameDelegate(self._runs_tree)
+            self._runs_tree_compare_delegate = _CompareNameDelegate(self._runs_tree, theme_mode=self.theme_mode)
             self._runs_tree.setItemDelegate(self._runs_tree_compare_delegate)
         except Exception:
             self._runs_tree_compare_delegate = None
@@ -1047,7 +1212,7 @@ class MainWindow(QWidget):
             pass
 
         # Enable single-click to expand/collapse folders
-        self._runs_tree.clicked.connect(self._toggle_tree_item)
+        self._runs_tree.clicked.connect(self._on_runs_tree_clicked)
 
         # Benchmark Controller
         # IMPORTANT FIX: pass both runs_model (tree model) and runs_source_model (QFileSystemModel)
@@ -1061,8 +1226,8 @@ class MainWindow(QWidget):
             remove_btn=None,
             compare_btn=self.compare_btn,
             runs_tree=self._runs_tree,
-            runs_model=self._runs_tree.model(),        # proxy or source (whatever the tree uses)
-            runs_source_model=self._runs_model,        # always the QFileSystemModel (source)
+            runs_model=self._runs_tree.model(),          # proxy
+            runs_source_model=self._runs_source_model,   # virtual source model
             runs_root=self._runs_root,
             graph_preview=self.graph,
             sensor_manager=self.sensors,
@@ -1174,7 +1339,29 @@ class MainWindow(QWidget):
         self._stack = QStackedWidget()
 
         center_layout.addWidget(self._nav)
-        center_layout.addWidget(self._stack, 1)
+
+        # Content splitter: main stack on left, help panel on right
+        self._content_splitter = QSplitter(Qt.Horizontal)
+        self._content_splitter.setChildrenCollapsible(True)
+        self._content_splitter.setHandleWidth(5)
+        self._content_splitter.setStyleSheet(
+            "QSplitter::handle:horizontal {"
+            "  background: rgba(128, 128, 128, 0.25);"
+            "  border-left: 1px solid rgba(128, 128, 128, 0.15);"
+            "  border-right: 1px solid rgba(128, 128, 128, 0.15);"
+            "}"
+            "QSplitter::handle:horizontal:hover {"
+            "  background: rgba(128, 128, 128, 0.45);"
+            "}"
+        )
+        self._content_splitter.addWidget(self._stack)
+
+        # Help side-panel (hidden by default; shown in place of a floating dialog)
+        self._help_panel = HelpPanel(self, theme_mode=self.theme_mode)
+        self._help_panel.setVisible(False)
+        self._content_splitter.addWidget(self._help_panel)
+
+        center_layout.addWidget(self._content_splitter, 1)
 
         # --------------------------
         # Run page
@@ -1191,7 +1378,7 @@ class MainWindow(QWidget):
         root.addWidget(self.case_edit)
 
         row = QHBoxLayout()
-        row.addWidget(self._bold_label("HWiNFO CSV (continuous)"))
+        row.addWidget(self._bold_label("Log HWiNFO CSV to"))
         row.addWidget(self.hwinfo_edit, 1)
         row.addWidget(self.pick_hwinfo_btn)
         row.addSpacing(8)
@@ -1373,20 +1560,180 @@ class MainWindow(QWidget):
         except Exception:
             pass
         tree_panel = QWidget()
+        tree_panel.setObjectName("ResultsTreePanel")
         tree_panel.setStyleSheet("""
-            QWidget {
+            QWidget#ResultsTreePanel {
                 border-right: 1px solid rgba(128, 128, 128, 0.3);
             }
         """)
         tree_panel_layout = QVBoxLayout(tree_panel)
         tree_panel_layout.setContentsMargins(0, 0, 0, 0)
         tree_panel_layout.setSpacing(0)
+
+        tree_month_row = QHBoxLayout()
+        tree_month_row.setContentsMargins(5, 6, 5, 2)
+        tree_month_row.setSpacing(6)
+
+        self._current_real_month = datetime.now().strftime("%Y-%m")
+        self._month_picker_overlay_visible = False
+        self._month_picker_display_year = int(datetime.now().year)
+        self._month_picker_buttons: list[QPushButton] = []
+        self._month_picker_stats_cache: dict[int, dict[str, dict[str, int]]] = {}
+
+        self._runs_current_month_btn = QPushButton("Current Month")
+        self._runs_current_month_btn.setCursor(Qt.PointingHandCursor)
+
+        self._runs_month_prev_btn = QPushButton()
+        self._runs_month_next_btn = QPushButton()
+        self._runs_month_label = QPushButton("")
+        self._runs_month_label.setCursor(Qt.PointingHandCursor)
+        self._runs_month_label.setFlat(True)
+        self._runs_month_label.setCheckable(False)
+
+        self._month_prev_icon_path = Path(__file__).parent.parent / "resources" / "icons" / "left_chevron.svg"
+        self._month_next_icon_path = Path(__file__).parent.parent / "resources" / "icons" / "right_chevron.svg"
+
+        self._runs_month_prev_btn.setCursor(Qt.PointingHandCursor)
+        self._runs_month_next_btn.setCursor(Qt.PointingHandCursor)
+
+        self._refresh_month_nav_icons()
+
+        try:
+            self._runs_month_prev_btn.setIconSize(QSize(16, 16))
+            self._runs_month_next_btn.setIconSize(QSize(16, 16))
+            self._runs_month_prev_btn.setFixedSize(28, 28)
+            self._runs_month_next_btn.setFixedSize(28, 28)
+        except Exception:
+            pass
+
+        left_month_nav = QWidget()
+        left_month_nav_layout = QHBoxLayout(left_month_nav)
+        left_month_nav_layout.setContentsMargins(0, 0, 0, 0)
+        left_month_nav_layout.setSpacing(4)
+        left_month_nav_layout.addWidget(self._runs_month_prev_btn)
+        left_month_nav_layout.addWidget(self._runs_month_next_btn)
+
+        tree_month_row.addWidget(left_month_nav, 0, Qt.AlignLeft)
+        tree_month_row.addStretch(1)
+        tree_month_row.addWidget(self._runs_month_label, 0, Qt.AlignCenter)
+        tree_month_row.addStretch(1)
+        tree_month_row.addWidget(self._runs_current_month_btn, 0, Qt.AlignRight)
+
+        tree_panel_layout.addLayout(tree_month_row)
+
         tree_search_row = QHBoxLayout()
-        tree_search_row.setContentsMargins(5, 6, 5, 4)
+        tree_search_row.setContentsMargins(5, 4, 5, 4)
         tree_search_row.setSpacing(0)
         tree_search_row.addWidget(self._runs_tree_search)
         tree_panel_layout.addLayout(tree_search_row)
-        tree_panel_layout.addWidget(self._runs_tree, 1)
+
+        self._results_tree_stack = QStackedWidget()
+
+        # Normal mode page: the regular current-month tree
+        self._results_tree_stack.addWidget(self._runs_tree)
+
+        # Search mode page: sectioned month results with visual separators
+        self._runs_search_scroll = QScrollArea()
+        self._runs_search_scroll.setWidgetResizable(True)
+        self._runs_search_scroll.setFrameShape(QFrame.NoFrame)
+        self._runs_search_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._runs_search_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        self._runs_search_content = QWidget()
+        self._runs_search_layout = QVBoxLayout(self._runs_search_content)
+        self._runs_search_layout.setContentsMargins(0, 0, 0, 0)
+        self._runs_search_layout.setSpacing(8)
+        self._runs_search_scroll.setWidget(self._runs_search_content)
+
+        self._results_tree_stack.addWidget(self._runs_search_scroll)
+        self._runs_month_label.clicked.connect(self._toggle_month_picker_overlay)
+
+        tree_panel_layout.addWidget(self._results_tree_stack, 1)
+        self._month_picker_overlay = QWidget(tree_panel)
+        self._month_picker_overlay.hide()
+        self._month_picker_overlay.raise_()
+        self._month_picker_overlay.setObjectName("RunsMonthPickerOverlay")
+
+        self._month_picker_overlay_layout = QVBoxLayout(self._month_picker_overlay)
+        self._month_picker_overlay_layout.setContentsMargins(12, 12, 12, 12)
+        self._month_picker_overlay_layout.setSpacing(10)
+
+        self._month_picker_header = QWidget()
+        self._month_picker_header_layout = QGridLayout(self._month_picker_header)
+        self._month_picker_header_layout.setContentsMargins(5, 0, 5, 0)
+        self._month_picker_header_layout.setHorizontalSpacing(0)
+        self._month_picker_header_layout.setVerticalSpacing(0)
+
+        self._month_picker_prev_btn = QPushButton()
+        self._month_picker_next_btn = QPushButton()
+        self._month_picker_current_year_btn = QPushButton("Current Year")
+        self._month_picker_current_year_btn.setCursor(Qt.PointingHandCursor)
+        self._month_picker_current_year_btn.clicked.connect(self._go_to_current_overlay_year)
+        self._month_picker_prev_btn.setCursor(Qt.PointingHandCursor)
+        self._month_picker_next_btn.setCursor(Qt.PointingHandCursor)
+
+        try:
+            self._month_picker_prev_btn.setIconSize(QSize(16, 16))
+            self._month_picker_next_btn.setIconSize(QSize(16, 16))
+            self._month_picker_prev_btn.setFixedSize(28, 28)
+            self._month_picker_next_btn.setFixedSize(28, 28)
+        except Exception:
+            pass
+
+        self._month_picker_prev_btn.setIcon(
+            self._tinted_rail_icon(
+                self._month_prev_icon_path,
+                "#000000" if resolve_effective_theme_mode(self.theme_mode, QApplication.instance()) == "light" else "#FFFFFF"
+            )
+        )
+        self._month_picker_next_btn.setIcon(
+            self._tinted_rail_icon(
+                self._month_next_icon_path,
+                "#000000" if resolve_effective_theme_mode(self.theme_mode, QApplication.instance()) == "light" else "#FFFFFF"
+            )
+        )
+
+        self._month_picker_prev_btn.clicked.connect(self._show_previous_results_month)
+        self._month_picker_next_btn.clicked.connect(self._show_next_results_month)
+
+        self._month_picker_nav_left = QWidget()
+        self._month_picker_nav_left_layout = QHBoxLayout(self._month_picker_nav_left)
+        self._month_picker_nav_left_layout.setContentsMargins(0, 0, 0, 0)
+        self._month_picker_nav_left_layout.setSpacing(4)
+        self._month_picker_nav_left_layout.addWidget(self._month_picker_prev_btn)
+        self._month_picker_nav_left_layout.addWidget(self._month_picker_next_btn)
+
+        # right spacer with same width as left nav, so the year stays truly centered
+        self._month_picker_year_label = QLabel("")
+        self._month_picker_year_label.setAlignment(Qt.AlignCenter)
+        self._month_picker_year_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        self._month_picker_header_layout.addWidget(self._month_picker_nav_left, 0, 0, Qt.AlignLeft)
+        self._month_picker_header_layout.addWidget(self._month_picker_year_label, 0, 1, Qt.AlignCenter)
+        self._month_picker_header_layout.addWidget(self._month_picker_current_year_btn, 0, 2, Qt.AlignRight)
+
+        self._month_picker_header_layout.setColumnStretch(0, 0)
+        self._month_picker_header_layout.setColumnStretch(1, 1)
+        self._month_picker_header_layout.setColumnStretch(2, 0)
+
+        self._month_picker_overlay_layout.addWidget(self._month_picker_header)
+
+        self._month_picker_scroll = QScrollArea()
+        self._month_picker_scroll.setWidgetResizable(True)
+        self._month_picker_scroll.setFrameShape(QFrame.NoFrame)
+        self._month_picker_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._month_picker_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._hide_month_picker_horizontal_scrollbar()
+
+        self._month_picker_grid_host = QWidget()
+        self._month_picker_grid = QGridLayout(self._month_picker_grid_host)
+        self._month_picker_grid.setContentsMargins(0, 0, 0, 0)
+        self._month_picker_grid.setHorizontalSpacing(10)
+        self._month_picker_grid.setVerticalSpacing(10)
+
+        self._month_picker_scroll.setWidget(self._month_picker_grid_host)
+        self._hide_month_picker_horizontal_scrollbar()
+        self._month_picker_overlay_layout.addWidget(self._month_picker_scroll, 1)
 
         tree_footer = QVBoxLayout()
         tree_footer.setContentsMargins(10, 0, 10, 5)
@@ -1492,6 +1839,7 @@ class MainWindow(QWidget):
 
         splitter.addWidget(preview_panel)
         self._apply_results_preview_theme()
+        self._apply_results_tree_theme()
 
         try:
             splitter.setStretchFactor(0, 0)
@@ -1561,8 +1909,1025 @@ class MainWindow(QWidget):
         self._update_ui_set_button_text = None
         self._update_ui_set_button_enabled = None
 
+        self._search_section_trees: list[QTreeView] = []
+        self._search_section_models: list[tuple[MonthGroupedRunsModel, RunsProxyModel]] = []
+
+        self._runs_current_month_btn.clicked.connect(self._go_to_current_results_month)
+        self._runs_month_prev_btn.clicked.connect(self._show_previous_results_month)
+        self._runs_month_next_btn.clicked.connect(self._show_next_results_month)
+        self._refresh_results_month_nav()
+
     def _set_update_busy(self, busy: bool) -> None:
         self._update_in_progress = bool(busy)
+
+    def _refresh_results_month_nav(self) -> None:
+        try:
+            source = getattr(self, "_runs_source_model", None)
+            if source is None:
+                return
+
+            months = source.available_months()
+            current = source.current_month()
+
+            overlay_mode = bool(getattr(self, "_month_picker_overlay_visible", False))
+
+            if overlay_mode:
+                year = int(getattr(self, "_month_picker_display_year", datetime.now().year))
+
+                # Keep the clickable month-year header text unchanged while overlay is open.
+                try:
+                    self._runs_month_label.setText(_month_key_to_label(current))
+                except Exception:
+                    self._runs_month_label.setText(str(current or ""))
+
+                available_years = self._month_picker_overlay_years()
+
+                # Main header chevrons stay disabled while overlay is active.
+                self._runs_month_prev_btn.setEnabled(False)
+                self._runs_month_next_btn.setEnabled(False)
+
+                try:
+                    self._runs_current_month_btn.setEnabled(True)
+                except Exception:
+                    pass
+
+                # Update overlay-local chevrons instead.
+                try:
+                    if year in available_years:
+                        idx = available_years.index(year)
+                        self._month_picker_prev_btn.setEnabled(idx < len(available_years) - 1)
+                        self._month_picker_next_btn.setEnabled(idx > 0)
+                    else:
+                        self._month_picker_prev_btn.setEnabled(bool(available_years and year < max(available_years)))
+                        self._month_picker_next_btn.setEnabled(bool(available_years and year > min(available_years)))
+                except Exception:
+                    pass
+
+                try:
+                    current_overlay_year = self._overlay_current_year()
+                    self._month_picker_current_year_btn.setEnabled(year != current_overlay_year)
+                except Exception:
+                    pass
+
+                return
+
+            try:
+                self._runs_month_label.setText(_month_key_to_label(current))
+            except Exception:
+                self._runs_month_label.setText(str(current or ""))
+
+            if current in months:
+                idx = months.index(current)
+                self._runs_month_prev_btn.setEnabled(idx < len(months) - 1)
+                self._runs_month_next_btn.setEnabled(idx > 0)
+            else:
+                self._runs_month_prev_btn.setEnabled(False)
+                self._runs_month_next_btn.setEnabled(False)
+
+            try:
+                current_real = str(getattr(self, "_current_real_month", "") or "").strip()
+                self._runs_current_month_btn.setEnabled(bool(current_real and current != current_real))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _month_picker_month_name(self, month: int) -> str:
+        try:
+            return _MONTHS_EN[int(month) - 1]
+        except Exception:
+            return str(month)
+
+    def _month_picker_min_bubble_width(self) -> int:
+        return 136
+
+    def _month_picker_bubble_height(self, cols: int) -> int:
+        try:
+            if cols == 2:
+                return 72
+
+            overlay = getattr(self, "_month_picker_overlay", None)
+            if overlay is None:
+                return 92
+
+            avail_h = int(overlay.height() or 0)
+            if avail_h <= 0:
+                return 92
+
+            top_bottom_margins = 24
+            header_h = 28
+            layout_spacing = 10
+            grid_v_spacing = int(self._month_picker_grid.verticalSpacing() or 10)
+
+            usable_h = max(
+                120,
+                avail_h - top_bottom_margins - header_h - layout_spacing - 4
+            )
+
+            rows = (12 + max(1, cols) - 1) // max(1, cols)
+            total_spacing = grid_v_spacing * max(0, rows - 1)
+            cell_h = max(72, (usable_h - total_spacing) // max(1, rows))
+            return max(72, min(104, cell_h))
+        except Exception:
+            return 72 if cols == 2 else 92
+
+    def _month_picker_grid_content_height(self, cols: int, bubble_h: int) -> int:
+        try:
+            rows = (12 + max(1, cols) - 1) // max(1, cols)
+            v_spacing = int(self._month_picker_grid.verticalSpacing() or 10)
+            margins = self._month_picker_grid.contentsMargins()
+            return (
+                int(margins.top())
+                + int(margins.bottom())
+                + (rows * int(bubble_h))
+                + (max(0, rows - 1) * v_spacing)
+            )
+        except Exception:
+            rows = (12 + max(1, cols) - 1) // max(1, cols)
+            return rows * int(bubble_h) + max(0, rows - 1) * 10
+
+    def _month_picker_collect_year_stats(self, year: int) -> dict[str, dict[str, int]]:
+        try:
+            year = int(year)
+            cached = self._month_picker_stats_cache.get(year)
+            if cached is not None:
+                return cached
+
+            out: dict[str, dict[str, int]] = {}
+            for m in range(1, 13):
+                key = f"{year:04d}-{m:02d}"
+                out[key] = {
+                    "total": 0,
+                    "single": 0,
+                    "compare": 0,
+                }
+
+            runs_root = Path(getattr(self, "_runs_root", "") or "")
+            if not runs_root.exists() or not runs_root.is_dir():
+                self._month_picker_stats_cache[year] = out
+                return out
+
+            compare_name_re = re.compile(
+                r"^.+\s(?:CPU|GPU|CPUGPU)(?:\svs\s.+\s(?:CPU|GPU|CPUGPU))+(?:\s\+\d+)?$",
+                flags=re.IGNORECASE,
+            )
+
+            for case_ent in os.scandir(str(runs_root)):
+                if not case_ent.is_dir():
+                    continue
+
+                for run_ent in os.scandir(case_ent.path):
+                    if not run_ent.is_dir():
+                        continue
+
+                    run_dir = Path(run_ent.path)
+                    run_name = str(run_dir.name or "")
+
+                    is_single = bool(_RESULT_RUN_FOLDER_RE.match(run_name))
+                    is_compare = bool(compare_name_re.match(run_name))
+                    if not is_single and not is_compare:
+                        continue
+
+                    month_key = ""
+                    try:
+                        if hasattr(self.benchmark, "_month_key_for_run_dir"):
+                            month_key = str(self.benchmark._month_key_for_run_dir(run_dir) or "").strip()
+                    except Exception:
+                        month_key = ""
+
+                    if not month_key.startswith(f"{year:04d}-"):
+                        continue
+                    if month_key not in out:
+                        continue
+
+                    out[month_key]["total"] += 1
+                    if is_compare:
+                        out[month_key]["compare"] += 1
+                    else:
+                        out[month_key]["single"] += 1
+
+            self._month_picker_stats_cache[year] = out
+            return out
+        except Exception:
+            return {}
+
+    def _invalidate_month_picker_stats_cache(self) -> None:
+        try:
+            self._month_picker_stats_cache.clear()
+        except Exception:
+            pass
+
+    def _month_picker_cell_width(self, cols: int) -> int:
+        try:
+            scroll = getattr(self, "_month_picker_scroll", None)
+            if scroll is not None and scroll.isVisible():
+                vp = scroll.viewport()
+                if vp is not None:
+                    usable_w = int(vp.width() or 0)
+                else:
+                    usable_w = 0
+            else:
+                usable_w = 0
+
+            if usable_w <= 0:
+                overlay = getattr(self, "_month_picker_overlay", None)
+                if overlay is None:
+                    return self._month_picker_min_bubble_width()
+
+                layout = getattr(self, "_month_picker_overlay_layout", None)
+                margins = layout.contentsMargins() if layout is not None else None
+                left = int(margins.left()) if margins is not None else 12
+                right = int(margins.right()) if margins is not None else 12
+                usable_w = max(0, int(overlay.width() or 0) - left - right)
+
+            spacing = int(self._month_picker_grid.horizontalSpacing() or 10)
+
+            if cols <= 0:
+                cols = 1
+
+            return max(
+                self._month_picker_min_bubble_width(),
+                (usable_w - max(0, cols - 1) * spacing) // cols
+            )
+        except Exception:
+            return self._month_picker_min_bubble_width()
+
+    def _show_previous_results_month(self) -> None:
+        try:
+            if bool(getattr(self, "_month_picker_overlay_visible", False)):
+                self._step_month_picker_overlay_year(+1)
+                return
+
+            source = getattr(self, "_runs_source_model", None)
+            if source is None:
+                return
+
+            months = source.available_months()
+            current = source.current_month()
+            if current not in months:
+                return
+
+            idx = months.index(current)
+            if idx < len(months) - 1:
+                source.set_current_month(months[idx + 1])
+                try:
+                    sm = self._runs_tree.selectionModel()
+                    if sm is not None:
+                        sm.clearSelection()
+                        sm.clearCurrentIndex()
+                except Exception:
+                    pass
+                self._refresh_results_month_nav()
+        except Exception:
+            pass
+
+    def _overlay_current_year(self) -> int:
+        try:
+            current_real = str(getattr(self, "_current_real_month", "") or "").strip()
+            if re.match(r"^\d{4}-\d{2}$", current_real):
+                return int(current_real[:4])
+        except Exception:
+            pass
+        return int(datetime.now().year)
+
+
+    def _go_to_current_overlay_year(self) -> None:
+        try:
+            self._month_picker_display_year = self._overlay_current_year()
+            self._rebuild_month_picker_overlay()
+            self._refresh_results_month_nav()
+        except Exception:
+            pass
+
+    def _show_next_results_month(self) -> None:
+        try:
+            if bool(getattr(self, "_month_picker_overlay_visible", False)):
+                self._step_month_picker_overlay_year(-1)
+                return
+
+            source = getattr(self, "_runs_source_model", None)
+            if source is None:
+                return
+
+            months = source.available_months()
+            current = source.current_month()
+            if current not in months:
+                return
+
+            idx = months.index(current)
+            if idx > 0:
+                source.set_current_month(months[idx - 1])
+                self._refresh_results_month_nav()
+        except Exception:
+            pass
+
+    def _remember_finished_result(self, result: dict | None) -> None:
+        try:
+            run_dir = str((result or {}).get("run_dir") or "").strip()
+            if not run_dir:
+                return
+
+            self._pending_latest_result_path = run_dir
+
+            month_key = ""
+            try:
+                if hasattr(self.benchmark, "_month_key_for_run_dir"):
+                    month_key = str(self.benchmark._month_key_for_run_dir(Path(run_dir)) or "").strip()
+            except Exception:
+                month_key = ""
+
+            self._pending_latest_result_month = month_key
+        except Exception:
+            pass
+
+
+    def _focus_latest_finished_result(self, retries: int = 12) -> None:
+        try:
+            try:
+                if self._runs_source_model is not None and hasattr(self._runs_source_model, "refresh"):
+                    self._runs_source_model.refresh()
+            except Exception:
+                pass
+
+            try:
+                if self._runs_proxy is not None and hasattr(self._runs_proxy, "invalidate"):
+                    self._runs_proxy.invalidate()
+            except Exception:
+                pass
+            run_dir = str(getattr(self, "_pending_latest_result_path", "") or "").strip()
+            if not run_dir:
+                self.benchmark.select_latest_result()
+                return
+
+            run_path = Path(run_dir)
+            if not run_path.exists() or not run_path.is_dir():
+                if retries > 0:
+                    QTimer.singleShot(150, lambda: self._focus_latest_finished_result(retries - 1))
+                else:
+                    self.benchmark.select_latest_result()
+                return
+
+            month_key = str(getattr(self, "_pending_latest_result_month", "") or "").strip()
+            if month_key:
+                try:
+                    self._runs_source_model.set_current_month(month_key)
+                except Exception:
+                    pass
+
+            try:
+                self._runs_proxy.invalidate()
+            except Exception:
+                pass
+
+            src_idx = None
+            try:
+                if hasattr(self._runs_source_model, "index_for_path"):
+                    src_idx = self._runs_source_model.index_for_path(str(run_path))
+            except Exception:
+                src_idx = None
+
+            if src_idx is None or not src_idx.isValid():
+                if retries > 0:
+                    QTimer.singleShot(150, lambda: self._focus_latest_finished_result(retries - 1))
+                else:
+                    self.benchmark.select_latest_result()
+                return
+
+            try:
+                view_idx = self._runs_proxy.mapFromSource(src_idx) if self._runs_proxy is not None else src_idx
+            except Exception:
+                view_idx = src_idx
+
+            if view_idx is None or not view_idx.isValid():
+                if retries > 0:
+                    QTimer.singleShot(150, lambda: self._focus_latest_finished_result(retries - 1))
+                else:
+                    self.benchmark.select_latest_result()
+                return
+
+            try:
+                parent = view_idx.parent()
+                while parent.isValid():
+                    self._runs_tree.expand(parent)
+                    parent = parent.parent()
+            except Exception:
+                pass
+
+            try:
+                sm = self._runs_tree.selectionModel()
+                if sm is not None:
+                    sm.setCurrentIndex(
+                        view_idx,
+                        QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                    )
+                else:
+                    self._runs_tree.setCurrentIndex(view_idx)
+            except Exception:
+                try:
+                    self._runs_tree.setCurrentIndex(view_idx)
+                except Exception:
+                    pass
+
+            try:
+                self._runs_tree.scrollTo(view_idx)
+            except Exception:
+                pass
+
+            try:
+                handled = False
+                if hasattr(self.benchmark, "activate_results_index"):
+                    handled = bool(self.benchmark.activate_results_index(view_idx))
+                if not handled and hasattr(self.benchmark, "_on_runs_current_changed"):
+                    self.benchmark._on_runs_current_changed(view_idx, view_idx)
+            except Exception:
+                pass
+
+        except Exception:
+            try:
+                self.benchmark.select_latest_result()
+            except Exception:
+                pass
+
+    def _go_to_current_results_month(self) -> None:
+        try:
+            self._hide_month_picker_overlay()
+        except Exception:
+            pass
+        try:
+            source = getattr(self, "_runs_source_model", None)
+            if source is None:
+                return
+
+            target_month = str(getattr(self, "_current_real_month", "") or "").strip()
+            if not target_month:
+                target_month = datetime.now().strftime("%Y-%m")
+
+            source.set_current_month(target_month)
+
+            # If search mode is active, leave search mode and return to the normal tree.
+            try:
+                search_text = str(self._runs_tree_search.text() or "").strip()
+            except Exception:
+                search_text = ""
+
+            if search_text:
+                try:
+                    self._runs_tree_search.blockSignals(True)
+                    self._runs_tree_search.clear()
+                finally:
+                    try:
+                        self._runs_tree_search.blockSignals(False)
+                    except Exception:
+                        pass
+
+                try:
+                    self._runs_source_model.set_folder_name_filter("")
+                except Exception:
+                    pass
+
+                try:
+                    if getattr(self, "_runs_proxy", None) is not None:
+                        self._runs_proxy.invalidate()
+                except Exception:
+                    pass
+
+                try:
+                    if getattr(self, "_results_tree_stack", None) is not None:
+                        self._results_tree_stack.setCurrentWidget(self._runs_tree)
+                except Exception:
+                    pass
+
+                try:
+                    self._clear_search_results_sections()
+                except Exception:
+                    pass
+
+            try:
+                sm = self._runs_tree.selectionModel()
+                if sm is not None:
+                    sm.clearSelection()
+                    sm.clearCurrentIndex()
+            except Exception:
+                pass
+
+            self._refresh_results_month_nav()
+        except Exception:
+            pass
+
+    def _refresh_compare_delegate_theme(self) -> None:
+        try:
+            if getattr(self, "_runs_tree_compare_delegate", None) is not None:
+                self._runs_tree_compare_delegate.set_theme_mode(self.theme_mode)
+        except Exception:
+            pass
+
+        try:
+            for tree in getattr(self, "_search_section_trees", []) or []:
+                delegate = tree.itemDelegate()
+                if isinstance(delegate, _CompareNameDelegate):
+                    delegate.set_theme_mode(self.theme_mode)
+        except Exception:
+            pass
+    
+    def _month_picker_column_count(self) -> int:
+        try:
+            usable_w = 0
+
+            # Prefer the real scroll viewport width when available.
+            scroll = getattr(self, "_month_picker_scroll", None)
+            if scroll is not None:
+                vp = scroll.viewport()
+                if vp is not None:
+                    usable_w = int(vp.width() or 0)
+
+            # Fallback before first show/layout.
+            if usable_w <= 0:
+                overlay = getattr(self, "_month_picker_overlay", None)
+                if overlay is None:
+                    return 3
+
+                layout = getattr(self, "_month_picker_overlay_layout", None)
+                margins = layout.contentsMargins() if layout is not None else None
+                left = int(margins.left()) if margins is not None else 12
+                right = int(margins.right()) if margins is not None else 12
+
+                usable_w = int(overlay.width() or 0) - left - right
+
+            if usable_w <= 0:
+                return 3
+
+            spacing = int(self._month_picker_grid.horizontalSpacing() or 10)
+            min_bubble_w = int(self._month_picker_min_bubble_width())
+
+            best_cols = 1
+            for cols in range(4, 0, -1):
+                needed = cols * min_bubble_w + max(0, cols - 1) * spacing
+                if usable_w >= needed:
+                    best_cols = cols
+                    break
+
+            return max(1, min(4, best_cols))
+        except Exception:
+            return 3
+
+
+    def _clear_month_picker_grid(self) -> None:
+        try:
+            while self._month_picker_grid.count():
+                item = self._month_picker_grid.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+
+            # Important: clear stale column/row sizing from previous layouts
+            # (e.g. when going from 4 cols -> 2 cols -> 1 col).
+            for i in range(12):
+                try:
+                    self._month_picker_grid.setColumnMinimumWidth(i, 0)
+                    self._month_picker_grid.setColumnStretch(i, 0)
+                    self._month_picker_grid.setRowMinimumHeight(i, 0)
+                    self._month_picker_grid.setRowStretch(i, 0)
+                except Exception:
+                    pass
+
+            self._month_picker_buttons = []
+        except Exception:
+            pass
+
+
+    def _fit_month_picker_grid_host_to_viewport(self) -> None:
+        try:
+            scroll = getattr(self, "_month_picker_scroll", None)
+            host = getattr(self, "_month_picker_grid_host", None)
+            if scroll is None or host is None:
+                return
+
+            vp = scroll.viewport()
+            if vp is None:
+                return
+
+            viewport_w = max(0, int(vp.width() or 0))
+            if viewport_w > 0:
+                host.setFixedWidth(viewport_w)
+
+            self._hide_month_picker_horizontal_scrollbar()
+        except Exception:
+            pass
+
+    def _month_picker_is_future_month(self, month_key: str) -> bool:
+        try:
+            mk = str(month_key or "").strip()
+            if not re.match(r"^\d{4}-\d{2}$", mk):
+                return False
+
+            current_real = str(getattr(self, "_current_real_month", "") or "").strip()
+            if not re.match(r"^\d{4}-\d{2}$", current_real):
+                current_real = datetime.now().strftime("%Y-%m")
+
+            # Safe because format is YYYY-MM
+            return mk > current_real
+        except Exception:
+            return False
+
+
+    def _month_picker_is_selectable(self, month_key: str, stats: dict[str, int] | None) -> bool:
+        try:
+            if self._month_picker_is_future_month(month_key):
+                return False
+            return int((stats or {}).get("total", 0)) > 0
+        except Exception:
+            return False
+
+    def _rebuild_month_picker_overlay(self) -> None:
+        try:
+            year = int(getattr(self, "_month_picker_display_year", datetime.now().year))
+            stats_by_month = self._month_picker_collect_year_stats(year)
+
+            self._clear_month_picker_grid()
+            self._month_picker_year_label.setText(str(year))
+
+            cols = max(1, self._month_picker_column_count())
+            bubble_h = self._month_picker_bubble_height(cols)
+            cell_w = self._month_picker_cell_width(cols)
+
+            month_keys = [f"{year:04d}-{m:02d}" for m in range(1, 13)]
+            for i, month_key in enumerate(month_keys):
+                stats = stats_by_month.get(month_key, {"total": 0, "single": 0, "compare": 0})
+                bubble = self._make_month_picker_bubble(month_key, stats, bubble_h)
+                bubble.setMinimumWidth(0)
+                bubble.setMaximumWidth(16777215)
+                row = i // cols
+                col = i % cols
+                self._month_picker_grid.addWidget(bubble, row, col)
+                self._month_picker_buttons.append(bubble)
+
+            rows = (len(month_keys) + cols - 1) // cols
+
+            for col in range(cols):
+                self._month_picker_grid.setColumnStretch(col, 1)
+                self._month_picker_grid.setColumnMinimumWidth(col, cell_w)
+
+            for row in range(rows):
+                self._month_picker_grid.setRowStretch(row, 0)
+
+            content_h = self._month_picker_grid_content_height(cols, bubble_h)
+
+            self._month_picker_scroll.setWidgetResizable(True)
+            self._month_picker_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+            if cols == 2:
+                self._month_picker_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                self._month_picker_scroll.setFixedHeight(content_h)
+                self._month_picker_grid_host.setFixedHeight(content_h)
+            else:
+                self._month_picker_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                self._month_picker_scroll.setMinimumHeight(0)
+                self._month_picker_scroll.setMaximumHeight(16777215)
+                self._month_picker_grid_host.setMinimumHeight(0)
+                self._month_picker_grid_host.setMaximumHeight(16777215)
+
+            self._month_picker_grid.invalidate()
+            self._month_picker_grid_host.adjustSize()
+            self._month_picker_grid_host.updateGeometry()
+            self._month_picker_scroll.widget().updateGeometry()
+            self._month_picker_scroll.viewport().update()
+
+            # Clamp host width to the real viewport width so it never overflows horizontally.
+            self._fit_month_picker_grid_host_to_viewport()
+            QTimer.singleShot(0, self._fit_month_picker_grid_host_to_viewport)
+        except Exception:
+            pass
+
+    def _step_month_picker_overlay_year(self, step: int) -> None:
+        try:
+            years = self._month_picker_overlay_years()
+            if not years:
+                return
+
+            current_year = int(getattr(self, "_month_picker_display_year", datetime.now().year))
+
+            if current_year not in years:
+                # snap to the nearest valid starting point
+                self._month_picker_display_year = int(years[0])
+            else:
+                idx = years.index(current_year)
+                new_idx = max(0, min(len(years) - 1, idx + int(step)))
+                if new_idx == idx:
+                    return
+                self._month_picker_display_year = int(years[new_idx])
+
+            self._rebuild_month_picker_overlay()
+            self._refresh_results_month_nav()
+        except Exception:
+            pass
+
+    def _month_picker_overlay_years(self) -> list[int]:
+        """Years that can be browsed inside the month-picker overlay.
+
+        Test behavior:
+        - include all years that actually have results
+        - also include exactly one extra year before the earliest result year
+        """
+        try:
+            source = getattr(self, "_runs_source_model", None)
+            if source is None:
+                return []
+
+            months = list(source.available_months() or [])
+            years = sorted(
+                {
+                    int(str(m).split("-")[0])
+                    for m in months
+                    if re.match(r"^\d{4}-\d{2}$", str(m or ""))
+                },
+                reverse=True,
+            )
+
+            if years:
+                extra_year = min(years) - 1
+                if extra_year not in years:
+                    years.append(extra_year)
+                    years = sorted(years, reverse=True)
+
+            return years
+        except Exception:
+            return []
+
+    def _hide_month_picker_horizontal_scrollbar(self) -> None:
+        try:
+            scroll = getattr(self, "_month_picker_scroll", None)
+            if scroll is None:
+                return
+
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+            try:
+                scroll.setStyleSheet(
+                    """
+                    QScrollArea {
+                        border: none;
+                    }
+                    QScrollBar:horizontal {
+                        height: 0px;
+                        max-height: 0px;
+                        min-height: 0px;
+                        margin: 0px;
+                        padding: 0px;
+                        border: none;
+                        background: transparent;
+                    }
+                    """
+                )
+            except Exception:
+                pass
+
+            bar = scroll.horizontalScrollBar()
+            if bar is not None:
+                bar.hide()
+                bar.setEnabled(False)
+                bar.setFixedHeight(0)
+                bar.setMaximumHeight(0)
+                bar.setMinimumHeight(0)
+                bar.setValue(0)
+
+            try:
+                scroll.setViewportMargins(0, 0, 0, 0)
+            except Exception:
+                pass
+
+            scroll.updateGeometry()
+            scroll.viewport().update()
+            scroll.update()
+        except Exception:
+            pass
+
+    def _update_month_picker_overlay_geometry(self) -> None:
+        try:
+            overlay = getattr(self, "_month_picker_overlay", None)
+            stack = getattr(self, "_results_tree_stack", None)
+            if overlay is None or stack is None:
+                return
+
+            host_w = int(stack.width() or 0)
+            host_h = int(stack.height() or 0)
+            if host_w <= 0 or host_h <= 0:
+                return
+
+            overlay_w = max(240, int(host_w * 0.80))
+            cols = self._month_picker_column_count()
+
+            if cols == 2:
+                bubble_h = 72
+                grid_h = self._month_picker_grid_content_height(cols, bubble_h)
+
+                overlay_layout_margins = self._month_picker_overlay_layout.contentsMargins()
+                overlay_spacing = int(self._month_picker_overlay_layout.spacing() or 0)
+
+                header_h = max(
+                    28,
+                    int(self._month_picker_header.sizeHint().height() or 28)
+                )
+
+                required_h = (
+                    int(overlay_layout_margins.top())
+                    + int(overlay_layout_margins.bottom())
+                    + header_h
+                    + overlay_spacing
+                    + grid_h
+                )
+
+                overlay_h = min(required_h, max(220, host_h - 20))
+            else:
+                overlay_h = min(max(220, int(host_h * 0.82)), max(220, host_h - 20))
+
+            x = max(0, (host_w - overlay_w) // 2)
+            y = max(10, (host_h - overlay_h) // 2)
+
+            overlay.setGeometry(x, y, overlay_w, overlay_h)
+        except Exception:
+            pass
+
+    def _show_month_picker_overlay(self) -> None:
+        try:
+            source = getattr(self, "_runs_source_model", None)
+            if source is not None and hasattr(source, "current_month"):
+                current = str(source.current_month() or "").strip()
+                if re.match(r"^\d{4}-\d{2}$", current):
+                    self._month_picker_display_year = int(current[:4])
+
+            self._month_picker_overlay_visible = True
+
+            self._update_month_picker_overlay_geometry()
+            self._month_picker_overlay.show()
+            self._month_picker_overlay.raise_()
+
+            def _finalize():
+                try:
+                    self._update_month_picker_overlay_geometry()
+                    self._rebuild_month_picker_overlay()
+                    self._update_month_picker_overlay_geometry()
+                    self._hide_month_picker_horizontal_scrollbar()
+                    self._month_picker_overlay.raise_()
+                except Exception:
+                    pass
+
+            QTimer.singleShot(0, _finalize)
+            self._refresh_results_month_nav()
+        except Exception:
+            pass
+
+    def _hide_month_picker_overlay(self) -> None:
+        try:
+            self._month_picker_overlay_visible = False
+            if getattr(self, "_month_picker_overlay", None) is not None:
+                self._month_picker_overlay.hide()
+            self._refresh_results_month_nav()
+        except Exception:
+            pass
+
+    def _toggle_month_picker_overlay(self) -> None:
+        try:
+            if bool(getattr(self, "_month_picker_overlay_visible", False)):
+                self._hide_month_picker_overlay()
+            else:
+                self._show_month_picker_overlay()
+        except Exception:
+            pass
+
+    def _is_month_picker_overlay_target(self, obj) -> bool:
+        try:
+            overlay = getattr(self, "_month_picker_overlay", None)
+            if overlay is None:
+                return False
+
+            if obj is overlay:
+                return True
+
+            if isinstance(obj, QWidget) and overlay.isAncestorOf(obj):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _select_month_from_picker(self, month_key: str) -> None:
+        try:
+            source = getattr(self, "_runs_source_model", None)
+            if source is None:
+                return
+
+            month_key = str(month_key or "").strip()
+            if not re.match(r"^\d{4}-\d{2}$", month_key):
+                return
+
+            stats_by_month = self._month_picker_collect_year_stats(int(month_key[:4]))
+            stats = stats_by_month.get(month_key, {"total": 0, "single": 0, "compare": 0})
+
+            if not self._month_picker_is_selectable(month_key, stats):
+                return
+
+            source.set_current_month(month_key)
+            self._hide_month_picker_overlay()
+            self._refresh_results_month_nav()
+        except Exception:
+            pass
+
+    def _make_month_picker_bubble(self, month_key: str, stats: dict[str, int], bubble_h: int = 92) -> QPushButton:
+        btn = QPushButton()
+        btn.setCheckable(False)
+        btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        btn.setFixedHeight(int(bubble_h))
+
+        try:
+            title = _month_key_to_label(month_key, include_year=False)
+        except Exception:
+            title = str(month_key)
+
+        total = int((stats or {}).get("total", 0))
+        single = int((stats or {}).get("single", 0))
+        compare = int((stats or {}).get("compare", 0))
+
+        is_future = self._month_picker_is_future_month(month_key)
+        is_selectable = self._month_picker_is_selectable(month_key, stats)
+
+        # Future months: month name only.
+        # Empty past/current months: keep stats text, but greyed out + disabled.
+        if is_future:
+            btn.setText(title)
+        else:
+            btn.setText(
+                f"{title}\n"
+                f"{total} tests\n"
+                f"{single} single • {compare} compare"
+            )
+
+        btn.setProperty("_month_key", month_key)
+        btn.clicked.connect(lambda checked=False, mk=month_key: self._select_month_from_picker(mk))
+
+        btn.setEnabled(is_selectable)
+        btn.setCursor(Qt.PointingHandCursor if is_selectable else Qt.ArrowCursor)
+
+        try:
+            current = ""
+            if getattr(self, "_runs_source_model", None) is not None and hasattr(self._runs_source_model, "current_month"):
+                current = str(self._runs_source_model.current_month() or "")
+        except Exception:
+            current = ""
+
+        try:
+            effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+            is_current = bool(is_selectable and month_key == current)
+
+            if effective_mode == "light":
+                if is_selectable:
+                    bg = "#F7F7F7" if not is_current else "#DCEBFF"
+                    border = "#D8D8D8" if not is_current else "#7BA7F7"
+                    hover = "#ECECEC" if not is_current else "#D2E5FF"
+                    text = "#1A1A1A"
+                else:
+                    bg = "#F1F1F1"
+                    border = "#E0E0E0"
+                    hover = bg
+                    text = "#A0A0A0"
+            else:
+                if is_selectable:
+                    bg = "#1B1B1B" if not is_current else "#1F2E44"
+                    border = "#343434" if not is_current else "#4D7FCC"
+                    hover = "#252525" if not is_current else "#263954"
+                    text = "#EAEAEA"
+                else:
+                    bg = "#171717"
+                    border = "#2A2A2A"
+                    hover = bg
+                    text = "#6F6F6F"
+
+            radius = max(18, min(28, bubble_h // 3))
+
+            btn.setStyleSheet(
+                f"""
+                QPushButton {{
+                    text-align: center;
+                    padding: 8px 10px 12px 10px;
+                    border-radius: {radius}px;
+                    border: 1px solid {border};
+                    background-color: {bg};
+                    color: {text};
+                    font-weight: 600;
+                    line-height: 1.2em;
+                }}
+                QPushButton:hover:!disabled {{
+                    background-color: {hover};
+                }}
+                QPushButton:disabled {{
+                    border: 1px solid {border};
+                    background-color: {bg};
+                    color: {text};
+                }}
+                """
+            )
+        except Exception:
+            pass
+
+        return btn
 
     def _bind_update_ui(
         self,
@@ -1627,6 +2992,76 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
+    def _toggle_search_tree_item(self, index) -> None:
+        try:
+            sender_tree = self.sender()
+            if sender_tree is None:
+                return
+
+            if sender_tree.isExpanded(index):
+                sender_tree.collapse(index)
+            else:
+                sender_tree.expand(index)
+        except Exception:
+            pass
+
+
+    def _on_search_tree_double_clicked(self, tree, proxy, source, idx) -> None:
+        try:
+            old_tree = self.benchmark._runs_tree
+            old_model = self.benchmark._runs_model
+            old_source = self.benchmark._runs_source_model
+
+            self.benchmark._runs_tree = tree
+            self.benchmark._runs_model = proxy
+            self.benchmark._runs_source_model = source
+            try:
+                self.benchmark.toggle_compare_selection_for_index(idx)
+            finally:
+                self.benchmark._runs_tree = old_tree
+                self.benchmark._runs_model = old_model
+                self.benchmark._runs_source_model = old_source
+        except Exception:
+            pass
+
+
+    def _on_search_tree_current_changed(self, tree, proxy, source, current, previous) -> None:
+        try:
+            old_tree = self.benchmark._runs_tree
+            old_model = self.benchmark._runs_model
+            old_source = self.benchmark._runs_source_model
+
+            self.benchmark._runs_tree = tree
+            self.benchmark._runs_model = proxy
+            self.benchmark._runs_source_model = source
+            try:
+                self.benchmark._on_runs_current_changed(current, previous)
+            finally:
+                self.benchmark._runs_tree = old_tree
+                self.benchmark._runs_model = old_model
+                self.benchmark._runs_source_model = old_source
+        except Exception:
+            pass
+
+
+    def _on_search_tree_context_menu(self, tree, proxy, source, pos) -> None:
+        try:
+            old_tree = self._runs_tree
+            old_proxy = self._runs_proxy
+            old_source = self._runs_source_model
+
+            self._runs_tree = tree
+            self._runs_proxy = proxy
+            self._runs_source_model = source
+            try:
+                self._on_runs_tree_context_menu(pos)
+            finally:
+                self._runs_tree = old_tree
+                self._runs_proxy = old_proxy
+                self._runs_source_model = old_source
+        except Exception:
+            pass
+
     def _hide_update_progress(self) -> None:
         try:
             if self._update_progress_dialog is not None:
@@ -1653,7 +3088,7 @@ class MainWindow(QWidget):
                     # already cached the latest folder — derive header text
                     # from it so we can show it immediately.
                     if not has_content:
-                        folder = getattr(self.benchmark, "_latest_cached_folder", None)
+                        folder = getattr(self, "_pending_latest_result_path", None) or getattr(self.benchmark, "_latest_cached_folder", None)
                         if folder is not None:
                             from ui.graph_preview.preview_path_helpers import choose_preview_file_for_folder
                             pick = choose_preview_file_for_folder(str(folder))
@@ -1691,7 +3126,7 @@ class MainWindow(QWidget):
                 except Exception:
                     pass
                 # Defer the heavier canvas relayout to the next tick.
-                QTimer.singleShot(0, self.benchmark.select_latest_result)
+                QTimer.singleShot(0, self._focus_latest_finished_result)
         except Exception:
             pass
 
@@ -1843,6 +3278,147 @@ class MainWindow(QWidget):
                 pass
 
             try:
+                nav_btn_css = f"""
+                QPushButton {{
+                    background-color: {search_bg};
+                    color: {tree_text};
+                    border: 1px solid {search_border};
+                    border-radius: 8px;
+                    padding: 4px 10px;
+                }}
+                QPushButton:hover {{
+                    background-color: {hover_bg};
+                }}
+                QPushButton:disabled {{
+                    color: {placeholder_text};
+                }}
+                """
+
+                chevron_btn_css = f"""
+                QPushButton {{
+                    background: transparent;
+                    border: none;
+                    border-radius: 10px;
+                    padding: 0px;
+                }}
+                QPushButton:hover {{
+                    background-color: {hover_bg};
+                }}
+                QPushButton:pressed {{
+                    background-color: {hover_bg};
+                }}
+                QPushButton:disabled {{
+                    background: transparent;
+                    border: none;
+                }}
+                """
+
+                self._runs_current_month_btn.setStyleSheet(nav_btn_css)
+                self._month_picker_current_year_btn.setStyleSheet(nav_btn_css)
+                self._runs_month_prev_btn.setStyleSheet(chevron_btn_css)
+                self._runs_month_next_btn.setStyleSheet(chevron_btn_css)
+            except Exception:
+                pass
+
+            try:
+                self._month_picker_prev_btn.setStyleSheet(chevron_btn_css)
+                self._month_picker_next_btn.setStyleSheet(chevron_btn_css)
+            except Exception:
+                pass
+
+            try:
+                overlay_bg = "rgba(255,255,255,0.96)" if effective_mode == "light" else "rgba(20,20,20,0.96)"
+                overlay_border = "rgba(0,0,0,0.10)" if effective_mode == "light" else "rgba(255,255,255,0.10)"
+                inner_bg = "#FFFFFF" if effective_mode == "light" else "#141414"
+
+                overlay_css = f"""
+                QWidget#RunsMonthPickerOverlay {{
+                    background-color: {overlay_bg};
+                    border: 1px solid {overlay_border};
+                    border-radius: 14px;
+                }}
+                """
+                self._month_picker_overlay.setStyleSheet(overlay_css)
+
+                self._month_picker_grid_host.setStyleSheet(
+                    f"background-color: {inner_bg}; border: none;"
+                )
+
+                try:
+                    self._month_picker_scroll.setStyleSheet(
+                        f"""
+                        QScrollArea {{
+                            background-color: {inner_bg};
+                            border: none;
+                        }}
+                        QScrollArea > QWidget > QWidget {{
+                            background-color: {inner_bg};
+                            border: none;
+                        }}
+                        QScrollBar:horizontal {{
+                            height: 0px;
+                            max-height: 0px;
+                            min-height: 0px;
+                            margin: 0px;
+                            padding: 0px;
+                            border: none;
+                            background: transparent;
+                        }}
+                        """
+                    )
+                except Exception:
+                    pass
+
+                self._month_picker_header.setStyleSheet("background: transparent; border: none;")
+                self._month_picker_nav_left.setStyleSheet("background: transparent; border: none;")
+                # REMOVE this line unless you actually create self._month_picker_nav_right
+                # self._month_picker_nav_right.setStyleSheet("background: transparent; border: none;")
+
+                self._month_picker_year_label.setStyleSheet(
+                    f"""
+                    QLabel {{
+                        color: {tree_text};
+                        font-weight: 700;
+                        font-size: 15px;
+                        background: transparent;
+                        border: none;
+                        margin: 0px;
+                        padding: 0px;
+                    }}
+                    """
+                )
+
+                self._runs_month_label.setObjectName("RunsMonthLabel")
+                self._runs_month_label.setFlat(True)
+                self._runs_month_label.setAutoDefault(False)
+                self._runs_month_label.setDefault(False)
+                self._runs_month_label.setStyleSheet(
+                    f"""
+                    QPushButton#RunsMonthLabel {{
+                        background: transparent;
+                        border: none;
+                        padding: 2px 8px;
+                        margin: 0px;
+                        color: {tree_text};
+                        font-weight: 700;
+                    }}
+                    QPushButton#RunsMonthLabel:hover {{
+                        background-color: {hover_bg};
+                        border: none;
+                        border-radius: 8px;
+                    }}
+                    QPushButton#RunsMonthLabel:pressed {{
+                        background-color: {hover_bg};
+                        border: none;
+                    }}
+                    """
+                )
+            except Exception as e:
+                print("month nav styling failed:", e)
+            except Exception:
+                pass
+
+            try:
                 self._runs_tree.viewport().update()
                 self._runs_tree.update()
             except Exception:
@@ -1860,6 +3436,38 @@ class MainWindow(QWidget):
                     tt.setFont(self._runs_tree_tooltip_font())
             except Exception:
                 pass
+        except Exception:
+            pass
+    
+    def _on_search_tree_clicked(self, tree, proxy, source, index) -> None:
+        try:
+            btn = tree.property("_tb_last_button")
+            if btn is not None and int(btn) == int(Qt.RightButton):
+                return
+        except Exception:
+            pass
+
+        try:
+            old_tree = self.benchmark._runs_tree
+            old_model = self.benchmark._runs_model
+            old_source = self.benchmark._runs_source_model
+
+            self.benchmark._runs_tree = tree
+            self.benchmark._runs_model = proxy
+            self.benchmark._runs_source_model = source
+            try:
+                handled = False
+                if hasattr(self.benchmark, "activate_results_index"):
+                    handled = bool(self.benchmark.activate_results_index(index))
+                if not handled:
+                    if tree.isExpanded(index):
+                        tree.collapse(index)
+                    else:
+                        tree.expand(index)
+            finally:
+                self.benchmark._runs_tree = old_tree
+                self.benchmark._runs_model = old_model
+                self.benchmark._runs_source_model = old_source
         except Exception:
             pass
 
@@ -1919,15 +3527,19 @@ class MainWindow(QWidget):
             full_text = str(text or "")
             prefix = str(compare_prefix or "")
             body_text = full_text[len(prefix):] if prefix and full_text.startswith(prefix) else full_text
-            parts = body_text.split(" vs ")
+
+            parts: list[str] = []
+            for p in body_text.split(" vs "):
+                cleaned = re.sub(r"\s+", " ", str(p or "")).strip()
+                if cleaned:
+                    parts.append(cleaned)
+
             if not parts:
                 return ""
 
             base = self._runs_tree_tooltip_text_color()
-            chunks: list[str] = []
-            if prefix and full_text.startswith(prefix):
-                chunks.append(f"<span style='color:{base};'>{self._html_escape(prefix)}</span>")
 
+            rows: list[str] = []
             for idx, part in enumerate(parts):
                 color = base
                 try:
@@ -1935,13 +3547,23 @@ class MainWindow(QWidget):
                     if hasattr(current, "name"):
                         color = str(current.name() or base)
                 except Exception:
-                    color = base
+                    pass
 
-                chunks.append(f"<span style='color:{color};'>{self._html_escape(part)}</span>")
-                if idx != (len(parts) - 1):
-                    chunks.append(f"<span style='color:{base};'>{self._html_escape(' vs ')}</span>")
+                safe_part = self._html_escape(part).replace(" ", "&nbsp;")
 
-            return "<div style='white-space:pre-wrap;'>" + "".join(chunks) + "</div>"
+                suffix = ""
+                if idx != len(parts) - 1:
+                    suffix = f"&nbsp;<span style='color:{base};'>↔</span>"
+
+                rows.append(
+                    f"<span style='color:{color};'>{safe_part}</span>{suffix}"
+                )
+
+            return (
+                "<span style='white-space:nowrap; margin:0; padding:0;'>"
+                + "<br/>".join(rows)
+                + "</span>"
+            )
         except Exception:
             return ""
 
@@ -1973,9 +3595,8 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
-    def _show_runs_tree_tooltip(self, text: str, *, viewport_pos, item_rect, rich_html: str = "") -> None:
+    def _show_runs_tree_tooltip(self, tree: QTreeView, text: str, *, viewport_pos, item_rect, rich_html: str = "") -> None:
         try:
-            tree = getattr(self, "_runs_tree", None)
             if tree is None:
                 return
 
@@ -1985,9 +3606,13 @@ class MainWindow(QWidget):
 
             tt.setStyleSheet(self._runs_tree_tooltip_stylesheet())
             tt.setFont(self._runs_tree_tooltip_font())
+
             markup = str(rich_html or "").strip()
+            is_rich_compare = bool(markup)
+
             if not markup:
                 markup = f"<div style='white-space:pre-wrap;'>{self._html_escape(text)}</div>"
+
             tt.setText(markup)
 
             host_w = max(0, int(self.width() or 0))
@@ -1995,17 +3620,22 @@ class MainWindow(QWidget):
             margin = 8
             max_w = max(160, host_w - (margin * 2))
 
-            tt.setMaximumWidth(max_w)
-            tt.setWordWrap(False)
-            tt.adjustSize()
-            natural_w = int(tt.sizeHint().width() or tt.width() or 0)
-            if natural_w > max_w:
-                tt.setWordWrap(True)
-                tt.resize(max_w, 1)
-                tt.adjustSize()
-            else:
+            if is_rich_compare:
+                tt.setMaximumWidth(16777215)
                 tt.setWordWrap(False)
                 tt.adjustSize()
+            else:
+                tt.setMaximumWidth(max_w)
+                tt.setWordWrap(False)
+                tt.adjustSize()
+                natural_w = int(tt.sizeHint().width() or tt.width() or 0)
+                if natural_w > max_w:
+                    tt.setWordWrap(True)
+                    tt.resize(max_w, 1)
+                    tt.adjustSize()
+                else:
+                    tt.setWordWrap(False)
+                    tt.adjustSize()
 
             try:
                 if item_rect is not None and item_rect.isValid():
@@ -2076,27 +3706,354 @@ class MainWindow(QWidget):
     def _on_runs_tree_search_changed(self, text: str) -> None:
         try:
             search_text = str(text or "").strip()
-            if search_text and self._runs_tree_search_expanded_paths is None:
-                self._runs_tree_search_expanded_paths = self._capture_runs_tree_expanded_paths()
+            if search_text and bool(getattr(self, "_month_picker_overlay_visible", False)):
+                self._hide_month_picker_overlay()
 
-            proxy = getattr(self, "_runs_proxy", None)
-            if proxy is not None and hasattr(proxy, "set_folder_name_filter"):
-                proxy.set_folder_name_filter(text)
+            if search_text:
+                self._rebuild_search_results_sections(search_text)
+                if getattr(self, "_results_tree_stack", None) is not None:
+                    self._results_tree_stack.setCurrentWidget(self._runs_search_scroll)
+            else:
                 try:
-                    root_index = self._runs_model.index(str(self._runs_root))
-                    self._runs_tree.setRootIndex(proxy.mapFromSource(root_index))
+                    if getattr(self, "_runs_source_model", None) is not None:
+                        self._runs_source_model.set_folder_name_filter("")
                 except Exception:
                     pass
-            elif getattr(self, "_runs_model", None) is not None:
-                # Fallback: keep the search box inert rather than breaking the tree
+
+                try:
+                    if getattr(self, "_runs_proxy", None) is not None:
+                        self._runs_proxy.invalidate()
+                except Exception:
+                    pass
+
+                if getattr(self, "_results_tree_stack", None) is not None:
+                    self._results_tree_stack.setCurrentWidget(self._runs_tree)
+
+                try:
+                    self._clear_search_results_sections()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _clear_search_results_sections(self) -> None:
+        try:
+            layout = getattr(self, "_runs_search_layout", None)
+            if layout is None:
                 return
 
-            saved_paths = self._runs_tree_search_expanded_paths
-            if saved_paths is not None:
-                self._apply_runs_tree_expanded_paths(saved_paths)
+            while layout.count():
+                item = layout.takeAt(0)
+                widget = item.widget()
+                child_layout = item.layout()
+                if widget is not None:
+                    try:
+                        widget.deleteLater()
+                    except Exception:
+                        pass
+                elif child_layout is not None:
+                    try:
+                        while child_layout.count():
+                            sub = child_layout.takeAt(0)
+                            w = sub.widget()
+                            if w is not None:
+                                w.deleteLater()
+                    except Exception:
+                        pass
 
-            if not search_text:
-                self._runs_tree_search_expanded_paths = None
+            self._search_section_trees = []
+            self._search_section_models = []
+        except Exception:
+            pass
+
+
+    def _search_month_keys_with_matches(self, search_text: str) -> list[str]:
+        try:
+            runs_root = Path(getattr(self, "_runs_root", "") or "")
+            if not runs_root.exists() or not runs_root.is_dir():
+                return []
+
+            grouped: dict[str, bool] = {}
+
+            for case_ent in os.scandir(str(runs_root)):
+                if not case_ent.is_dir():
+                    continue
+
+                case_name = str(case_ent.name or "")
+                for run_ent in os.scandir(case_ent.path):
+                    if not run_ent.is_dir():
+                        continue
+
+                    run_dir = Path(run_ent.path)
+                    run_name = run_dir.name
+                    if not _RESULT_RUN_FOLDER_RE.match(run_name) and not re.match(
+                        r"^.+\s(?:CPU|GPU|CPUGPU)(?:\svs\s.+\s(?:CPU|GPU|CPUGPU))+(?:\s\+\d+)?$",
+                        run_name,
+                        flags=re.IGNORECASE,
+                    ):
+                        continue
+
+                    hay = f"{case_name} {run_name}".casefold()
+                    if str(search_text or "").strip().casefold() not in hay:
+                        continue
+
+                    month_key = ""
+                    try:
+                        if hasattr(self.benchmark, "_month_key_for_run_dir"):
+                            month_key = str(self.benchmark._month_key_for_run_dir(run_dir) or "").strip()
+                    except Exception:
+                        month_key = ""
+
+                    if month_key:
+                        grouped[month_key] = True
+
+            months = sorted(grouped.keys(), reverse=True)
+
+            current = ""
+            try:
+                if getattr(self, "_runs_source_model", None) is not None and hasattr(self._runs_source_model, "current_month"):
+                    current = str(self._runs_source_model.current_month() or "").strip()
+            except Exception:
+                current = ""
+
+            if current and current in months:
+                months.remove(current)
+                months.insert(0, current)
+
+            return months
+        except Exception:
+            return []
+
+
+    def _make_search_month_header(self, month_key: str) -> QWidget:
+        header = QFrame()
+        header.setObjectName("RunsSearchMonthHeader")
+
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(10, 3, 10, 3)
+        layout.setSpacing(0)
+
+        label = QLabel("")
+        label.setObjectName("RunsSearchMonthHeaderLabel")
+        try:
+            label.setText(_month_key_to_label(month_key))
+        except Exception:
+            label.setText(str(month_key or ""))
+
+        try:
+            f = label.font()
+            f.setBold(True)
+            label.setFont(f)
+        except Exception:
+            pass
+
+        layout.addWidget(label)
+
+        try:
+            effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+            if effective_mode == "light":
+                header.setStyleSheet("""
+                    QFrame#RunsSearchMonthHeader {
+                        border: none;
+                        border-top: 1px solid rgba(0,0,0,0.16);
+                        border-bottom: 1px solid rgba(0,0,0,0.10);
+                        background-color: rgba(0,0,0,0.03);
+                    }
+                    QLabel#RunsSearchMonthHeaderLabel {
+                        border: none;
+                        background-color: transparent;
+                        color: #1A1A1A;
+                    }
+                """)
+            else:
+                header.setStyleSheet("""
+                    QFrame#RunsSearchMonthHeader {
+                        border: none;
+                        border-top: 1px solid rgba(255,255,255,0.14);
+                        border-bottom: 1px solid rgba(255,255,255,0.08);
+                        background-color: rgba(255,255,255,0.03);
+                    }
+                    QLabel#RunsSearchMonthHeaderLabel {
+                        border: none;
+                        background-color: transparent;
+                        color: #EAEAEA;
+                    }
+                """)
+        except Exception:
+            pass
+
+        return header
+
+
+    def _make_search_month_tree(self, month_key: str, search_text: str) -> QTreeView | None:
+        try:
+            source = MonthGroupedRunsModel(self._runs_root, self)
+            source.set_current_month(month_key)
+            source.set_folder_name_filter(search_text)
+
+            proxy = RunsProxyModel(self)
+            proxy.setSourceModel(source)
+
+            tree = QTreeView()
+            tree.setHeaderHidden(True)
+            tree.setModel(proxy)
+
+            try:
+                tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+                tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+                tree.setExpandsOnDoubleClick(False)
+            except Exception:
+                pass
+
+            try:
+                for c in range(1, 4):
+                    tree.hideColumn(c)
+            except Exception:
+                pass
+
+            try:
+                tree.setSortingEnabled(True)
+                tree.sortByColumn(0, Qt.AscendingOrder)
+            except Exception:
+                pass
+
+            try:
+                tree.clicked.connect(lambda idx, t=tree, p=proxy, s=source: self._on_search_tree_clicked(t, p, s, idx))
+            except Exception:
+                pass
+
+            try:
+                tree.doubleClicked.connect(lambda idx, t=tree, p=proxy, s=source: self._on_search_tree_double_clicked(t, p, s, idx))
+            except Exception:
+                pass
+
+            try:
+                tree.selectionModel().currentChanged.connect(
+                    lambda current, previous, t=tree, p=proxy, s=source: self._on_search_tree_current_changed(t, p, s, current, previous)
+                )
+            except Exception:
+                pass
+
+            try:
+                tree.selectionModel().selectionChanged.connect(
+                    lambda selected, deselected: self.benchmark._update_compare_btn_state()
+                )
+            except Exception:
+                pass
+
+            try:
+                tree.setContextMenuPolicy(Qt.CustomContextMenu)
+                tree.customContextMenuRequested.connect(lambda pos, t=tree, p=proxy, s=source: self._on_search_tree_context_menu(t, p, s, pos))
+            except Exception:
+                pass
+
+            try:
+                tree.viewport().installEventFilter(self)
+            except Exception:
+                pass
+
+            try:
+                tree.setProperty("_tb_last_button", int(Qt.LeftButton))
+            except Exception:
+                pass
+
+            try:
+                tree.setItemDelegate(_CompareNameDelegate(tree, theme_mode=self.theme_mode))
+            except Exception:
+                pass
+
+            try:
+                effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+                if effective_mode == "light":
+                    tree_text = "#000000"
+                    selection_text = "#0F172A"
+                    selection_bg = "#BFD8FF"
+                    hover_bg = "#ECECEC"
+                else:
+                    tree_text = "#B0B0B0"
+                    selection_text = tree_text
+                    selection_bg = "#2A2A2A"
+                    hover_bg = "#242424"
+
+                tree.setStyleSheet(
+                    f"""
+                    QTreeView {{
+                        border: none;
+                        color: {tree_text};
+                        background: transparent;
+                    }}
+                    QTreeView::item:selected {{
+                        background-color: {selection_bg};
+                        color: {selection_text};
+                        outline: none;
+                        border: none;
+                    }}
+                    QTreeView::item:hover {{
+                        background-color: {hover_bg};
+                    }}
+                    QTreeView::item:focus {{
+                        outline: none;
+                        border: none;
+                    }}
+                    """
+                )
+            except Exception:
+                pass
+
+            self._search_section_trees.append(tree)
+            self._search_section_models.append((source, proxy))
+            return tree
+        except Exception:
+            return None
+
+
+    def _rebuild_search_results_sections(self, search_text: str) -> None:
+        try:
+            self._clear_search_results_sections()
+
+            layout = getattr(self, "_runs_search_layout", None)
+            if layout is None:
+                return
+
+            months = self._search_month_keys_with_matches(search_text)
+            if not months:
+                empty = QLabel("No matching folders")
+                try:
+                    empty.setAlignment(Qt.AlignCenter)
+                except Exception:
+                    pass
+                layout.addWidget(empty)
+                layout.addStretch(1)
+                return
+
+            for month_key in months:
+                header = self._make_search_month_header(month_key)
+                layout.addWidget(header)
+
+                tree = self._make_search_month_tree(month_key, search_text)
+                if tree is None:
+                    continue
+
+                try:
+                    rows = 0
+                    try:
+                        model = tree.model()
+                        if model is not None:
+                            rows = model.rowCount()
+                    except Exception:
+                        rows = 6
+
+                    row_h = tree.sizeHintForRow(0)
+                    if row_h <= 0:
+                        row_h = 22
+
+                    tree.setMinimumHeight(max(80, min(420, row_h * max(3, rows) + 8)))
+                except Exception:
+                    tree.setMinimumHeight(120)
+
+                layout.addWidget(tree)
+
+            layout.addStretch(1)
         except Exception:
             pass
 
@@ -2313,20 +4270,43 @@ class MainWindow(QWidget):
         except Exception:
             return []
 
-    def _runs_tree_index_is_dir(self, idx) -> bool:
+    def _runs_tree_index_is_dir(self, idx, tree: QTreeView | None = None) -> bool:
         try:
             if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
                 return False
-            if getattr(self, "_runs_proxy", None) is not None and hasattr(self._runs_proxy, "mapToSource"):
-                src = self._runs_proxy.mapToSource(idx)
-                return bool(self._runs_model.isDir(src))
-            return bool(self._runs_model.isDir(idx))
+
+            use_tree = tree
+            if use_tree is None:
+                use_tree = getattr(self, "_runs_tree", None)
+            if use_tree is None:
+                return False
+
+            model = use_tree.model()
+            if model is None:
+                return False
+
+            if hasattr(model, "mapToSource") and hasattr(model, "sourceModel"):
+                src = model.mapToSource(idx)
+                sm = model.sourceModel()
+                if sm is not None and hasattr(sm, "isDir"):
+                    return bool(sm.isDir(src))
+
+            if hasattr(model, "isDir"):
+                return bool(model.isDir(idx))
         except Exception:
             return False
 
-    def _runs_tree_compare_prefix(self) -> str:
+        return False
+
+    def _runs_tree_compare_prefix(self, tree: QTreeView | None = None) -> str:
         try:
-            model = self._runs_tree.model() if getattr(self, "_runs_tree", None) is not None else None
+            use_tree = tree
+            if use_tree is None:
+                use_tree = getattr(self, "_runs_tree", None)
+            if use_tree is None:
+                return "↔ "
+
+            model = use_tree.model()
             get_pref = getattr(model, "get_compare_prefix", None)
             if callable(get_pref):
                 pref = str(get_pref() or "").strip()
@@ -2343,9 +4323,8 @@ class MainWindow(QWidget):
         except Exception:
             return str(path or "")
 
-    def _runs_tree_tooltip_payload_at(self, pos) -> dict[str, str]:
+    def _runs_tree_tooltip_payload_at(self, tree: QTreeView, pos) -> dict[str, str]:
         try:
-            tree = getattr(self, "_runs_tree", None)
             if tree is None:
                 return {"text": "", "html": ""}
 
@@ -2379,8 +4358,8 @@ class MainWindow(QWidget):
                 return {"text": "", "html": ""}
 
             fm = option.fontMetrics
-            path = self._runs_tree_index_to_path(index)
-            is_dir = self._runs_tree_index_is_dir(index)
+            path = self._runs_tree_index_to_path(index, tree)
+            is_dir = self._runs_tree_index_is_dir(index, tree)
             model = tree.model()
 
             is_compare_result_dir = False
@@ -2438,28 +4417,36 @@ class MainWindow(QWidget):
                         return {"text": text, "html": ""}
                     return {"text": "", "html": ""}
 
-            compare_prefix = self._runs_tree_compare_prefix()
-            if is_compare_case_dir and (not active_norm or self._norm_fs_path(path) != str(active_norm)):
-                pref_w = int(fm.horizontalAdvance(compare_prefix)) if compare_prefix else 0
-                name_avail = max(0, avail - pref_w)
-                if fm.elidedText(text, Qt.ElideRight, name_avail) != text:
-                    return {"text": text, "html": ""}
-                return {"text": "", "html": ""}
+            compare_prefix = self._runs_tree_compare_prefix(tree)
 
-            if active_norm and self._norm_fs_path(path) == str(active_norm) and text and (" vs " in text) and seg_colors:
+            is_active_compare_path = bool(active_norm and self._norm_fs_path(path) == str(active_norm))
+            is_compare_name = bool((is_compare_case_dir or is_compare_run_dir) and (" vs " in text))
+
+            if is_compare_name:
                 shown_text = text[len(compare_prefix):] if compare_prefix and text.startswith(compare_prefix) else text
-                pref_w = int(fm.horizontalAdvance(compare_prefix)) if (is_compare_case_dir and compare_prefix) else 0
-                name_avail = max(0, avail - pref_w)
-                if int(fm.horizontalAdvance(shown_text)) > name_avail:
-                    rich_html = ""
-                    if is_compare_run_dir:
-                        rich_html = self._runs_tree_compare_tooltip_html(text, compare_prefix, seg_colors)
-                    return {"text": text, "html": rich_html}
-                return {"text": "", "html": ""}
+                shown_text_for_measure = shown_text.replace(" vs ", " ↔ ")
 
-            if fm.elidedText(text, Qt.ElideRight, avail) != text:
-                return {"text": text, "html": ""}
-            return {"text": "", "html": ""}
+                pref_w = 0
+                if is_compare_case_dir and compare_prefix:
+                    try:
+                        if isinstance(delegate, _CompareNameDelegate):
+                            pref_w = int(delegate._compare_prefix_draw_width(fm, text_rect, compare_prefix))
+                        else:
+                            pref_w = int(fm.horizontalAdvance(compare_prefix))
+                    except Exception:
+                        pref_w = int(fm.horizontalAdvance(compare_prefix))
+
+                name_avail = max(0, avail - pref_w)
+
+                if fm.elidedText(shown_text_for_measure, Qt.ElideRight, name_avail) != shown_text_for_measure:
+                    rich_html = self._runs_tree_compare_tooltip_html(
+                        text,
+                        compare_prefix,
+                        seg_colors if is_active_compare_path else [],
+                    )
+                    return {"text": shown_text_for_measure, "html": rich_html}
+
+                return {"text": "", "html": ""}
         except Exception:
             return {"text": "", "html": ""}
 
@@ -2656,25 +4643,61 @@ class MainWindow(QWidget):
 
     def _tinted_rail_icon(self, icon_path: Path, color: str) -> QIcon:
         try:
-            base_icon = QIcon(str(icon_path))
-            pixmap = base_icon.pixmap(self._rail_icon_size)
-            if pixmap.isNull():
-                return base_icon
-
-            tinted = QPixmap(pixmap.size())
-            tinted.fill(Qt.transparent)
-
-            painter = QPainter(tinted)
+            # Render SVG at physical resolution so it stays sharp at any DPI scale.
             try:
-                painter.drawPixmap(0, 0, pixmap)
-                painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
-                painter.fillRect(tinted.rect(), QColor(color))
-            finally:
-                painter.end()
+                dpr = float(self.devicePixelRatioF())
+            except Exception:
+                dpr = 1.0
+            if dpr <= 0:
+                dpr = 1.0
 
+            log_w = self._rail_icon_size.width()
+            log_h = self._rail_icon_size.height()
+            phys_w = max(1, round(log_w * dpr))
+            phys_h = max(1, round(log_h * dpr))
+
+            renderer = QSvgRenderer(str(icon_path))
+            if not renderer.isValid():
+                return QIcon(str(icon_path))
+
+            src = QPixmap(phys_w, phys_h)
+            src.fill(Qt.transparent)
+            p = QPainter(src)
+            try:
+                renderer.render(p, QRectF(0.0, 0.0, float(phys_w), float(phys_h)))
+            finally:
+                p.end()
+
+            tinted = QPixmap(phys_w, phys_h)
+            tinted.fill(Qt.transparent)
+            p = QPainter(tinted)
+            try:
+                p.drawPixmap(0, 0, src)
+                p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+                p.fillRect(tinted.rect(), QColor(color))
+            finally:
+                p.end()
+
+            tinted.setDevicePixelRatio(dpr)
             return QIcon(tinted)
         except Exception:
             return QIcon(str(icon_path))
+
+    def _refresh_month_nav_icons(self) -> None:
+        try:
+            effective_mode = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+            icon_color = "#000000" if effective_mode == "light" else "#FFFFFF"
+
+            self._runs_month_prev_btn.setIcon(self._tinted_rail_icon(self._month_prev_icon_path, icon_color))
+            self._runs_month_next_btn.setIcon(self._tinted_rail_icon(self._month_next_icon_path, icon_color))
+        except Exception:
+            pass
+
+        try:
+            self._month_picker_prev_btn.setIcon(self._tinted_rail_icon(self._month_prev_icon_path, icon_color))
+            self._month_picker_next_btn.setIcon(self._tinted_rail_icon(self._month_next_icon_path, icon_color))
+        except Exception:
+            pass
 
     def _refresh_left_rail_icons(self) -> None:
         try:
@@ -2976,21 +4999,42 @@ class MainWindow(QWidget):
         demo_display = self.fur_demo_combo.currentText()
         fur_demo = self.fur_demo_map.get(demo_display, "furmark-knot-gl")
 
+        hwinfo_csv = resolve_hwinfo_csv()
+        hwinfo_exe = resolve_hwinfo_exe(self.hwinfo_exe)
+
+        self.hwinfo_csv = hwinfo_csv
+        self.hwinfo_exe = hwinfo_exe
+
+        try:
+            if self.hwinfo_edit.text().strip() != hwinfo_csv:
+                self.hwinfo_edit.setText(hwinfo_csv)
+        except Exception:
+            pass
+
         res_display = self.fur_res_combo.currentText()
         fur_w, fur_h = self.res_map.get(res_display, (3840, 1600))
+        furmark_exe = resolve_furmark_exe(self.furmark_exe)
+        prime_exe = resolve_prime95_exe(self.prime_exe)
+
+        if furmark_exe:
+            self.furmark_exe = furmark_exe
+
+        if prime_exe:
+            self.prime_exe = prime_exe
 
         return {
             "case_name": self.case_edit.text().strip(),
             "warmup_total_sec": warm,
             "log_total_sec": logsec,
-            "hwinfo_csv": self.hwinfo_edit.text().strip(),
+            "hwinfo_csv": hwinfo_csv,
+            "hwinfo_exe": hwinfo_exe,
             "fur_demo": fur_demo,
             "fur_demo_display": demo_display,
             "fur_width": fur_w,
             "fur_height": fur_h,
             "fur_res_display": res_display,
-            "furmark_exe": self.furmark_exe,
-            "prime_exe": self.prime_exe,
+            "furmark_exe": furmark_exe,
+            "prime_exe": prime_exe,
             "ntfy_topic": self.ntfy_topic,
             "stress_cpu": bool(getattr(self.sensors, "stress_cpu", True)),
             "stress_gpu": bool(getattr(self.sensors, "stress_gpu", True)),
@@ -3001,24 +5045,40 @@ class MainWindow(QWidget):
         """Load settings from JSON file."""
         data = load_json(self.settings_path)
         if not data:
+            # Fresh install — show help automatically once the window is visible.
+            QTimer.singleShot(200, self.open_help)
             return
+
+        # Show help whenever the installed version is newer than what the
+        # settings were last saved with.  This catches the case where old
+        # settings survive an uninstall/reinstall (settings.json lives in
+        # %LOCALAPPDATA% and is intentionally not removed by the uninstaller).
+        last_seen = str(data.get("last_seen_version") or "").strip()
+        if last_seen != __version__:
+            QTimer.singleShot(200, self.open_help)
 
         self._apply_saved_window_state(data)
 
         self.case_edit.setText(str(data.get("case_name", self.case_edit.text())))
-        self.hwinfo_edit.setText(str(data.get("hwinfo_csv", self.hwinfo_edit.text())))
+        self.hwinfo_csv = resolve_hwinfo_csv()
+        self.hwinfo_edit.setText(self.hwinfo_csv)
 
         self.warmup_min.setValue(int(data.get("warmup_min", self.warmup_min.value())))
         self.warmup_sec.setValue(int(data.get("warmup_sec", self.warmup_sec.value())))
         self.log_min.setValue(int(data.get("log_min", self.log_min.value())))
         self.log_sec.setValue(int(data.get("log_sec", self.log_sec.value())))
 
-        self.furmark_exe = str(data.get("furmark_exe", self.furmark_exe or "")).strip()
-        self.prime_exe = str(data.get("prime_exe", self.prime_exe or "")).strip()
+        saved_furmark = str(data.get("furmark_exe", "")).strip()
+        saved_prime = str(data.get("prime_exe", "")).strip()
+        saved_hwinfo = ""
+
+        self.furmark_exe = resolve_furmark_exe(saved_furmark)
+        self.prime_exe = resolve_prime95_exe(saved_prime)
+        self.hwinfo_exe = resolve_hwinfo_exe("")
 
         self.ntfy_topic = str(data.get("ntfy_topic", self.ntfy_topic or "")).strip()
 
-        self.theme_mode = str(data.get("theme", self.theme_mode or "dark")).strip().lower() or "dark"
+        self.theme_mode = str(data.get("theme", self.theme_mode or "device")).strip().lower() or "device"
 
         try:
             style_combobox_popup(self.fur_demo_combo, self.theme_mode)
@@ -3032,6 +5092,8 @@ class MainWindow(QWidget):
             self._apply_results_tree_theme()
             self._apply_output_toggle_theme()
             self._refresh_left_rail_icons()
+            self._refresh_month_nav_icons()
+            self._refresh_compare_delegate_theme()
         except Exception:
             pass
 
@@ -3113,7 +5175,7 @@ class MainWindow(QWidget):
         """Save settings to JSON file."""
         payload = {
             "case_name": self.case_edit.text().strip(),
-            "hwinfo_csv": self.hwinfo_edit.text().strip(),
+            "hwinfo_csv": resolve_hwinfo_csv(),
             "warmup_min": int(self.warmup_min.value()),
             "warmup_sec": int(self.warmup_sec.value()),
             "log_min": int(self.log_min.value()),
@@ -3125,8 +5187,10 @@ class MainWindow(QWidget):
             "stress_gpu": bool(self.sensors.stress_gpu),
             "furmark_exe": self.furmark_exe,
             "prime_exe": self.prime_exe,
+            "hwinfo_exe": resolve_hwinfo_exe(""),
             "ntfy_topic": self.ntfy_topic,
             "theme": self.theme_mode,
+            "last_seen_version": __version__,
         }
         payload.update(self._current_window_settings())
         save_json(self.settings_path, payload)
@@ -3145,8 +5209,8 @@ class MainWindow(QWidget):
         if dlg.exec() != QDialog.Accepted:
             return
 
-        self.furmark_exe = dlg.furmark_exe()
-        self.prime_exe = dlg.prime_exe()
+        self.furmark_exe = resolve_furmark_exe(dlg.furmark_exe())
+        self.prime_exe = resolve_prime95_exe(dlg.prime_exe())
         try:
             self.ntfy_topic = dlg.ntfy_topic()
         except Exception:
@@ -3167,14 +5231,30 @@ class MainWindow(QWidget):
             self._apply_results_tree_theme()
             self._apply_output_toggle_theme()
             self._refresh_left_rail_icons()
+            self._refresh_month_nav_icons()
             self._sync_furmark_gpu_controls()
+            self._refresh_compare_delegate_theme()
+
+        self.hwinfo_exe = resolve_hwinfo_exe("")
+        self.hwinfo_csv = resolve_hwinfo_csv()
+        try:
+            self.hwinfo_edit.setText(self.hwinfo_csv)
+        except Exception:
+            pass
 
         self.save_settings()
 
     def open_help(self) -> None:
-        """Open help/instructions dialog."""
-        dlg = HelpDialog(self, theme_mode=self.theme_mode)
-        dlg.exec()
+        """Toggle the help side panel."""
+        if self._help_panel.isVisible():
+            self._help_panel.hide()
+            return
+        self._help_panel.set_theme_mode(self.theme_mode)
+        self._help_panel.setVisible(True)
+        # Allocate the panel its default width; stack gets the rest
+        total = self._content_splitter.width()
+        panel_w = HelpPanel.PANEL_WIDTH
+        self._content_splitter.setSizes([max(0, total - panel_w), panel_w])
 
     def closeEvent(self, event):
         """Handle window close event."""
@@ -3246,6 +5326,15 @@ class MainWindow(QWidget):
 
     def _on_run_finished(self, result: dict | None = None) -> None:
         try:
+            self._invalidate_month_picker_stats_cache()
+            self._refresh_results_month_nav()
+        except Exception:
+            pass
+        try:
+            self._remember_finished_result(result)
+        except Exception:
+            pass
+        try:
             try:
                 self._live_monitor.stop()
                 self._live_graph.stop()
@@ -3262,6 +5351,12 @@ class MainWindow(QWidget):
                 self._show_console_output()
             if self._output_btn_console is not None:
                 self._output_btn_console.setChecked(True)
+
+            try:
+                if self._stack is not None and self._stack.currentIndex() == getattr(self, "_page_results_index", -1):
+                    QTimer.singleShot(150, self._focus_latest_finished_result)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -3438,17 +5533,59 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
-    def pick_hwinfo(self):
-        """Open file dialog to select HWiNFO CSV."""
-        path, _ = QFileDialog.getOpenFileName(self, "Select hwinfo.csv", str(Path.cwd()), "CSV Files (*.csv)")
-        if path:
-            self.hwinfo_edit.setText(path)
-            self.save_settings()
-            self.sensors.refresh_csv_status()
+    def open_hwinfo(self):
+        """Open bundled HWiNFO and keep ThermalBench locked to tools/HWiNFO/hwinfo.csv."""
+        try:
+            self.hwinfo_csv = resolve_hwinfo_csv()
+            self.hwinfo_exe = resolve_hwinfo_exe("")
+
+            try:
+                self.hwinfo_edit.setText(self.hwinfo_csv)
+            except Exception:
+                pass
+
+            if not self.hwinfo_exe:
+                QMessageBox.critical(
+                    self,
+                    "HWiNFO not found",
+                    "Bundled HWiNFO was not found.\n\nExpected one of:\n"
+                    f"{hwinfo_dir() / 'HWiNFO64.exe'}\n"
+                    f"{hwinfo_dir() / 'HWiNFO.exe'}",
+                )
+                return
+
+            launched = launch_hwinfo(self.hwinfo_exe)
+            if not launched:
+                QMessageBox.critical(
+                    self,
+                    "HWiNFO not found",
+                    "Could not launch bundled HWiNFO.",
+                )
+                return
+
+            self.append("Opened HWiNFO.")
+            self.append(f"Set HWiNFO sensor logging CSV to: {self.hwinfo_csv}")
+
+            try:
+                self.sensors.refresh_csv_status()
+            except Exception:
+                pass
+
+            self._update_run_button_state()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Open HWiNFO failed", str(e))
+
+    def _copy_hwinfo_folder_path(self):
+        try:
+            folder = str(Path(self.hwinfo_csv).parent)
+            QApplication.clipboard().setText(folder)
+            self.copy_hwinfo_path_btn.setText("Copied!")
+            QTimer.singleShot(2000, lambda: self.copy_hwinfo_path_btn.setText("Copy Path"))
+        except Exception as e:
+            QMessageBox.critical(self, "Copy failed", str(e))
 
     def _toggle_tree_item(self, index):
-        """Toggle expand/collapse state of tree item on single click."""
-        # Ignore right-click: it should open context menu only.
         try:
             btn = self._runs_tree.property("_tb_last_button")
             if btn is not None and int(btn) == int(Qt.RightButton):
@@ -3457,44 +5594,21 @@ class MainWindow(QWidget):
             pass
 
         try:
-            # Special-case: top-level case folders under runs root.
-            # Clicking a case folder should expand it (so the newest run we auto-select is visible)
-            # but should not collapse it on the same click.
-            if index is not None and (not hasattr(index, "isValid") or index.isValid()):
-                try:
-                    root_idx = self._runs_tree.rootIndex()
-                except Exception:
-                    root_idx = None
+            if index is None or (hasattr(index, "isValid") and not index.isValid()):
+                return
 
-                try:
-                    parent = index.parent()
-                except Exception:
-                    parent = None
+            # Make full-row click also update current index immediately.
+            try:
+                self._runs_tree.setCurrentIndex(index)
+            except Exception:
+                pass
 
-                is_case_top = False
-                try:
-                    if root_idx is not None and parent is not None:
-                        is_case_top = (
-                            parent.isValid()
-                            and root_idx.isValid()
-                            and parent == root_idx
-                        )
-                except Exception:
-                    is_case_top = False
-
-                if is_case_top:
-                    try:
-                        self._runs_tree.expand(index)
-                    except Exception:
-                        pass
-                    return
+            if self._runs_tree.isExpanded(index):
+                self._runs_tree.collapse(index)
+            else:
+                self._runs_tree.expand(index)
         except Exception:
             pass
-
-        if self._runs_tree.isExpanded(index):
-            self._runs_tree.collapse(index)
-        else:
-            self._runs_tree.expand(index)
 
     def eventFilter(self, obj, event):
         """Track mouse button used in the results tree.
@@ -3503,30 +5617,67 @@ class MainWindow(QWidget):
         (auto-expand/select/preview).
         """
         try:
+            if obj is getattr(self, "hwinfo_edit", None) and event.type() == QEvent.Resize:
+                btn = getattr(self, "copy_hwinfo_path_btn", None)
+                if btn is not None:
+                    bh = obj.height() - 10
+                    bw = btn.sizeHint().width()
+                    btn.setGeometry(obj.width() - bw - 5, 5, bw, bh)
+        except Exception:
+            pass
+        try:
             if self._handle_shift_wheel_horizontal_scroll(obj, event):
                 return True
 
             if event is not None and event.type() == QEvent.MouseButtonPress:
                 click_target = self._case_name_click_target(obj, event)
+
                 if self._case_name_popup.isVisible() and not self._is_case_name_popup_target(click_target):
                     self._dismiss_case_name_suggestions()
+
+                try:
+                    if bool(getattr(self, "_month_picker_overlay_visible", False)):
+                        month_label_btn = getattr(self, "_runs_month_label", None)
+                        if click_target is not month_label_btn and not self._is_month_picker_overlay_target(click_target):
+                            self._hide_month_picker_overlay()
+                except Exception:
+                    pass
 
             if obj is getattr(self, "case_edit", None):
                 if event is not None and event.type() in (QEvent.FocusIn, QEvent.MouseButtonPress):
                     QTimer.singleShot(0, lambda: self._show_case_name_suggestions(force=True))
 
-            if getattr(self, "_runs_tree", None) is not None and obj is self._runs_tree.viewport():
+            tree_for_tooltip = None
+            try:
+                all_trees = []
+                if getattr(self, "_runs_tree", None) is not None:
+                    all_trees.append(self._runs_tree)
+                all_trees.extend(list(getattr(self, "_search_section_trees", []) or []))
+
+                for candidate in all_trees:
+                    try:
+                        if candidate is not None and obj is candidate.viewport():
+                            tree_for_tooltip = candidate
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                tree_for_tooltip = None
+
+            if tree_for_tooltip is not None:
                 if event is not None and event.type() == QEvent.ToolTip:
                     try:
                         pos = event.position().toPoint()
                     except Exception:
                         pos = event.pos()
-                    payload = self._runs_tree_tooltip_payload_at(pos)
+
+                    payload = self._runs_tree_tooltip_payload_at(tree_for_tooltip, pos)
                     text = str((payload or {}).get("text") or "")
                     if text:
-                        idx = self._runs_tree.indexAt(pos)
-                        rect = self._runs_tree.visualRect(idx)
+                        idx = tree_for_tooltip.indexAt(pos)
+                        rect = tree_for_tooltip.visualRect(idx)
                         self._show_runs_tree_tooltip(
+                            tree_for_tooltip,
                             text,
                             viewport_pos=pos,
                             item_rect=rect,
@@ -3534,6 +5685,7 @@ class MainWindow(QWidget):
                         )
                     else:
                         self._hide_runs_tree_tooltip()
+
                     try:
                         event.accept()
                     except Exception:
@@ -3545,7 +5697,7 @@ class MainWindow(QWidget):
 
                 if event is not None and event.type() == QEvent.MouseButtonPress:
                     try:
-                        self._runs_tree.setProperty("_tb_last_button", int(event.button()))
+                        tree_for_tooltip.setProperty("_tb_last_button", int(event.button()))
                     except Exception:
                         pass
         except Exception:
@@ -3553,17 +5705,33 @@ class MainWindow(QWidget):
 
         return super().eventFilter(obj, event)
 
-    def _runs_tree_index_to_path(self, idx) -> str:
+    def _runs_tree_index_to_path(self, idx, tree: QTreeView | None = None) -> str:
         try:
             if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
                 return ""
-            # Tree model can be proxy; always map to QFileSystemModel for the file path.
-            if getattr(self, "_runs_proxy", None) is not None and hasattr(self._runs_proxy, "mapToSource"):
-                src = self._runs_proxy.mapToSource(idx)
-                return self._runs_model.filePath(src)
-            return self._runs_model.filePath(idx)
+
+            use_tree = tree
+            if use_tree is None:
+                use_tree = getattr(self, "_runs_tree", None)
+            if use_tree is None:
+                return ""
+
+            model = use_tree.model()
+            if model is None:
+                return ""
+
+            if hasattr(model, "mapToSource"):
+                src = model.mapToSource(idx)
+                source_model = model.sourceModel() if hasattr(model, "sourceModel") else None
+                if source_model is not None and hasattr(source_model, "filePath"):
+                    return str(source_model.filePath(src) or "")
+
+            if hasattr(model, "filePath"):
+                return str(model.filePath(idx) or "")
         except Exception:
             return ""
+
+        return ""
 
     def _is_case_folder(self, p: Path) -> bool:
         try:
@@ -3834,8 +6002,8 @@ class MainWindow(QWidget):
                 # Re-select renamed folder (best-effort; model updates async).
                 def _reselect():
                     try:
-                        src_idx = self._runs_model.index(str(dest))
-                        if not src_idx.isValid():
+                        src_idx = self._runs_source_model.index_for_path(str(dest))
+                        if src_idx is None or not src_idx.isValid():
                             return
                         view_idx = self._runs_proxy.mapFromSource(src_idx) if self._runs_proxy is not None else src_idx
                         if view_idx is None or (hasattr(view_idx, "isValid") and not view_idx.isValid()):
@@ -3882,6 +6050,16 @@ class MainWindow(QWidget):
             pass
 
     def _on_results_splitter_moved(self, *_args) -> None:
+        try:
+            if bool(getattr(self, "_month_picker_overlay_visible", False)):
+                QTimer.singleShot(0, lambda: (
+                    self._update_month_picker_overlay_geometry(),
+                    self._rebuild_month_picker_overlay(),
+                    self._update_month_picker_overlay_geometry(),
+                    self._hide_month_picker_horizontal_scrollbar()
+                ))
+        except Exception:
+            pass
         try:
             sp = getattr(self, "_results_split", None)
             if sp is None:
@@ -3981,6 +6159,16 @@ class MainWindow(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         try:
+            if bool(getattr(self, "_month_picker_overlay_visible", False)):
+                QTimer.singleShot(0, lambda: (
+                    self._update_month_picker_overlay_geometry(),
+                    self._rebuild_month_picker_overlay(),
+                    self._update_month_picker_overlay_geometry(),
+                    self._hide_month_picker_horizontal_scrollbar()
+                ))
+        except Exception:
+            pass
+        try:
             # only enforce while Live output is shown
             if self._output_stack is not None and self._output_stack.currentIndex() == 0:
                 QTimer.singleShot(0, self._apply_live_split_ratio)
@@ -4045,9 +6233,20 @@ class MainWindow(QWidget):
 
             x = ctypes.c_short(int(msg.lParam) & 0xFFFF).value
             y = ctypes.c_short((int(msg.lParam) >> 16) & 0xFFFF).value
+
+            # WM_NCHITTEST lParam is in physical screen pixels.
+            # QWidget.frameGeometry() returns logical (device-independent) pixels.
+            # Divide by DPR to bring physical coords into logical space.
+            try:
+                dpr = float(self.devicePixelRatio()) or 1.0
+            except Exception:
+                dpr = 1.0
+            x_log = x / dpr
+            y_log = y / dpr
+
             frame = self.frameGeometry()
-            local_x = int(x - frame.left())
-            local_y = int(y - frame.top())
+            local_x = x_log - frame.left()
+            local_y = y_log - frame.top()
             width = int(frame.width())
             height = int(frame.height())
 

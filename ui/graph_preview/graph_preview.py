@@ -243,15 +243,29 @@ class GraphPreview(QObject):
 
         # matplotlib
         try:
-            self._preview_fig = Figure(figsize=(5, 3))
-            self._preview_left_margin_px_base = 56
-            self._preview_left_tick_pad_px = 3
+            # Use the screen's device pixel ratio to scale the figure DPI so that
+            # matplotlib text (which is sized in points at fig.dpi) appears at the
+            # same logical/visual size regardless of Windows display scaling.
+            try:
+                _app = QApplication.instance()
+                _init_dpr = float(_app.devicePixelRatioF()) if _app is not None else 1.0
+            except Exception:
+                _init_dpr = 1.0
+            if _init_dpr <= 0.0:
+                _init_dpr = 1.0
+            _fig_dpi = max(72, min(300, round(100.0 * _init_dpr)))
+
+            self._preview_fig = Figure(figsize=(5, 3), dpi=_fig_dpi)
+            # Physical-pixel constants: scale with DPR so logical visual size stays
+            # consistent at any Windows scaling level.
+            self._preview_left_margin_px_base = round(56 * _init_dpr)
+            self._preview_left_tick_pad_px = round(3 * _init_dpr)
             self._preview_right_frac = 0.995
-            self._preview_right_pad_px = 18
+            self._preview_right_pad_px = round(18 * _init_dpr)
             self._preview_top_frac = 0.93
             self._preview_bottom_frac = 0.05
-            self._preview_top_pad_px = 30
-            self._preview_bottom_pad_px = 16
+            self._preview_top_pad_px = round(30 * _init_dpr)
+            self._preview_bottom_pad_px = round(16 * _init_dpr)
             self._preview_stack_hspace = 0.20
             self._preview_title_axes_y = 1.02
             self._preview_title_font_size = 11
@@ -348,9 +362,16 @@ class GraphPreview(QObject):
                     y = ev.pos().y()
                     self._qt_last_mouse_xy = (int(x), int(y))
 
-                    h = self._preview_canvas.height()
-                    display_x = x
-                    display_y = h - y
+                    # Qt logical -> matplotlib display (physical) coords:
+                    # multiply by dpr to match the physical pixel space that
+                    # ax.bbox and transData use.
+                    try:
+                        _dpr_mm = float(self._preview_canvas.devicePixelRatioF() or 1.0)
+                    except Exception:
+                        _dpr_mm = 1.0
+                    h_log = self._preview_canvas.height()
+                    display_x = x * _dpr_mm
+                    display_y = (h_log - y) * _dpr_mm
 
                     try:
                         data_xy = self._preview_ax.transData.inverted().transform((display_x, display_y))
@@ -358,7 +379,7 @@ class GraphPreview(QObject):
                         self._on_preview_hover_xy(xdata, ydata)
                     except Exception:
                         try:
-                            me = MPLMouseEvent("motion_notify_event", self._preview_canvas, x, display_y)
+                            me = MPLMouseEvent("motion_notify_event", self._preview_canvas, x * _dpr_mm, display_y)
                             self._on_preview_hover(me)
                         except Exception:
                             pass
@@ -391,7 +412,7 @@ class GraphPreview(QObject):
 
             self._preview_canvas.hide()
 
-            self._preview_timeline_fig = Figure(figsize=(5, 0.45))
+            self._preview_timeline_fig = Figure(figsize=(5, 0.45), dpi=_fig_dpi)
             self._preview_timeline_canvas = FigureCanvas(self._preview_timeline_fig)
             self._preview_timeline_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             self._preview_timeline_canvas.setFixedHeight(64)
@@ -2999,36 +3020,50 @@ class GraphPreview(QObject):
             w = int(tt.width())
             h = int(tt.height())
 
-            # Axis bbox in display coords (origin bottom-left). Convert to Qt coords.
+            # Matplotlib display coordinates are physical pixels (the canvas is rendered at
+            # dpi * devicePixelRatioF resolution). Qt widget coordinates are logical pixels.
+            # Dividing matplotlib display coords by dpr converts them to Qt logical px.
+            try:
+                dpr = float(self._preview_canvas.devicePixelRatioF() or 1.0)
+            except Exception:
+                dpr = 1.0
+            if dpr <= 0.0:
+                dpr = 1.0
+
+            canvas_h_log = float(self._preview_canvas.height())   # Qt logical px
+            canvas_h_phys = canvas_h_log * dpr                     # matplotlib display px
+
+            # Axis bbox in display coords (physical px, origin bottom-left).
+            # Convert to Qt logical coords (origin top-left).
             bb = ax.bbox
-            canvas_h = int(self._preview_canvas.height())
-            ax_left = float(bb.x0)
-            ax_right = float(bb.x1)
-            ax_top = float(canvas_h - bb.y1)
-            ax_bottom = float(canvas_h - bb.y0)
+            ax_left   = float(bb.x0) / dpr
+            ax_right  = float(bb.x1) / dpr
+            ax_top    = (canvas_h_phys - float(bb.y1)) / dpr
+            ax_bottom = (canvas_h_phys - float(bb.y0)) / dpr
 
             margin = float(getattr(self, "_preview_tt_margin_px", 4) or 4)
 
-            # Anchor in display coords -> Qt coords
+            # Anchor: convert matplotlib display (physical px) -> Qt logical coords
             try:
                 cx, cy = ax.transData.transform((float(xdata), float(ydata)))
+                qt_anchor_x = float(cx) / dpr
+                qt_anchor_y = (canvas_h_phys - float(cy)) / dpr
             except Exception:
-                # fallback to last mouse position if available
+                # fallback to last mouse position if available (already in Qt logical px)
                 if self._qt_last_mouse_xy is not None:
-                    cx = float(self._qt_last_mouse_xy[0])
-                    cy = float(canvas_h - self._qt_last_mouse_xy[1])
+                    qt_anchor_x = float(self._qt_last_mouse_xy[0])
+                    qt_anchor_y = float(canvas_h_log - self._qt_last_mouse_xy[1])
                 else:
-                    cx = 0.5 * (ax_left + ax_right)
-                    cy = 0.5 * (bb.y0 + bb.y1)  # display
-            qt_anchor_x = float(cx)
-            qt_anchor_y = float(canvas_h - cy)
+                    qt_anchor_x = 0.5 * (ax_left + ax_right)
+                    qt_anchor_y = 0.5 * (ax_top + ax_bottom)
 
-            # Convert offset points -> px
+            # Convert offset points -> Qt logical px
+            # (1 pt = dpi/72 matplotlib physical px; divide by dpr for Qt logical px)
             fig = getattr(self, "_preview_fig", None)
             dpi = float(getattr(fig, "dpi", 100) or 100) if fig is not None else 100.0
 
             def pt_to_px(v):
-                return float(v) * dpi / 72.0
+                return float(v) * dpi / 72.0 / dpr
 
             ur = getattr(self, "_preview_tt_default_xybox", (10, 10))
             dr = getattr(self, "_preview_tt_flipped_xybox", (10, -10))
@@ -3987,12 +4022,22 @@ class GraphPreview(QObject):
                     except Exception:
                         self._ls_btn_bbox = None
 
+                    # Scale pixel gaps by device pixel ratio so buttons stay consistently
+                    # spaced on high-DPI / scaled displays (matplotlib display coords are
+                    # physical pixels, so logical gaps must be multiplied by dpr).
+                    try:
+                        _dpr = float(self._preview_canvas.devicePixelRatioF() or 1.0)
+                    except Exception:
+                        _dpr = 1.0
+                    if _dpr <= 0.0:
+                        _dpr = 1.0
+
                     # Delta toggle bbox + positioning (left of Legend & stats)
                     try:
                         if self._delta_btn_text is not None:
                             # If we have the LS bbox, position the delta button by pixel offset.
                             if self._ls_btn_bbox is not None:
-                                gap_px = 14.0
+                                gap_px = 14.0 * _dpr
                                 desired_right_x = float(self._ls_btn_bbox.x0) - float(gap_px)
 
                                 ax_btn = getattr(self._delta_btn_text, "axes", None)
@@ -4017,7 +4062,7 @@ class GraphPreview(QObject):
                             self._delta_btn_bbox = self._delta_btn_text.get_window_extent(renderer)
                             try:
                                 if self._ls_btn_bbox is not None and self._delta_btn_bbox is not None:
-                                    max_right = float(self._ls_btn_bbox.x0) - 10.0
+                                    max_right = float(self._ls_btn_bbox.x0) - 10.0 * _dpr
                                     if float(self._delta_btn_bbox.x1) > max_right:
                                         # shift left by overlap in display coords
                                         shift = float(self._delta_btn_bbox.x1) - max_right
@@ -4039,7 +4084,7 @@ class GraphPreview(QObject):
                     try:
                         if self._zero_btn_text is not None:
                             if self._delta_btn_bbox is not None:
-                                gap_px = 18.0
+                                gap_px = 18.0 * _dpr
                                 desired_right_x = float(self._delta_btn_bbox.x0) - float(gap_px)
 
                                 ax_btn = getattr(self._zero_btn_text, "axes", None)
@@ -4063,7 +4108,7 @@ class GraphPreview(QObject):
                             self._zero_btn_bbox = self._zero_btn_text.get_window_extent(renderer)
                             try:
                                 if self._delta_btn_bbox is not None and self._zero_btn_bbox is not None:
-                                    max_right = float(self._delta_btn_bbox.x0) - 14.0
+                                    max_right = float(self._delta_btn_bbox.x0) - 14.0 * _dpr
                                     if float(self._zero_btn_bbox.x1) > max_right:
                                         shift = float(self._zero_btn_bbox.x1) - max_right
                                         ax_btn = getattr(self._zero_btn_text, "axes", None) or (self._single_axes or [None])[0] or self._preview_ax
@@ -7529,9 +7574,16 @@ class GraphPreview(QObject):
                 y = ev.pos().y()
                 self._qt_last_mouse_xy = (int(x), int(y))
 
-                h = self._preview_canvas.height()
-                display_x = x
-                display_y = h - y
+                # Qt logical -> matplotlib display (physical) coords:
+                # multiply by dpr to match the physical pixel space that
+                # ax.bbox and transData use.
+                try:
+                    _dpr_cm = float(self._preview_canvas.devicePixelRatioF() or 1.0)
+                except Exception:
+                    _dpr_cm = 1.0
+                h_log = self._preview_canvas.height()
+                display_x = x * _dpr_cm
+                display_y = (h_log - y) * _dpr_cm
 
                 # Find which axis is under cursor
                 hit_ax = None
@@ -8335,9 +8387,16 @@ class GraphPreview(QObject):
                 except Exception:
                     return
 
-                h = self._preview_canvas.height()
-                display_x = x
-                display_y = h - y
+                # Qt logical -> matplotlib display (physical) coords:
+                # multiply by dpr to match the physical pixel space that
+                # ax.bbox and transData use.
+                try:
+                    _dpr_sm = float(self._preview_canvas.devicePixelRatioF() or 1.0)
+                except Exception:
+                    _dpr_sm = 1.0
+                h_log = self._preview_canvas.height()
+                display_x = x * _dpr_sm
+                display_y = (h_log - y) * _dpr_sm
 
                 # Find which axis is under the cursor
                 hit_ax = None

@@ -1,5 +1,6 @@
 import json
 import ctypes
+import struct as _struct
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,7 @@ def _cstr(b: bytes) -> str:
     raw = b.split(b"\x00", 1)[0]
     if not raw:
         return ""
-    for enc in ("utf-8", "cp1252", "latin-1"):
+    for enc in ("utf-8", "cp950", "cp1252", "latin-1"):
         try:
             return raw.decode(enc)
         except Exception:
@@ -165,8 +166,20 @@ def _open_sm2_mapping():
 
 def _read_entries_v2(base_ptr: int) -> list[tuple[str, str]]:
     """
-    Dynamic reader using SM2 'V2' header layout:
-    uses header-provided offsets + element sizes (works when elements are 392/460 etc).
+    Dynamic reader using SM2 'V2' header layout.
+
+    Handles both the classic 128-byte string layout and the newer 256-byte string
+    layout (introduced in newer HWiNFO releases) by inferring the string-field
+    width from the element sizes reported in the header.
+
+    Fixed reading-element prefix (regardless of string size):
+      tReading       4 bytes  @ 0
+      dwSensorIndex  4 bytes  @ 4
+      dwReadingID    4 bytes  @ 8
+      szLabelOrig    str_len  @ 12
+      szLabelUser    str_len  @ 12 + str_len
+      szUnit         16 bytes @ 12 + 2*str_len
+      (Value etc. follow but are not needed here)
     """
     hdr = _SM2HeaderV2.from_address(base_ptr)
 
@@ -185,32 +198,47 @@ def _read_entries_v2(base_ptr: int) -> list[tuple[str, str]]:
     read_sz = int(hdr.dwSizeOfReadingElement)
     read_n = int(hdr.dwNumReadingElements)
 
-    # sanity: element sizes must at least fit our prefix structs
-    if sensor_sz < ctypes.sizeof(_SM2SensorPrefix):
-        raise RuntimeError(f"SM2 sensor element too small: {sensor_sz}")
-    if read_sz < ctypes.sizeof(_SM2ReadingPrefix):
-        raise RuntimeError(f"SM2 reading element too small: {read_sz}")
+    # Infer string field width from element size.
+    # With str_len=128: min sensor elem = 8+128+128 = 264, min reading elem = 12+128+128+16+32 = 316
+    # With str_len=256: min sensor elem = 8+256+256 = 520, min reading elem = 12+256+256+16+32 = 572
+    sensor_str_len = 256 if sensor_sz >= 520 else 128
+    read_str_len   = 256 if read_sz   >= 572 else 128
+
+    min_sensor_prefix = 8 + 2 * sensor_str_len
+    min_read_prefix   = 12 + 2 * read_str_len + 16
+
+    if sensor_sz < min_sensor_prefix:
+        raise RuntimeError(f"SM2 sensor element too small: {sensor_sz} (expected >= {min_sensor_prefix})")
+    if read_sz < min_read_prefix:
+        raise RuntimeError(f"SM2 reading element too small: {read_sz} (expected >= {min_read_prefix})")
 
     # Sensors (group titles)
     sensors: list[str] = []
     for i in range(sensor_n):
         addr = base_ptr + sensor_off + i * sensor_sz
-        s = _SM2SensorPrefix.from_address(addr)
-        name = _cstr(bytes(s.szSensorNameUser)) or _cstr(bytes(s.szSensorNameOrig))
-        sensors.append(name or f"Sensor {i}")
+        # dwSensorID(4) + dwSensorInst(4) = 8 bytes, then two name strings
+        raw = (ctypes.c_char * (8 + 2 * sensor_str_len)).from_address(addr)
+        b = bytes(raw)
+        name_orig = _cstr(b[8 : 8 + sensor_str_len])
+        name_user = _cstr(b[8 + sensor_str_len : 8 + 2 * sensor_str_len])
+        sensors.append(name_user or name_orig or f"Sensor {i}")
 
     # Readings (label -> group)
     out: list[tuple[str, str]] = []
     for i in range(read_n):
         addr = base_ptr + read_off + i * read_sz
-        r = _SM2ReadingPrefix.from_address(addr)
+        raw = (ctypes.c_char * (12 + 2 * read_str_len + 16)).from_address(addr)
+        b = bytes(raw)
 
-        si = int(r.dwSensorIndex)
+        # tReading, dwSensorIndex, dwReadingID are the first 3 uint32s
+        _, si, _ = _struct.unpack_from("<III", b, 0)
         group = sensors[si] if 0 <= si < len(sensors) else "Other"
 
-        rname = _cstr(bytes(r.szLabelUser)) or _cstr(bytes(r.szLabelOrig))
-        unit = _cstr(bytes(r.szUnit)).strip()
+        label_orig = _cstr(b[12                   : 12 + read_str_len])
+        label_user = _cstr(b[12 + read_str_len     : 12 + 2 * read_str_len])
+        unit       = _cstr(b[12 + 2 * read_str_len : 12 + 2 * read_str_len + 16]).strip()
 
+        rname = label_user or label_orig
         if not rname:
             continue
 

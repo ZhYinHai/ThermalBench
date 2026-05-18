@@ -8,6 +8,7 @@ from typing import Optional, Callable
 from PySide6.QtCore import QTimer, Qt, QEvent, QMimeData
 from PySide6.QtGui import QPixmap, QIcon, QFontMetrics, QFont
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QVBoxLayout,
     QHBoxLayout,
@@ -600,7 +601,13 @@ class LegendStatsPopup(QDialog):
             
             col_count = len(headers)
 
-            # Gather all rows in display order (including group headers)
+            # Gather all rows in display order (including group headers).
+            # A group-header row is held in a "pending" buffer and only written
+            # once at least one checked sensor follows it, so fully-unchecked
+            # groups don't produce an orphaned header in the exported table.
+            pending_group_text: str | None = None
+            pending_group_html: str | None = None
+
             for i in range(self.tree.topLevelItemCount()):
                 item = self.tree.topLevelItem(i)
                 if item is None:
@@ -615,19 +622,33 @@ class LegendStatsPopup(QDialog):
                 if is_group_header:
                     group_name = (item.text(0) or "").strip()
                     if not group_name:
+                        pending_group_text = None
+                        pending_group_html = None
                         continue
 
-                    # Plain text: put the group name in the first column, blanks after.
-                    text_lines.append("\t".join([group_name] + [""] * (col_count - 1)))
-
-                    # HTML: a full-width row spanning all columns.
-                    html_parts.append(
+                    # Buffer — don't write yet.
+                    pending_group_text = "\t".join([group_name] + [""] * (col_count - 1))
+                    pending_group_html = (
                         f"<tr><td colspan=\"{col_count}\" style=\"padding:2px 8px;white-space:nowrap;"
                         f"background-color:#f3f3f3;border:1px solid black;line-height:0.9;font-size:9pt;"
                         f"font-weight:bold;\">{group_name}</td></tr>"
                     )
                     continue
-                
+
+                # Skip unchecked (hidden) sensors.
+                try:
+                    if item.checkState(0) != Qt.Checked:
+                        continue
+                except Exception:
+                    pass
+
+                # Flush the buffered group header before the first checked sensor.
+                if pending_group_text is not None:
+                    text_lines.append(pending_group_text)
+                    html_parts.append(pending_group_html)
+                    pending_group_text = None
+                    pending_group_html = None
+
                 # Get sensor name
                 sensor_name = str(item.data(0, Qt.UserRole) or item.text(0) or "").strip()
                 if not sensor_name:
@@ -695,8 +716,15 @@ class LegendStatsPopup(QDialog):
     # ---------- helpers ----------
     def _make_color_icon(self, hex_color: str) -> QIcon:
         try:
-            pix = QPixmap(10, 10)
+            try:
+                app = QApplication.instance()
+                dpr = float(app.devicePixelRatio()) if app is not None else 1.0
+            except Exception:
+                dpr = 1.0
+            phys = max(1, round(10 * dpr))
+            pix = QPixmap(phys, phys)
             pix.fill(hex_color)
+            pix.setDevicePixelRatio(dpr)
             return QIcon(pix)
         except Exception:
             return QIcon()

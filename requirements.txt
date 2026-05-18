@@ -1,9 +1,12 @@
 PySide6
 pandas
+numpy
 matplotlib
+pytz
+tzdata
 psutil
 pyinstaller
 requests
 packaging
-requests
 temper_windows
+pywinusb

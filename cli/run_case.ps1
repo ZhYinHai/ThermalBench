@@ -9,17 +9,17 @@ param(
   [switch]$StressGPU,
 
   # HWiNFO continuous log (must already be running)
-  [string]$HwinfoCsv = "C:\TempTesting\hwinfo.csv",
+  [string]$HwinfoCsv = "",
 
+  # Results root
+  [string]$RunsRoot = "",
   # Ambient sensor logging (TEMPer USB dongle)
   [switch]$EnableAmbient = $true,
   [int]$AmbientIntervalMs = 1000,
 
   # tools
-  # [string]$FurMarkExe = "C:\Program Files\Geeks3D\FurMark2_x64\furmark.exe",
-  # [string]$PrimeExe   = "C:\Users\Intel Testbench\Downloads\Prime_95_v30.3build6\prime95.exe",
-  [string]$FurMarkExe = "C:\Users\Dennis\Downloads\FurMark_2.10.2_win64\FurMark_win64\furmark.exe",
-  [string]$PrimeExe   = "C:\Users\Dennis\Downloads\p95v3019b20.win64\prime95.exe",
+  [string]$FurMarkExe = "",
+  [string]$PrimeExe   = "",
 
 
   # FurMark settings
@@ -36,7 +36,7 @@ param(
   [string]$AbortFlag = (Join-Path $env:TEMP "temptesting_abort.flag"),
 
   # after run: try to clear master log (may fail if file locked - ok)
-  [switch]$ClearHwinfoAfter = $true,
+  [switch]$ClearHwinfoAfter = $false,
 
   # after run: try to clear ambient log (temp file) (best-effort)
   [switch]$ClearAmbientAfter = $true,
@@ -49,8 +49,56 @@ function Assert-File($p, $label) {
   if (-not (Test-Path $p)) { throw "$label does not exist: $p" }
 }
 
+function Resolve-BundledToolPath {
+  param(
+    [string]$Current,
+    [string]$AppRoot,
+    [string[]]$RelativeCandidates,
+    [string]$Label
+  )
+
+  if ($Current -and (Test-Path -LiteralPath $Current)) {
+    try { return (Resolve-Path -LiteralPath $Current).Path } catch { return $Current }
+  }
+
+  foreach ($rel in $RelativeCandidates) {
+    try {
+      $candidate = Join-Path $AppRoot $rel
+      if (Test-Path -LiteralPath $candidate) {
+        return (Resolve-Path -LiteralPath $candidate).Path
+      }
+    } catch {}
+  }
+
+  return $Current
+}
+
 function Stop-StressToolsByName {
   Stop-Process -Name "furmark","prime95" -Force -ErrorAction SilentlyContinue
+}
+
+function Resolve-DefaultRunsRoot {
+  $docs = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+
+  if ([string]::IsNullOrWhiteSpace($docs)) {
+    $base = Join-Path $env:LOCALAPPDATA "ThermalBench"
+  } else {
+    $base = Join-Path $docs "ThermalBench"
+  }
+
+  return (Join-Path $base "runs")
+}
+
+function Resolve-DefaultHwinfoCsv {
+  $docs = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+
+  if ([string]::IsNullOrWhiteSpace($docs)) {
+    $base = Join-Path $env:LOCALAPPDATA "ThermalBench"
+  } else {
+    $base = Join-Path $docs "ThermalBench"
+  }
+
+  return (Join-Path $base "HWiNFO\hwinfo.csv")
 }
 
 function Set-AbortFlag {
@@ -102,7 +150,7 @@ function Resolve-PythonRuntime {
   return @{ Exe=$exe; UsePyLauncher=$usePy }
 }
 
-function Countdown-OrAbort($seconds, $label) {
+function Countdown-OrAbort($seconds, $label, [string[]]$MonitorNames = @()) {
   $interactive = Has-InteractiveConsole
 
   if ($interactive) {
@@ -114,6 +162,16 @@ function Countdown-OrAbort($seconds, $label) {
   for ($i = $seconds; $i -gt 0; $i--) {
 
     if (Is-AbortFlagSet) { throw "ABORT" }
+
+    # Verify that every monitored stress tool is still running (by name).
+    # FurMark 2 is a GeeXLab launcher that exits after spawning the real
+    # render child process, so we must check by name rather than the original
+    # PID (which belongs to the short-lived launcher, not the render worker).
+    foreach ($name in $MonitorNames) {
+      if (-not (Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+        throw "Stress tool '$name' stopped unexpectedly during the test."
+      }
+    }
 
     if ($interactive) {
       if ([Console]::KeyAvailable) {
@@ -129,7 +187,7 @@ function Countdown-OrAbort($seconds, $label) {
   }
 }
 
-function Get-RunName([string]$CaseName, [int]$WarmupSec, [int]$LogSec, [switch]$StressCPU, [switch]$StressGPU) {
+function Get-RunName([string]$CaseName, [int]$WarmupSec, [int]$LogSec, [switch]$StressCPU, [switch]$StressGPU, [string]$RunsRoot) {
   # Stress prefix
   $stressName = ""
   if ($StressCPU.IsPresent -and $StressGPU.IsPresent) { $stressName = "CPUGPU" }
@@ -146,8 +204,11 @@ function Get-RunName([string]$CaseName, [int]$WarmupSec, [int]$LogSec, [switch]$
   $base = ("{0}_W{1}_L{2}" -f $stressName, $wMin, $lMin)
 
   # Auto-increment version if same base already exists for this case.
-  $repoRoot = Split-Path -Parent $PSScriptRoot
-  $caseDir = Join-Path $repoRoot ("runs\{0}" -f $CaseName)
+  if ([string]::IsNullOrWhiteSpace($RunsRoot)) {
+    $RunsRoot = Resolve-DefaultRunsRoot
+  }
+
+  $caseDir = Join-Path $RunsRoot $CaseName
   New-Item -ItemType Directory -Force $caseDir | Out-Null
 
   $re = ("^{0}_V(\\d+)$" -f [regex]::Escape($base))
@@ -175,12 +236,31 @@ function Start-StressTools {
   if ($StressGPU.IsPresent) {
     Assert-File $FurMarkExe "FurMarkExe"
     $furDir = Split-Path -Parent $FurMarkExe
-    $furArgs = @("--demo",$FurDemo,"--width",$FurWidth,"--height",$FurHeight,"--vsync","0")
+    $furArgs = @("--demo",$FurDemo,"--width",$FurWidth,"--height",$FurHeight,"--vsync","0","--hpgfx","1")
     Write-Host "Start FurMark2: $FurMarkExe $($furArgs -join ' ')"
     $fur = Start-Process -FilePath $FurMarkExe -ArgumentList $furArgs -WorkingDirectory $furDir -PassThru -WindowStyle Normal
 
-    Start-Sleep -Seconds 2
-    if (-not (Get-Process -Id $fur.Id -ErrorAction SilentlyContinue)) {
+    # FurMark 2 (GeeXLab) exits the launcher process after spawning the real
+    # render child, so we cannot rely on $fur.Id surviving.  Wait up to 5 s for
+    # any "furmark" process (launcher or child) to appear/remain running.
+    $furName = [System.IO.Path]::GetFileNameWithoutExtension($FurMarkExe)
+    $furRunning = $false
+    for ($i = 0; $i -lt 10; $i++) {
+      Start-Sleep -Milliseconds 500
+      if (Get-Process -Name $furName -ErrorAction SilentlyContinue) {
+        $furRunning = $true
+        break
+      }
+    }
+    if (-not $furRunning) {
+      # Surface the GeeXLab / FurMark log to help diagnose the crash.
+      $furLog = Join-Path $furDir "_geexlab_log.txt"
+      if (Test-Path $furLog) {
+        $logLines = Get-Content $furLog -Tail 30 -ErrorAction SilentlyContinue
+        Write-Host "--- FurMark log (last 30 lines) ---"
+        $logLines | ForEach-Object { Write-Host $_ }
+        Write-Host "---"
+      }
       throw "FurMark2 exited immediately."
     }
     $furPid = [int]$fur.Id
@@ -240,13 +320,6 @@ if ($StopNow) {
 }
 
 Write-Host ""
-Write-Host "HWiNFO continuous CSV: $HwinfoCsv"
-if (-not (Test-Path $HwinfoCsv)) {
-  Write-Host "WARNING: $HwinfoCsv does not exist yet." -ForegroundColor Yellow
-  Write-Host "Enable HWiNFO logging to this path and run again." -ForegroundColor Yellow
-  exit 1
-}
-
 Clear-AbortFlag
 
 $scriptDir = $PSScriptRoot
@@ -261,6 +334,68 @@ try {
     $repoRoot = Split-Path -Parent $repoRoot
   }
 } catch {}
+
+if ([string]::IsNullOrWhiteSpace($RunsRoot)) {
+  $RunsRoot = Resolve-DefaultRunsRoot
+}
+
+try {
+  New-Item -ItemType Directory -Force $RunsRoot | Out-Null
+  $RunsRoot = (Resolve-Path -LiteralPath $RunsRoot).Path
+} catch {}
+
+Write-Host "Runs root: $RunsRoot"
+
+# Results should live in Documents\ThermalBench\runs, not inside Program Files.
+if ([string]::IsNullOrWhiteSpace($RunsRoot)) {
+  $RunsRoot = Resolve-DefaultRunsRoot
+}
+
+try {
+  New-Item -ItemType Directory -Force $RunsRoot | Out-Null
+  $RunsRoot = (Resolve-Path -LiteralPath $RunsRoot).Path
+} catch {}
+
+# Fixed bundled HWiNFO CSV.
+# ThermalBench always expects HWiNFO to log here:
+#   <AppRoot>\tools\HWiNFO\hwinfo.csv
+if ([string]::IsNullOrWhiteSpace($HwinfoCsv)) {
+  $HwinfoCsv = Resolve-DefaultHwinfoCsv
+}
+
+try {
+  if (Test-Path -LiteralPath $HwinfoCsv) {
+    $HwinfoCsv = (Resolve-Path -LiteralPath $HwinfoCsv).Path
+  }
+} catch {}
+
+Write-Host ""
+Write-Host "HWiNFO continuous CSV: $HwinfoCsv"
+if (-not (Test-Path -LiteralPath $HwinfoCsv)) {
+  Write-Host "WARNING: $HwinfoCsv does not exist yet." -ForegroundColor Yellow
+  Write-Host "Open HWiNFO and enable sensor logging to this exact path:" -ForegroundColor Yellow
+  Write-Host "  $HwinfoCsv" -ForegroundColor Yellow
+  exit 1
+}
+
+# Prefer installed/bundled tool paths when explicit paths are missing or invalid.
+$FurMarkExe = Resolve-BundledToolPath `
+  -Current $FurMarkExe `
+  -AppRoot $repoRoot `
+  -RelativeCandidates @(
+    "tools\FurMark\furmark.exe",
+    "tools\FurMark\FurMark_win64\furmark.exe"
+  ) `
+  -Label "FurMark"
+
+$PrimeExe = Resolve-BundledToolPath `
+  -Current $PrimeExe `
+  -AppRoot $repoRoot `
+  -RelativeCandidates @(
+    "tools\Prime95\prime95.exe",
+    "tools\Prime95\prime95\prime95.exe"
+  ) `
+  -Label "Prime95"
 
 # Resolve Python runtime early (needed for ambient logger as well as plotting).
 $py = Resolve-PythonRuntime
@@ -287,6 +422,7 @@ try {
       $rand = Get-Random
       $ambientCsv = Join-Path $env:TEMP ("ThermalBench_ambient_{0}_{1}.csv" -f $PID, $rand)
       $intervalSec = [math]::Max(0.1, ([double]$AmbientIntervalMs / 1000.0))
+      $intervalSecStr = $intervalSec.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 
       # Let the GUI know where to read ambient data for live stats/plotting.
       try { Write-Host ("GUI_AMBIENT_CSV:{0}" -f $ambientCsv) } catch {}
@@ -294,7 +430,7 @@ try {
       # Prefer a bundled ambient logger EXE when present (release builds).
       $ambientExe = Join-Path $repoRoot "ThermalBench-AmbientLogger.exe"
       if (Test-Path $ambientExe) {
-        $args = @('--out', $ambientCsv, '--interval', ("{0}" -f $intervalSec))
+        $args = @('--out', $ambientCsv, '--interval', $intervalSecStr)
         Write-Host "Ambient logger (bundled): $ambientExe $($args -join ' ')"
         $p = Start-Process -FilePath $ambientExe -ArgumentList $args -PassThru -WindowStyle Hidden
         if ($p -and $p.Id) { $ambientPid = [int]$p.Id }
@@ -306,9 +442,9 @@ try {
           $ambientScript = Join-Path $repoRoot "ambient_logger.py"
           if (Test-Path $ambientScript) {
             if ($UsePyLauncher) {
-              $args = @('-3', $ambientScript, '--out', $ambientCsv, '--interval', ("{0}" -f $intervalSec))
+              $args = @('-3', $ambientScript, '--out', $ambientCsv, '--interval', $intervalSecStr)
             } else {
-              $args = @($ambientScript, '--out', $ambientCsv, '--interval', ("{0}" -f $intervalSec))
+              $args = @($ambientScript, '--out', $ambientCsv, '--interval', $intervalSecStr)
             }
             Write-Host "Ambient logger (python): $PythonExe $($args -join ' ')"
             $p = Start-Process -FilePath $PythonExe -ArgumentList $args -PassThru -WindowStyle Hidden
@@ -338,10 +474,13 @@ try {
   Write-Host ""
 
   Write-Host "GUI_TIMER:WARMUP_START"
-  Countdown-OrAbort -seconds $WarmupSec -label "Warm-up (stress ON, logging IGNORE)"
+  $monNames = @()
+  if ($furPid -ne 0) { $monNames += "furmark" }
+  if ($prPid  -ne 0) { $monNames += "prime95" }
+  Countdown-OrAbort -seconds $WarmupSec -label "Warm-up (stress ON, logging IGNORE)" -MonitorNames $monNames
 
-  $runId  = Get-RunName -CaseName $CaseName -WarmupSec $WarmupSec -LogSec $LogSec -StressCPU:$StressCPU -StressGPU:$StressGPU
-  # Place run outputs at repository-level `runs/` (one level above this script's folder)
+  $runId  = Get-RunName -CaseName $CaseName -WarmupSec $WarmupSec -LogSec $LogSec -StressCPU:$StressCPU -StressGPU:$StressGPU -RunsRoot $RunsRoot
+  # Place run outputs in the user-writable ThermalBench runs folder.
 
   # Safety net: never reuse an existing output directory (prevents overwriting prior runs)
   $m = [regex]::Match($runId, '^(.*)_V(\d+)$')
@@ -352,11 +491,11 @@ try {
     try { $v = [int]$m.Groups[2].Value } catch { $v = 1 }
   }
 
-  $outDir = Join-Path $repoRoot ("runs\{0}\{1}" -f $CaseName, $runId)
+  $outDir = Join-Path $RunsRoot ("{0}\{1}" -f $CaseName, $runId)
   while (Test-Path -LiteralPath $outDir) {
     $v = $v + 1
     $runId = ("{0}_V{1}" -f $base, $v)
-    $outDir = Join-Path $repoRoot ("runs\{0}\{1}" -f $CaseName, $runId)
+    $outDir = Join-Path $RunsRoot ("{0}\{1}" -f $CaseName, $runId)
   }
 
   New-Item -ItemType Directory -Force $outDir | Out-Null
@@ -367,7 +506,7 @@ try {
   Write-Host ("WindowStart: {0}" -f $windowStart.ToString("yyyy-MM-dd HH:mm:ss.fff"))
 
   Write-Host "GUI_TIMER:LOG_START"
-  Countdown-OrAbort -seconds $LogSec -label "Logging window (stress ON, data USED)"
+  Countdown-OrAbort -seconds $LogSec -label "Logging window (stress ON, data USED)" -MonitorNames $monNames
 
   $windowEnd = Get-Date
   Write-Host ("WindowEnd:   {0}" -f $windowEnd.ToString("yyyy-MM-dd HH:mm:ss.fff"))
@@ -420,14 +559,10 @@ Start-Sleep -Seconds 6
 $ws = $windowStart.ToString("yyyy-MM-dd HH:mm:ss.fff")
 $we = $windowEnd.ToString("yyyy-MM-dd HH:mm:ss.fff")
 
-if (-not $PythonExe) {
-  Write-Host "Python executable not found. Create a virtualenv in $PSScriptRoot (python -m venv .venv) or ensure 'python' or 'py' is on PATH."
-  exit 1
-}
+# Prefer bundled plotter EXE in installed/release builds.
+$plotExe = Join-Path $repoRoot "ThermalBench-PlotHwinfo.exe"
 
-# Invoke the plotter
 $plotArgs = @(
-  $PlotScript,
   '--csv', $HwinfoCsv,
   '--out', $outDir,
   '--patterns'
@@ -447,10 +582,25 @@ if ($ambientCsv -and (Test-Path $ambientCsv)) {
   $plotArgs += @('--ambient-csv', $ambientCsv)
 }
 
-if ($UsePyLauncher) {
-  & $PythonExe -3 @plotArgs
+if (Test-Path $plotExe) {
+  Write-Host "Plotter (bundled): $plotExe"
+  & $plotExe @plotArgs
 } else {
-  & $PythonExe @plotArgs
+  # Dev fallback: use Python + plot_hwinfo.py
+  if (-not $PythonExe) {
+    Write-Host "Python executable not found. Create a virtualenv or ensure 'python' or 'py' is on PATH."
+    exit 1
+  }
+
+  Write-Host "Plotter (python): $PythonExe $PlotScript"
+
+  $pythonPlotArgs = @($PlotScript) + $plotArgs
+
+  if ($UsePyLauncher) {
+    & $PythonExe -3 @pythonPlotArgs
+  } else {
+    & $PythonExe @pythonPlotArgs
+  }
 }
 
 $pyExit = $LASTEXITCODE

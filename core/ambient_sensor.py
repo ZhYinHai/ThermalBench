@@ -4,19 +4,93 @@ import time
 from typing import Optional
 
 import temper_windows
+import pywinusb.hid as hid
 
 
 CAL_OFFSET_C = 4.0  # calibration: subtract offset from raw probe reading
+
+# VID/PID pairs tried in order.  The first entry matches the temper_windows
+# library's own filter; the remaining entries cover common TEMPer2 clone
+# variants that ship with different USB controller chips.
+_TEMPER_VID_PIDS: list[tuple[int, int]] = [
+    (0x413D, 0x2107),  # RDing TEMPer / TEMPerHUM (handled by temper_windows)
+    (0x1A86, 0xE025),  # TEMPer2 clone – WCH CH340/CH341 chip
+    (0x0C45, 0x7401),  # TEMPer clone – Sonix/Microdia chip
+    (0x0C45, 0x7402),  # TEMPer clone – Sonix/Microdia variant
+]
+
+_CMD = [0x00, 0x01, 0x80, 0x33, 0x01, 0x00, 0x00, 0x00, 0x00]
+
+
+def _read_raw_temper(vid: int, pid: int) -> Optional[float]:
+    """Try to read temperature from any device matching (vid, pid).
+
+    Returns the first successful reading, or None if no device responds.
+    Uses the same protocol as the temper_windows library.
+    """
+    devices = hid.HidDeviceFilter(vendor_id=vid, product_id=pid).get_devices()
+    if not devices:
+        return None
+
+    result: list[Optional[float]] = [None]
+    received: list[bool] = [False]
+
+    def _handler(data: list) -> None:
+        try:
+            result[0] = float(data[3] * 256 + data[4]) / 100.0
+        except (IndexError, TypeError):
+            pass
+        received[0] = True
+
+    device = devices[0]
+    try:
+        device.open()
+        device.set_raw_data_handler(_handler)
+        received[0] = False
+        device.send_output_report(_CMD)
+
+        sleep = 0.01
+        deadline = time.monotonic() + 2.0
+        while not received[0] and time.monotonic() < deadline:
+            time.sleep(sleep)
+            sleep = 0.05
+    finally:
+        device.close()
+
+    return result[0]
 
 
 def read_ambient_c(*, cal_offset_c: float = CAL_OFFSET_C) -> float:
     """Read ambient temperature in °C from the TEMPer USB sensor.
 
+    Tries the primary VID/PID first (via temper_windows), then falls back to
+    additional known VID/PID pairs so that TEMPer2 clone variants are
+    recognised automatically.
+
     Raises:
-        Exception: if the underlying sensor read fails.
+        RuntimeError: if no TEMPer device could be found or read.
     """
-    t = float(temper_windows.get_temperature())
-    return float(t - float(cal_offset_c))
+    # Primary path: temper_windows (VID 0x413D / PID 0x2107)
+    try:
+        t = temper_windows.get_temperature()
+        if t is not None:
+            return float(t) - float(cal_offset_c)
+    except Exception:
+        pass
+
+    # Fallback: try all known VID/PID pairs (skipping the first – already tried)
+    for vid, pid in _TEMPER_VID_PIDS[1:]:
+        try:
+            t = _read_raw_temper(vid, pid)
+            if t is not None:
+                return float(t) - float(cal_offset_c)
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "No TEMPer USB temperature sensor found. "
+        "Make sure the sensor is plugged in and its driver is installed."
+    )
 
 
 def _debug_main() -> None:

@@ -71,23 +71,37 @@ class SettingsDialog(QDialog):
         root.addWidget(QLabel("FurMark executable (.exe)"))
         fur_row = QHBoxLayout()
         self.fur_edit = QLineEdit(furmark_exe or "")
-        self.fur_edit.setPlaceholderText(r"C:\Path\To\furmark.exe")
+        self.fur_edit.setPlaceholderText(r"C:\Path\To\FurMark64.exe")
+        self.fur_edit.setReadOnly(True)
+        self.fur_edit.setCursor(Qt.ArrowCursor)
+        self._fur_indicator = QLabel("●")
+        self._fur_indicator.setFixedWidth(16)
+        self._fur_indicator.setAlignment(Qt.AlignCenter)
         btn_fur = QPushButton("Browse…")
-        btn_fur.clicked.connect(lambda: self._pick_exe(self.fur_edit))
+        btn_fur.clicked.connect(lambda: self._pick_exe(self.fur_edit, self._fur_indicator))
         fur_row.addWidget(self.fur_edit, 1)
+        fur_row.addWidget(self._fur_indicator)
         fur_row.addWidget(btn_fur)
         root.addLayout(fur_row)
+        self._update_exe_indicator(self._fur_indicator, self.fur_edit.text())
 
         # --- Prime95 path ---
         root.addWidget(QLabel("Prime95 executable (.exe)"))
         pr_row = QHBoxLayout()
         self.prime_edit = QLineEdit(prime_exe or "")
         self.prime_edit.setPlaceholderText(r"C:\Path\To\prime95.exe")
+        self.prime_edit.setReadOnly(True)
+        self.prime_edit.setCursor(Qt.ArrowCursor)
+        self._prime_indicator = QLabel("●")
+        self._prime_indicator.setFixedWidth(16)
+        self._prime_indicator.setAlignment(Qt.AlignCenter)
         btn_pr = QPushButton("Browse…")
-        btn_pr.clicked.connect(lambda: self._pick_exe(self.prime_edit))
+        btn_pr.clicked.connect(lambda: self._pick_exe(self.prime_edit, self._prime_indicator))
         pr_row.addWidget(self.prime_edit, 1)
+        pr_row.addWidget(self._prime_indicator)
         pr_row.addWidget(btn_pr)
         root.addLayout(pr_row)
+        self._update_exe_indicator(self._prime_indicator, self.prime_edit.text())
 
         # --- Appearance (Mode dropdown) ---
         row = QHBoxLayout()
@@ -280,7 +294,15 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
-    def _pick_exe(self, target: QLineEdit) -> None:
+    @staticmethod
+    def _update_exe_indicator(indicator: "QLabel", path: str) -> None:
+        exists = bool(path and os.path.isfile(path))
+        indicator.setToolTip("Executable found" if exists else "Executable not found")
+        indicator.setStyleSheet(
+            f"color: {'#2E9E4F' if exists else '#B0B0B0'}; font-size: 14px;"
+        )
+
+    def _pick_exe(self, target: "QLineEdit", indicator: "QLabel") -> None:
         start_dir = ""
         cur = target.text().strip()
         if cur and os.path.exists(cur):
@@ -296,6 +318,7 @@ class SettingsDialog(QDialog):
         )
         if path:
             target.setText(path)
+            self._update_exe_indicator(indicator, path)
 
     def furmark_exe(self) -> str:
         return self.fur_edit.text().strip()

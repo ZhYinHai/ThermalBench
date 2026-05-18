@@ -29,13 +29,23 @@ def on_preview_draw(gp: Any, event=None) -> None:
             else:
                 gp._ls_btn_bbox = None
 
+            # Scale pixel gaps by device pixel ratio so buttons stay consistently
+            # spaced on high-DPI / scaled displays (matplotlib display coords are
+            # physical pixels, so logical gaps must be multiplied by dpr).
+            try:
+                _dpr = float(gp._preview_canvas.devicePixelRatioF() or 1.0)
+            except Exception:
+                _dpr = 1.0
+            if _dpr <= 0.0:
+                _dpr = 1.0
+
             # Temperature delta toggle button: place it just to the left of the
             # Legend & stats button and cache its bbox for hit testing.
             try:
                 if getattr(gp, "_delta_btn_text", None) is not None:
                     # If we have the LS bbox, position the delta button by pixel offset.
                     if gp._ls_btn_bbox is not None:
-                        gap_px = 14.0
+                        gap_px = 14.0 * _dpr
                         # Find the desired RIGHT edge in display coords.
                         desired_right_x = float(gp._ls_btn_bbox.x0) - gap_px
 
@@ -67,7 +77,7 @@ def on_preview_draw(gp: Any, event=None) -> None:
             try:
                 if getattr(gp, "_zero_btn_text", None) is not None:
                     if getattr(gp, "_delta_btn_bbox", None) is not None:
-                        gap_px = 18.0
+                        gap_px = 18.0 * _dpr
                         desired_right_x = float(gp._delta_btn_bbox.x0) - gap_px
 
                         ax_btn = getattr(gp._zero_btn_text, "axes", None) or gp._preview_ax
@@ -91,7 +101,7 @@ def on_preview_draw(gp: Any, event=None) -> None:
                     # a clean gap by nudging left once if needed.
                     try:
                         if gp._delta_btn_bbox is not None and gp._zero_btn_bbox is not None:
-                            min_gap = 14.0
+                            min_gap = 14.0 * _dpr
                             max_right = float(gp._delta_btn_bbox.x0) - float(min_gap)
                             if float(gp._zero_btn_bbox.x1) > max_right:
                                 shift = float(gp._zero_btn_bbox.x1) - max_right

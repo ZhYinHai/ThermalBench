@@ -9,7 +9,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.20"
+  #define MyAppVersion "0.0.30"
 #endif
 
 #ifndef InstallerPrefix
@@ -39,7 +39,7 @@ AppId={#AppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppName}
-DefaultDirName={localappdata}\\Programs\\{#MyAppName}
+DefaultDirName={autopf}\{#MyAppName}
 DisableDirPage=no
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
@@ -48,7 +48,7 @@ OutputBaseFilename={#InstallerPrefix}{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 SetupIconFile=..\\resources\\thermal_bench.ico
 WizardStyle=modern
 
@@ -59,8 +59,18 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a &desktop icon"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
-; Install the full PyInstaller onedir bundle
-Source: "{#SourceDir}\\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; Install the full PyInstaller onedir bundle.
+; Runtime data such as hwinfo.csv and runs/ belongs in Documents\ThermalBench,
+; not inside Program Files.
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion; Excludes: "tools\HWiNFO\hwinfo.csv,runs\*"
+
+[Registry]
+Root: HKCU; Subkey: "Software\ThermalBench"; ValueType: string; ValueName: "InstallDir"; ValueData: "{app}"; Flags: uninsdeletekeyifempty
+Root: HKCU; Subkey: "Software\ThermalBench"; ValueType: string; ValueName: "HwinfoExe"; ValueData: "{app}\tools\HWiNFO\HWiNFO64.exe"; Flags: uninsdeletekeyifempty
+; FurMarkExe and PrimeExe are intentionally not written here.
+; These tools are copied to %LOCALAPPDATA%\ThermalBench\tools\ at runtime so
+; GeeXLab / Prime95 can write their log files without UAC issues.
+; The Python resolver (core/bundled_tools.py) handles path resolution.
 
 [Icons]
 Name: "{autoprograms}\\{#MyAppName}"; Filename: "{app}\\{#AppExeName}"

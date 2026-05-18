@@ -162,6 +162,120 @@ if (Test-Path $ambientScript) {
     Write-Host "Ambient logger script not found; skipping ambient logger EXE build: $ambientScript" -ForegroundColor Yellow
 }
 
+# 1c) Build standalone plot_hwinfo executable so releases don't depend on system Python/pandas
+$plotScript = Join-Path $PSScriptRoot 'cli\plot_hwinfo.py'
+if (Test-Path $plotScript) {
+    $plotName = 'ThermalBench-PlotHwinfo'
+    $plotDistDirTmp = Join-Path $PSScriptRoot 'dist\_plot_hwinfo'
+    $plotDistFinal = Join-Path $PSScriptRoot 'dist\ThermalBench'
+    $plotWorkDir = Join-Path $PSScriptRoot 'build\plot_hwinfo'
+
+    New-Item -ItemType Directory -Force -Path $plotWorkDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $plotDistDirTmp | Out-Null
+
+    Write-Host "Building plot_hwinfo executable..." -ForegroundColor Cyan
+
+    & $python -m PyInstaller --noconfirm --clean --onefile --console `
+        --name $plotName `
+        --distpath $plotDistDirTmp `
+        --workpath $plotWorkDir `
+        --specpath $plotWorkDir `
+        --collect-all pandas `
+        --collect-all numpy `
+        --collect-all matplotlib `
+        $plotScript
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller failed for cli\plot_hwinfo.py (exit code $LASTEXITCODE)"
+    }
+
+    $plotExeTmp = Join-Path $plotDistDirTmp ("{0}.exe" -f $plotName)
+    $plotExeFinal = Join-Path $plotDistFinal ("{0}.exe" -f $plotName)
+
+    if (-not (Test-Path $plotExeTmp)) {
+        throw "plot_hwinfo build succeeded but expected output not found: $plotExeTmp"
+    }
+
+    try {
+        if (Test-Path $plotExeFinal) {
+            Remove-Item -Force $plotExeFinal -ErrorAction SilentlyContinue
+        }
+    } catch {}
+
+    Copy-Item -Force -LiteralPath $plotExeTmp -Destination $plotExeFinal
+
+    if (-not (Test-Path $plotExeFinal)) {
+        throw "Failed to copy plot_hwinfo into app bundle: $plotExeFinal"
+    }
+} else {
+    Write-Host "plot_hwinfo.py not found; skipping plot EXE build: $plotScript" -ForegroundColor Yellow
+}
+
+$plotExeFinalCheck = Join-Path $PSScriptRoot 'dist\ThermalBench\ThermalBench-PlotHwinfo.exe'
+if (-not (Test-Path $plotExeFinalCheck)) {
+    throw "Missing ThermalBench-PlotHwinfo.exe. Installer would still depend on system Python/pandas."
+}
+
+# 1d) Copy bundled third-party tool folders into the app bundle.
+# IMPORTANT: copy full folders, not only .exe files, because FurMark/Prime95/HWiNFO need local dependencies.
+$vendorTools = Join-Path $PSScriptRoot 'vendor\tools'
+$distTools = Join-Path $PSScriptRoot 'dist\ThermalBench\tools'
+
+if (-not (Test-Path -LiteralPath $vendorTools)) {
+    throw "Missing vendor tools folder: $vendorTools"
+}
+
+$requiredVendorFiles = @(
+    'FurMark\furmark.exe',
+    'Prime95\prime95.exe',
+    'HWiNFO\HWiNFO64.exe'
+)
+
+foreach ($rel in $requiredVendorFiles) {
+    $p = Join-Path $vendorTools $rel
+    if (-not (Test-Path -LiteralPath $p)) {
+        throw "Missing required bundled tool file: $p"
+    }
+}
+
+Write-Host "Copying bundled tool folders..." -ForegroundColor Cyan
+
+if (Test-Path -LiteralPath $distTools) {
+    Remove-Item -LiteralPath $distTools -Recurse -Force
+}
+
+New-Item -ItemType Directory -Force -Path $distTools | Out-Null
+
+$toolFolders = @('FurMark', 'Prime95', 'HWiNFO')
+
+foreach ($folder in $toolFolders) {
+    $src = Join-Path $vendorTools $folder
+    $dst = Join-Path $distTools $folder
+
+    if (-not (Test-Path -LiteralPath $src)) {
+        throw "Missing bundled tool folder: $src"
+    }
+
+    Write-Host "Copying $src -> $dst" -ForegroundColor DarkCyan
+    Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force
+}
+
+$requiredDistFiles = @(
+    'FurMark\furmark.exe',
+    'FurMark\plugins',
+    'Prime95\prime95.exe',
+    'HWiNFO\HWiNFO64.exe'
+)
+
+foreach ($rel in $requiredDistFiles) {
+    $p = Join-Path $distTools $rel
+    if (-not (Test-Path -LiteralPath $p)) {
+        throw "Bundled tool copy failed. Missing in dist: $p"
+    }
+}
+
+Write-Host "Bundled tools copied to: $distTools" -ForegroundColor Green
+
 # 2) Compile Inno Setup installer
 $iscc = Find-ISCC -Explicit $InnoIsccPath
 if (-not $iscc) {

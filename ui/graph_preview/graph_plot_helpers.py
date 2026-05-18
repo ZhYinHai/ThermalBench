@@ -16,13 +16,20 @@ import matplotlib.dates as mdates
 import matplotlib.patheffects as pe
 
 
-import re
-import numpy as np
-import pandas as pd
-
-import matplotlib.cm as cm
-import matplotlib.dates as mdates
-import matplotlib.patheffects as pe
+def _parse_dt_flexible(s: pd.Series) -> pd.Series:
+    """Parse a datetime Series, supporting both EU (dd.mm.yyyy) and Asia (yyyy/mm/dd) formats."""
+    for fmt in (
+        "%d.%m.%Y %H:%M:%S.%f",   # NL/EU: 06.05.2026 13:23:01.975
+        "%d.%m.%Y %H:%M:%S",       # NL/EU without ms
+        "%Y/%m/%d %H:%M:%S.%f",   # TW/Asia: 2026/05/06 13:23:01.975
+        "%Y/%m/%d %H:%M:%S",       # TW/Asia without ms
+        "%Y-%m-%d %H:%M:%S.%f",   # ISO fallback
+        "%Y-%m-%d %H:%M:%S",       # ISO fallback without ms
+    ):
+        dt = pd.to_datetime(s, format=fmt, errors="coerce")
+        if dt.notna().any():
+            return dt
+    return pd.to_datetime(s, dayfirst=True, errors="coerce")
 
 
 def extract_unit_from_column(col_name: str) -> str:
@@ -118,14 +125,12 @@ def load_run_csv_dataframe(fpath: str) -> tuple[pd.DataFrame, list[str]]:
 
     dt_index = None
     if c0 == "date" and c1 == "time":
-        dt_index = pd.to_datetime(
-            df.iloc[:, 0].astype(str) + " " + df.iloc[:, 1].astype(str),
-            dayfirst=True,
-            errors="coerce",
+        dt_index = _parse_dt_flexible(
+            df.iloc[:, 0].astype(str) + " " + df.iloc[:, 1].astype(str)
         )
         df_data = df.iloc[:, 2:].copy()
     else:
-        dt_try = pd.to_datetime(df.iloc[:, 0].astype(str), dayfirst=True, errors="coerce")
+        dt_try = _parse_dt_flexible(df.iloc[:, 0].astype(str))
         if dt_try.notna().any():
             dt_index = dt_try
             df_data = df.iloc[:, 1:].copy()

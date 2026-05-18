@@ -306,7 +306,8 @@ class RunsProxyModel(QSortFilterProxyModel):
             if sm is None:
                 return False
             name = str(sm.fileName(source_index) or "")
-            return bool(_RUN_FOLDER_RE.match(name))
+            path = str(sm.filePath(source_index) or "")
+            return bool(path) and bool(_RUN_FOLDER_RE.match(name))
         except Exception:
             return False
 
@@ -576,27 +577,22 @@ class RunsProxyModel(QSortFilterProxyModel):
 
     # ---- make run folders not expandable ----
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
-        # If the parent is a run folder, hide ALL its children
-        try:
-            if self._is_run_folder_source_index(source_parent):
-                return False
-        except Exception:
-            pass
-
         try:
             sm = self.sourceModel()
-            if sm is not None:
-                source_index = sm.index(source_row, 0, source_parent)
-                if source_index.isValid() and not (
-                    self._source_name_matches_folder_filter(source_index)
-                    or self._has_matching_ancestor(source_index)
-                    or self._has_matching_descendant(source_index)
-                ):
-                    return False
-        except Exception:
-            pass
+            if sm is None:
+                return True
 
-        return True
+            source_index = sm.index(source_row, 0, source_parent)
+            if not source_index.isValid():
+                return False
+
+            # keep run nodes as leaf nodes
+            if self._is_run_folder_source_index(source_parent):
+                return False
+
+            return True
+        except Exception:
+            return True
 
     def hasChildren(self, parent: QModelIndex) -> bool:
         try:

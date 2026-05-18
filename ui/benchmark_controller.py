@@ -27,6 +27,8 @@ from PySide6.QtWidgets import (
 
 from core.ps_helpers import RUNMAP_RE, ps_quote, build_ps_array_literal
 
+from core.user_paths import thermalbench_runs_root
+from core.bundled_tools import resolve_hwinfo_csv, resolve_furmark_exe, resolve_prime95_exe
 from core.resources import resource_path
 from core.hwinfo_metadata import load_sensor_map
 from ui.graph_preview.graph_plot_helpers import load_run_csv_dataframe
@@ -64,7 +66,7 @@ class BenchmarkController:
         compare_btn,
         runs_tree: QTreeView,
         runs_model,
-        runs_source_model: QFileSystemModel,
+        runs_source_model,
         runs_root: Path,
         graph_preview,
         sensor_manager,
@@ -179,23 +181,9 @@ class BenchmarkController:
             pass
 
     def _prescan_latest_folder(self) -> None:
-        """Eagerly cache the latest result folder and pre-warm the tree model."""
         try:
             if self._latest_cached_folder is None:
                 self._fast_find_latest_result_folder()
-
-            # Force QFileSystemModel to start loading the case folder
-            # (parent of the latest run) so its children are ready
-            # before the user opens the results page.
-            folder = self._latest_cached_folder
-            if folder is not None and self._runs_source_model is not None:
-                case_dir = folder.parent
-                try:
-                    idx = self._runs_source_model.index(str(case_dir))
-                    if idx.isValid() and self._runs_source_model.canFetchMore(idx):
-                        self._runs_source_model.fetchMore(idx)
-                except Exception:
-                    pass
         except Exception:
             pass
 
@@ -225,6 +213,87 @@ class BenchmarkController:
                     self._graph_preview.preview_path(str(fpath))
             except Exception:
                 pass
+
+    def _month_key_for_run_dir(self, run_dir: Path) -> str:
+        try:
+            settings_path = run_dir / "test_settings.json"
+            if settings_path.is_file():
+                try:
+                    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+                    recorded_at = str(payload.get("recorded_at") or "").strip()
+                    if recorded_at:
+                        dt = datetime.fromisoformat(recorded_at.replace("Z", "+00:00")).replace(tzinfo=None)
+                        return dt.strftime("%Y-%m")
+                except Exception:
+                    pass
+
+            try:
+                dt = datetime.strptime(run_dir.name, "%Y%m%d_%H%M%S")
+                return dt.strftime("%Y-%m")
+            except Exception:
+                pass
+
+            try:
+                dt = datetime.fromtimestamp(run_dir.stat().st_mtime)
+                return dt.strftime("%Y-%m")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        return ""
+
+    def _latest_visible_run_in_case(self, case_dir: Path) -> Optional[Path]:
+        try:
+            if case_dir is None or not case_dir.exists() or not case_dir.is_dir():
+                return None
+
+            current_month = ""
+            try:
+                if self._runs_source_model is not None and hasattr(self._runs_source_model, "current_month"):
+                    current_month = str(self._runs_source_model.current_month() or "").strip()
+            except Exception:
+                current_month = ""
+
+            best_run = None
+            best_mtime = -1.0
+
+            for ent in os.scandir(str(case_dir)):
+                if not ent.is_dir():
+                    continue
+
+                cand = Path(ent.path)
+                if not _RUN_FOLDER_RE.match(cand.name):
+                    continue
+
+                if current_month:
+                    try:
+                        if self._month_key_for_run_dir(cand) != current_month:
+                            continue
+                    except Exception:
+                        continue
+
+                mt = -1.0
+                try:
+                    csvp = cand / "run_window.csv"
+                    if csvp.is_file():
+                        mt = float(csvp.stat().st_mtime)
+                    else:
+                        pngp = cand / "ALL_SELECTED.png"
+                        if pngp.is_file():
+                            mt = float(pngp.stat().st_mtime)
+                        else:
+                            mt = float(cand.stat().st_mtime)
+                except Exception:
+                    mt = -1.0
+
+                if mt > best_mtime:
+                    best_mtime = mt
+                    best_run = cand
+
+            return best_run
+        except Exception:
+            return None
 
     def _apply_pending_preview_target(self) -> None:
         tgt = None
@@ -415,6 +484,25 @@ class BenchmarkController:
             return sorted([str(s) for s in (sensors or []) if str(s).strip()], key=_sort_key)
         except Exception:
             return [str(s) for s in (sensors or []) if str(s).strip()]
+
+    def _refresh_results_models(self) -> None:
+        try:
+            if self._runs_source_model is not None and hasattr(self._runs_source_model, "refresh"):
+                self._runs_source_model.refresh()
+        except Exception:
+            pass
+
+        try:
+            if self._runs_model is not None and hasattr(self._runs_model, "invalidate"):
+                self._runs_model.invalidate()
+        except Exception:
+            pass
+
+        try:
+            self._runs_tree.viewport().update()
+            self._runs_tree.update()
+        except Exception:
+            pass
 
     def toggle_compare_selection_for_index(self, idx) -> None:
         """Double-click handler: toggles a run folder in the compare selection set."""
@@ -738,26 +826,35 @@ class BenchmarkController:
         try:
             if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
                 return ""
-            # if proxy, map to source
+
             if hasattr(self._runs_model, "mapToSource") and self._runs_source_model is not None:
                 src_idx = self._runs_model.mapToSource(idx)
-                return self._runs_source_model.filePath(src_idx)
-            # if direct fs model
+                if hasattr(self._runs_source_model, "filePath"):
+                    return str(self._runs_source_model.filePath(src_idx) or "")
+
             if hasattr(self._runs_model, "filePath"):
-                return self._runs_model.filePath(idx)
+                return str(self._runs_model.filePath(idx) or "")
         except Exception:
             return ""
+
         return ""
 
     def _path_to_proxy_index(self, path: str):
         try:
             if self._runs_source_model is None:
                 return None
-            src_idx = self._runs_source_model.index(str(path))
-            if not src_idx.isValid():
+
+            if hasattr(self._runs_source_model, "index_for_path"):
+                src_idx = self._runs_source_model.index_for_path(str(path))
+            else:
+                src_idx = self._runs_source_model.index(str(path))
+
+            if src_idx is None or (hasattr(src_idx, "isValid") and not src_idx.isValid()):
                 return None
+
             if hasattr(self._runs_model, "mapFromSource"):
                 return self._runs_model.mapFromSource(src_idx)
+
             return src_idx
         except Exception:
             return None
@@ -974,6 +1071,108 @@ class BenchmarkController:
         except Exception:
             return set()
         return out
+
+    def activate_results_index(self, idx) -> bool:
+        try:
+            if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
+                return False
+
+            fpath = self._idx_to_path(idx)
+            if not fpath:
+                return False
+
+            p = Path(fpath)
+            if not p.exists():
+                return False
+
+            # Keep selection/current in sync for full-row clicks.
+            try:
+                self._runs_tree.setCurrentIndex(idx)
+            except Exception:
+                pass
+
+            if p.is_dir():
+                try:
+                    root = self._runs_root
+                    if root is not None and root.exists():
+                        try:
+                            root_r = root.resolve()
+                            p_r = p.resolve()
+                        except Exception:
+                            root_r = root
+                            p_r = p
+
+                        is_case_dir = False
+                        try:
+                            is_case_dir = (
+                                p_r.is_dir()
+                                and p_r.parent is not None
+                                and p_r.parent.resolve() == root_r
+                                and (not _RUN_FOLDER_RE.match(p_r.name))
+                            )
+                        except Exception:
+                            is_case_dir = (
+                                p.is_dir()
+                                and p.parent == root
+                                and (not _RUN_FOLDER_RE.match(p.name))
+                            )
+
+                        if is_case_dir:
+                            try:
+                                self._runs_tree.expand(idx)
+                            except Exception:
+                                pass
+
+                            best_run = self._latest_visible_run_in_case(p_r)
+                            if best_run is None:
+                                return True
+
+                            best_idx = self._path_to_proxy_index(str(best_run))
+                            if best_idx is None or (hasattr(best_idx, "isValid") and not best_idx.isValid()):
+                                return True
+
+                            sm = self._runs_tree.selectionModel()
+                            if sm is not None:
+                                self._suppress_selection_preview = True
+                                try:
+                                    try:
+                                        self._runs_tree.setCurrentIndex(best_idx)
+                                    except Exception:
+                                        pass
+
+                                    try:
+                                        sm.select(
+                                            best_idx,
+                                            QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                                        )
+                                    except Exception:
+                                        try:
+                                            sm.setCurrentIndex(
+                                                best_idx,
+                                                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                                            )
+                                        except Exception:
+                                            pass
+
+                                    try:
+                                        self._runs_tree.scrollTo(best_idx)
+                                    except Exception:
+                                        pass
+                                finally:
+                                    self._suppress_selection_preview = False
+
+                            self._schedule_preview_target(fpath=str(best_run), is_dir=True)
+                            return True
+                except Exception:
+                    pass
+
+                self._schedule_preview_target(fpath=str(p), is_dir=True)
+                return True
+
+            self._schedule_preview_target(fpath=str(p), is_dir=False)
+            return True
+        except Exception:
+            return False
 
     def _find_compare_results_referencing_runs(self, run_rel_paths: set[str]) -> list[str]:
         """Return compare result folders (relative to runs_root) that reference any run in run_rel_paths."""
@@ -1315,6 +1514,105 @@ class BenchmarkController:
         except Exception:
             pass
 
+    def activate_results_index(self, index) -> bool:
+        """
+        Handle an explicit click on a results-tree row.
+
+        Returns True if this index is a case folder and we expanded it + selected
+        the latest visible run inside it.
+        """
+        try:
+            if index is None or (hasattr(index, "isValid") and not index.isValid()):
+                return False
+
+            fpath = self._idx_to_path(index)
+            if not fpath:
+                return False
+
+            p = Path(fpath)
+            if not p.is_dir():
+                return False
+
+            root = self._runs_root
+            if root is None or not root.exists():
+                return False
+
+            try:
+                root_r = root.resolve()
+                p_r = p.resolve()
+            except Exception:
+                root_r = root
+                p_r = p
+
+            is_case_dir = False
+            try:
+                is_case_dir = (
+                    p_r.is_dir()
+                    and p_r.parent is not None
+                    and p_r.parent.resolve() == root_r
+                    and (not _RUN_FOLDER_RE.match(p_r.name))
+                )
+            except Exception:
+                is_case_dir = (
+                    p.is_dir()
+                    and p.parent == root
+                    and (not _RUN_FOLDER_RE.match(p.name))
+                )
+
+            if not is_case_dir:
+                return False
+
+            try:
+                self._runs_tree.expand(index)
+            except Exception:
+                pass
+
+            best_run = self._latest_visible_run_in_case(p_r)
+            if best_run is None:
+                return True
+
+            run_idx = self._path_to_proxy_index(str(best_run))
+            if run_idx is None or (hasattr(run_idx, "isValid") and not run_idx.isValid()):
+                return True
+
+            sm = self._runs_tree.selectionModel()
+            if sm is None:
+                return True
+
+            self._suppress_selection_preview = True
+            try:
+                try:
+                    self._runs_tree.setCurrentIndex(run_idx)
+                except Exception:
+                    pass
+
+                try:
+                    sm.select(
+                        run_idx,
+                        QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                    )
+                except Exception:
+                    try:
+                        sm.setCurrentIndex(
+                            run_idx,
+                            QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                        )
+                    except Exception:
+                        pass
+
+                try:
+                    self._runs_tree.scrollTo(run_idx)
+                except Exception:
+                    pass
+            finally:
+                self._suppress_selection_preview = False
+
+            self._schedule_preview_target(fpath=str(best_run), is_dir=True)
+            return True
+
+        except Exception:
+            return False
+
     def _on_runs_current_changed(self, current, previous) -> None:
         try:
             if current is None or (hasattr(current, "isValid") and not current.isValid()):
@@ -1389,120 +1687,10 @@ class BenchmarkController:
                 return
 
             if p.is_dir():
-                # If the user clicks a case folder (runs/<case>), auto-select the newest
-                # run folder under it and preview that (case folders contain only results).
                 try:
-                    root = self._runs_root
-                    if root is not None and root.exists():
-                        try:
-                            root_r = root.resolve()
-                            p_r = p.resolve()
-                        except Exception:
-                            root_r = root
-                            p_r = p
-
-                        is_case_dir = False
-                        try:
-                            is_case_dir = (
-                                p_r.is_dir()
-                                and p_r.parent is not None
-                                and p_r.parent.resolve() == root_r
-                                and (not _RUN_FOLDER_RE.match(p_r.name))
-                            )
-                        except Exception:
-                            # best-effort fallback
-                            is_case_dir = (
-                                p.is_dir()
-                                and p.parent == root
-                                and (not _RUN_FOLDER_RE.match(p.name))
-                            )
-
-                        if is_case_dir:
-                            # Always expand the case folder on click.
-                            try:
-                                self._runs_tree.expand(current)
-                            except Exception:
-                                pass
-
-                            # Find newest run folder inside this case.
-                            best_run = None
-                            best_mtime = -1.0
-                            try:
-                                for ent in os.scandir(str(p_r)):
-                                    if not ent.is_dir():
-                                        continue
-                                    cand = Path(ent.path)
-                                    if not _RUN_FOLDER_RE.match(cand.name):
-                                        continue
-
-                                    # Prefer "run_window.csv" mtime, else ALL_SELECTED.png, else folder mtime.
-                                    mt = -1.0
-                                    try:
-                                        csvp = cand / "run_window.csv"
-                                        if csvp.is_file():
-                                            mt = float(csvp.stat().st_mtime)
-                                        else:
-                                            pngp = cand / "ALL_SELECTED.png"
-                                            if pngp.is_file():
-                                                mt = float(pngp.stat().st_mtime)
-                                            else:
-                                                mt = float(cand.stat().st_mtime)
-                                    except Exception:
-                                        mt = -1.0
-
-                                    if mt > best_mtime:
-                                        best_mtime = mt
-                                        best_run = cand
-                            except Exception:
-                                best_run = None
-
-                            if best_run is None:
-                                # Nothing to preview under this case folder.
-                                return
-
-                            idx = self._path_to_proxy_index(str(best_run))
-                            if idx is None or (hasattr(idx, "isValid") and not idx.isValid()):
-                                return
-
-                            sm = self._runs_tree.selectionModel()
-                            if sm is None:
-                                return
-
-                            # Programmatic selection: prevent intermediate preview churn.
-                            self._suppress_selection_preview = True
-                            try:
-                                try:
-                                    self._runs_tree.setCurrentIndex(idx)
-                                except Exception:
-                                    pass
-
-                                try:
-                                    sm.select(
-                                        idx,
-                                        QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
-                                    )
-                                except Exception:
-                                    try:
-                                        sm.setCurrentIndex(
-                                            idx,
-                                            QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
-                                        )
-                                    except Exception:
-                                        pass
-
-                                try:
-                                    self._runs_tree.scrollTo(idx)
-                                except Exception:
-                                    pass
-                            finally:
-                                self._suppress_selection_preview = False
-
-                            # Preview the selected run folder.
-                            self._schedule_preview_target(fpath=str(best_run), is_dir=True)
-                            return
-
+                    if self.activate_results_index(current):
+                        return
                 except Exception:
-                    # Fall back to normal directory preview.
                     pass
 
                 self._schedule_preview_target(fpath=str(p), is_dir=True)
@@ -1933,6 +2121,10 @@ class BenchmarkController:
         but avoid doing extra work if we're already on that folder.
         """
         try:
+            self._refresh_results_models()
+        except Exception:
+            pass
+        try:
             root = self._runs_root
             if not root or not root.exists():
                 return
@@ -2067,17 +2259,30 @@ class BenchmarkController:
         case = settings.get("case_name", "TEST").strip()
         warm = settings.get("warmup_total_sec", 0)
         logsec = settings.get("log_total_sec", 0)
-        hwinfo = settings.get("hwinfo_csv", "").strip()
+        hwinfo = resolve_hwinfo_csv()
         fur_demo = settings.get("fur_demo", "furmark-knot-gl")
         fur_demo_display = settings.get("fur_demo_display", "").strip()
         fur_w = settings.get("fur_width", 3840)
         fur_h = settings.get("fur_height", 1600)
         fur_res_display = settings.get("fur_res_display", "").strip()
-        furmark_exe = settings.get("furmark_exe", "")
-        prime_exe = settings.get("prime_exe", "")
+        furmark_exe = resolve_furmark_exe(settings.get("furmark_exe", ""))
+        prime_exe = resolve_prime95_exe(settings.get("prime_exe", ""))
 
         if warm <= 0 or logsec <= 0:
             QMessageBox.warning(self.parent, "Invalid time", "Warmup and Log must be > 0 seconds.")
+            return
+
+        # Reject characters that would create sub-folders or break the run tree.
+        _INVALID_CASE_CHARS = set('/\\:*?"<>|')
+        bad_chars = sorted({c for c in case if c in _INVALID_CASE_CHARS})
+        if bad_chars:
+            QMessageBox.warning(
+                self.parent,
+                "Invalid case name",
+                f"The case name contains characters that are not allowed in folder names: "
+                f"{' '.join(repr(c) for c in bad_chars)}\n\n"
+                f"Please remove them and try again.",
+            )
             return
 
         columns = self._sensor_manager.build_selected_columns()
@@ -2088,6 +2293,7 @@ class BenchmarkController:
             f"-WarmupSec {warm}",
             f"-LogSec {logsec}",
             f"-HwinfoCsv {ps_quote(hwinfo)}",
+            f"-RunsRoot {ps_quote(str(self._runs_root))}",
             f"-FurDemo {ps_quote(fur_demo)}",
             f"-FurWidth {fur_w}",
             f"-FurHeight {fur_h}",
@@ -2161,6 +2367,7 @@ class BenchmarkController:
                 "furmark_resolution": f"{int(fur_w)}x{int(fur_h)}",
                 "furmark_resolution_display": str(res_disp),
                 "recorded_at": datetime.now().isoformat(timespec="seconds"),
+                "runs_root": str(self._runs_root),
             }
         except Exception:
             self._pending_run_settings = {}
@@ -2268,6 +2475,27 @@ class BenchmarkController:
         self.stop_live_timer("Idle" if code == 0 else "Stopped")
         self._open_btn.setEnabled(bool(self.last_run_dir and Path(self.last_run_dir).exists()))
 
+        # Make sure the new run exists in the tree model before any UI tries to select it.
+        try:
+            if self.last_run_dir:
+                cand = Path(self.last_run_dir)
+                if cand.exists() and cand.is_dir():
+                    self._write_test_settings_for_run_dir(cand)
+                    self._latest_cached_folder = cand
+                    self._latest_cached_at_ts = time.time()
+                    try:
+                        csvp = cand / "run_window.csv"
+                        if csvp.is_file():
+                            self._latest_cached_mtime = float(csvp.stat().st_mtime)
+                    except Exception:
+                        pass
+
+            # Always refresh the results tree when a run finishes, regardless of
+            # whether last_run_dir was captured (e.g. if RUN MAP: was never emitted).
+            self._refresh_results_models()
+        except Exception:
+            pass
+
         try:
             if callable(getattr(self, "_on_run_finished", None)):
                 elapsed_sec = None
@@ -2293,17 +2521,6 @@ class BenchmarkController:
                 }
 
                 self._on_run_finished(result)
-        except Exception:
-            pass
-
-        # Refresh cache one more time (in case RUN MAP didn't arrive for some reason)
-        try:
-            if self.last_run_dir:
-                cand = Path(self.last_run_dir)
-                if cand.exists() and cand.is_dir():
-                    self._write_test_settings_for_run_dir(cand)
-                    self._latest_cached_folder = cand
-                    self._latest_cached_at_ts = time.time()
         except Exception:
             pass
 

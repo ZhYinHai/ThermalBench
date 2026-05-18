@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+*.backup
 runs/
 *.csv
 settings.json
@@ -16,9 +17,17 @@ build/
 dist_installer/
 *.exe
 
-# Optional: keep other build artifacts out of git
 *.msi
 *.msix
 # Large files
 *.zip
 ThermalBench.zip
+
+# Build logs
+build_installer_*.log
+
+# Vendor tool binaries (FurMark, Prime95, HWiNFO) — place these manually
+# Executables are already caught by *.exe above; this covers DLLs, configs, logs, etc.
+vendor/tools/FurMark/
+vendor/tools/Prime95/
+vendor/tools/HWiNFO/
