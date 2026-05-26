@@ -228,6 +228,35 @@ function Get-RunName([string]$CaseName, [int]$WarmupSec, [int]$LogSec, [switch]$
   return ("{0}_V{1}" -f $base, $nextV)
 }
 
+# Load Win32 ShowWindow so stress tools can be restored to normal size
+# WITHOUT stealing focus from ThermalBench.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class TBWinHelper {
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@ -ErrorAction SilentlyContinue
+
+function Show-ProcessNoActivate {
+  param([string]$Name = "", [int]$Id = 0)
+  # SW_SHOWNOACTIVATE (4): restore to normal size/position without stealing focus.
+  $SW_SHOWNOACTIVATE = 4
+  try {
+    $p = $null
+    if ($Id -gt 0) {
+      $p = Get-Process -Id $Id -ErrorAction SilentlyContinue
+    }
+    if (-not $p -and $Name) {
+      $p = Get-Process -Name $Name -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
+      [TBWinHelper]::ShowWindow($p.MainWindowHandle, $SW_SHOWNOACTIVATE) | Out-Null
+    }
+  } catch {}
+}
+
 function Start-StressTools {
   # return pids even if one tool is not started
   $furPid = 0
@@ -238,7 +267,9 @@ function Start-StressTools {
     $furDir = Split-Path -Parent $FurMarkExe
     $furArgs = @("--demo",$FurDemo,"--width",$FurWidth,"--height",$FurHeight,"--vsync","0","--hpgfx","1")
     Write-Host "Start FurMark2: $FurMarkExe $($furArgs -join ' ')"
-    $fur = Start-Process -FilePath $FurMarkExe -ArgumentList $furArgs -WorkingDirectory $furDir -PassThru -WindowStyle Normal
+    # Start minimised so FurMark does not steal focus from ThermalBench;
+    # Show-ProcessNoActivate restores it to normal size without activating it.
+    $fur = Start-Process -FilePath $FurMarkExe -ArgumentList $furArgs -WorkingDirectory $furDir -PassThru -WindowStyle Minimized
 
     # FurMark 2 (GeeXLab) exits the launcher process after spawning the real
     # render child, so we cannot rely on $fur.Id surviving.  Wait up to 5 s for
@@ -264,6 +295,9 @@ function Start-StressTools {
       throw "FurMark2 exited immediately."
     }
     $furPid = [int]$fur.Id
+    # Restore FurMark to normal size without activating (no focus steal).
+    Start-Sleep -Milliseconds 500
+    Show-ProcessNoActivate -Name $furName
   } else {
     Write-Host "GPU stress disabled."
   }
@@ -272,13 +306,17 @@ function Start-StressTools {
     Assert-File $PrimeExe "PrimeExe"
     $primeDir = Split-Path -Parent $PrimeExe
     Write-Host "Start Prime95: $PrimeExe -t"
-    $pr = Start-Process -FilePath $PrimeExe -ArgumentList "-t" -WorkingDirectory $primeDir -PassThru -WindowStyle Normal
+    # Start minimised so Prime95 does not steal focus from ThermalBench;
+    # Show-ProcessNoActivate restores it to normal size without activating it.
+    $pr = Start-Process -FilePath $PrimeExe -ArgumentList "-t" -WorkingDirectory $primeDir -PassThru -WindowStyle Minimized
 
     Start-Sleep -Seconds 2
     if (-not (Get-Process -Id $pr.Id -ErrorAction SilentlyContinue)) {
       throw "Prime95 exited immediately (possible first-run prompt)."
     }
     $prPid = [int]$pr.Id
+    # Restore Prime95 to normal size without activating (no focus steal).
+    Show-ProcessNoActivate -Id $prPid
   } else {
     Write-Host "CPU stress disabled."
   }
@@ -622,10 +660,17 @@ if ($ClearHwinfoAfter) {
 }
 
 if ($ClearAmbientAfter -and $ambientCsv -and (Test-Path $ambientCsv)) {
-  try {
-    Remove-Item -Force -ErrorAction Stop $ambientCsv
-    Write-Host "Ambient temp log removed: $ambientCsv"
-  } catch {
+  $removed = $false
+  for ($i = 0; $i -lt 5 -and -not $removed; $i++) {
+    try {
+      Remove-Item -Force -ErrorAction Stop $ambientCsv
+      Write-Host "Ambient temp log removed: $ambientCsv"
+      $removed = $true
+    } catch {
+      Start-Sleep -Milliseconds 300
+    }
+  }
+  if (-not $removed) {
     Write-Host "Could not remove ambient temp log (likely open): $ambientCsv" -ForegroundColor Yellow
   }
 }

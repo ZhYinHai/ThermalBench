@@ -37,6 +37,8 @@ class ComparePopup(QDialog):
         title: str,
         sensors: Iterable[str],
         group_map: Optional[dict[str, str]] = None,
+        run_labels: Optional[list[str]] = None,
+        run_dates: Optional[list[str]] = None,
         on_close: Optional[Callable[[], None]] = None,
         on_compare: Optional[Callable[[list[str]], None]] = None,
         theme_mode: str = "device",
@@ -84,6 +86,59 @@ class ComparePopup(QDialog):
         title_row.addStretch(1)
         title_row.addWidget(close_btn)
         root.addLayout(title_row)
+
+        if run_labels:
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setFrameShadow(QFrame.Plain)
+            sep.setFixedHeight(1)
+            sep.setStyleSheet(
+                f"background: {self._theme['dialog_border']}; border: none;"
+            )
+            root.addWidget(sep)
+
+            runs_section = QVBoxLayout()
+            runs_section.setContentsMargins(0, 2, 0, 2)
+            runs_section.setSpacing(2)
+
+            runs_header = QLabel("Comparing:")
+            runs_header.setStyleSheet(
+                f"color: {self._theme['close_fg']}; font-size: 11px; font-weight: 600;"
+            )
+            runs_section.addWidget(runs_header)
+
+            dates = list(run_dates or [])
+            for i, lbl in enumerate(run_labels):
+                date_str = dates[i] if i < len(dates) else ""
+                row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(6)
+
+                name_lbl = QLabel(f"\u2022  {lbl}")
+                name_lbl.setStyleSheet(
+                    f"color: {self._theme['text']}; font-size: 11px;"
+                )
+                row.addWidget(name_lbl, 1)
+
+                if date_str:
+                    date_lbl = QLabel(date_str)
+                    date_lbl.setStyleSheet(
+                        f"color: {self._theme['close_fg']}; font-size: 10px;"
+                    )
+                    date_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    row.addWidget(date_lbl)
+
+                runs_section.addLayout(row)
+            root.addLayout(runs_section)
+
+            sep2 = QFrame()
+            sep2.setFrameShape(QFrame.HLine)
+            sep2.setFrameShadow(QFrame.Plain)
+            sep2.setFixedHeight(1)
+            sep2.setStyleSheet(
+                f"background: {self._theme['dialog_border']}; border: none;"
+            )
+            root.addWidget(sep2)
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(1)

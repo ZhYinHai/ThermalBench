@@ -4682,8 +4682,17 @@ class GraphPreview(QObject):
         # Ensure we have an ambient series available for delta mode.
         # Many run_window.csv files may not include ambient unless it was merged
         # during capture; try to inject it from sidecar files when possible.
+        # IMPORTANT: an ambient column that exists in the CSV but has all-NaN values
+        # (e.g. the sensor was logged separately to ambient_window.csv) must also
+        # trigger the sidecar lookup — treat it the same as a missing column.
         try:
             amb_col = self._find_ambient_col(df_raw)
+            if amb_col:
+                try:
+                    if not bool(pd.to_numeric(df_raw[amb_col], errors="coerce").notna().any()):
+                        amb_col = None  # Column present but empty — fall through to sidecar
+                except Exception:
+                    pass
             if not amb_col:
                 df_with_amb = self._ensure_ambient_series_for_delta(df_raw)
                 if isinstance(df_with_amb, pd.DataFrame):
@@ -4767,31 +4776,38 @@ class GraphPreview(QObject):
             except Exception:
                 delta_mat = y_mat - amb_arr[:, None]
 
-            # Avoid pandas dtype-incompatible in-place assignment warnings when
-            # temperature columns are int and delta values are float.
-            # Preserve duplicate column names by assigning by positional index.
-            try:
-                delta_mat = np.asarray(delta_mat, dtype=float)
+            delta_mat = np.asarray(delta_mat, dtype=float)
 
-                cols_orig = df_disp.columns
-                df_disp.columns = range(int(df_disp.shape[1]))
-                df_disp.loc[:, temp_idxs2] = delta_mat
-                df_disp.columns = cols_orig
+            # pandas 3+ (with Copy-on-Write) rejects assigning float values into
+            # int64-dtype columns — even per-column iloc setitem doesn't always
+            # propagate.  Build a new DataFrame outright: copy non-temp columns
+            # as-is and replace temp columns with pre-computed float64 Series.
+            # This is safe for duplicate column names because we iterate by
+            # positional index, not by label.
+            try:
+                temp_pos_map = {int(i): j for j, i in enumerate(temp_idxs2)}
+                new_data: dict = {}
+                for _i, _col in enumerate(df_raw.columns):
+                    if _i in temp_pos_map:
+                        _j = temp_pos_map[_i]
+                        new_data[_col] = pd.Series(
+                            delta_mat[:, _j], index=df_raw.index, dtype="float64"
+                        )
+                    else:
+                        new_data[_col] = df_raw.iloc[:, _i]
+                df_disp = pd.DataFrame(new_data)
             except Exception:
-                # Last-resort: assign columns one by one.
-                try:
-                    cols_orig = df_disp.columns
-                    df_disp.columns = range(int(df_disp.shape[1]))
-                    for j, col_i in enumerate(temp_idxs2):
-                        try:
-                            df_disp.loc[:, int(col_i)] = np.asarray(delta_mat[:, int(j)], dtype=float)
-                        except Exception:
-                            continue
-                finally:
+                # Last-resort: assign columns one by one into a float-cast copy.
+                df_disp = df_raw.astype(
+                    {df_raw.columns[int(i)]: "float64" for i in temp_idxs2
+                     if df_raw.dtypes.iloc[int(i)].kind in ("i", "u")},
+                    errors="ignore",
+                )
+                for j, col_i in enumerate(temp_idxs2):
                     try:
-                        df_disp.columns = cols_orig
+                        df_disp.iloc[:, int(col_i)] = delta_mat[:, int(j)]
                     except Exception:
-                        pass
+                        continue
 
             return df_disp
         except Exception:
@@ -4808,10 +4824,19 @@ class GraphPreview(QObject):
             if not isinstance(df_raw, pd.DataFrame) or df_raw.empty:
                 return None
 
-            # If ambient is already present, nothing to do.
+            # If ambient is already present WITH valid (non-NaN) data, nothing to do.
+            # If the column exists but is all-NaN (e.g. empty placeholder), fall through
+            # so sidecar files can fill it with real measurements.
             try:
-                if self._find_ambient_col(df_raw):
-                    return df_raw
+                amb_col_existing = self._find_ambient_col(df_raw)
+                if amb_col_existing:
+                    try:
+                        ser = pd.to_numeric(df_raw[amb_col_existing], errors="coerce")
+                        if bool(ser.notna().any()):
+                            return df_raw  # Has valid ambient data, nothing to inject
+                        # else: column is empty — fall through to try sidecar
+                    except Exception:
+                        return df_raw  # Can't check; assume it's fine
             except Exception:
                 pass
 

@@ -50,6 +50,53 @@ def _configure_qt_high_dpi() -> None:
         pass
 
 
+def _suppress_qt_info_logs() -> None:
+    """Install a Qt message handler that only prints Critical and Fatal messages."""
+    from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+
+    def _handler(msg_type: QtMsgType, _context, message: str) -> None:
+        if msg_type in (QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
+            print(message, file=sys.stderr)
+
+    qInstallMessageHandler(_handler)
+
+
+def _suppress_ffmpeg_verbose() -> None:
+    """Set FFmpeg's internal log level to ERROR to silence informational output."""
+    import ctypes
+    import ctypes.util
+
+    AV_LOG_ERROR = 16
+
+    lib_name = ctypes.util.find_library("avutil")
+    if lib_name:
+        try:
+            avutil = ctypes.cdll.LoadLibrary(lib_name)
+            avutil.av_log_set_level(AV_LOG_ERROR)
+            return
+        except Exception:
+            pass
+
+    # Fallback: search PySide6's own directory for the bundled avutil DLL.
+    try:
+        import importlib.util as ilu
+        import pathlib
+
+        spec = ilu.find_spec("PySide6")
+        if spec and spec.submodule_search_locations:
+            pyside_dir = pathlib.Path(list(spec.submodule_search_locations)[0])
+            for pattern in ("avutil*.dll", "libavutil*.so*", "libavutil*.dylib"):
+                for dll in pyside_dir.glob(pattern):
+                    try:
+                        avutil = ctypes.cdll.LoadLibrary(str(dll))
+                        avutil.av_log_set_level(AV_LOG_ERROR)
+                        return
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+
 def _configure_tls_ca_bundle() -> None:
     """Ensure Requests can find a CA bundle in frozen builds.
 
@@ -77,6 +124,8 @@ def main() -> int:
     _enable_windows_dpi_awareness()
     _configure_qt_high_dpi()
     _configure_tls_ca_bundle()
+    _suppress_ffmpeg_verbose()
+    _suppress_qt_info_logs()
 
     from PySide6.QtWidgets import QApplication
 

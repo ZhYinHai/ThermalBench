@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QTextEdit,
+    QWidget,
 )
 
 from core.ps_helpers import RUNMAP_RE, ps_quote, build_ps_array_literal
@@ -130,6 +131,10 @@ class BenchmarkController:
         self._compare_restoring = False
         self._compare_popup: Optional[ComparePopup] = None
         self._compare_dim_overlay: Optional[DimOverlay] = None
+
+        # Compare-queue display panel (set from outside after construction)
+        self._compare_selection_frame = None
+        self._compare_selection_list_widget = None
 
         # Process for running benchmarks
         try:
@@ -399,6 +404,123 @@ class BenchmarkController:
         except Exception:
             return []
 
+    def set_compare_selection_panel(self, frame, list_widget, deselect_btn=None) -> None:
+        """Store references to the compare-queue UI widgets (set by main window)."""
+        self._compare_selection_frame = frame
+        self._compare_selection_list_widget = list_widget
+        if deselect_btn is not None:
+            try:
+                deselect_btn.clicked.connect(self._deselect_all_compare)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _get_run_datetime_str(d) -> str:
+        """Return a display date/time string for a run folder, matching the tree's logic."""
+        from datetime import datetime as _dt
+        import json as _json
+        p = Path(d)
+        # 1) recorded_at from test_settings.json (same source as the tree delegate)
+        try:
+            ts_path = p / "test_settings.json"
+            if ts_path.is_file():
+                payload = _json.loads(ts_path.read_text(encoding="utf-8"))
+                recorded_at = str(payload.get("recorded_at") or "").strip()
+                if recorded_at:
+                    return _dt.fromisoformat(
+                        recorded_at.replace("Z", "+00:00")
+                    ).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+        # 2) folder name in %Y%m%d_%H%M%S format
+        try:
+            return _dt.strptime(p.name, "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+        # 3) folder mtime
+        try:
+            return _dt.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return ""
+
+    def _update_compare_selection_panel(self) -> None:
+        """Rebuild the compare-queue panel to reflect the current selection set."""
+        try:
+            frame = self._compare_selection_frame
+            list_widget = self._compare_selection_list_widget
+            if frame is None or list_widget is None:
+                return
+
+            dirs = sorted(
+                self._compare_selected_dirs or set(),
+                key=lambda p: (str(p.parent.name).casefold(), str(p.name).casefold()),
+            )
+
+            if not dirs:
+                frame.hide()
+                return
+
+            try:
+                runs_root_resolved = self._runs_root.resolve()
+            except Exception:
+                runs_root_resolved = None
+
+            # Clear existing row widgets
+            layout = list_widget.layout()
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+
+            for d in dirs:
+                try:
+                    parent = d.parent
+                    if runs_root_resolved and parent.resolve() == runs_root_resolved:
+                        run_label = d.name
+                    else:
+                        run_label = f"{parent.name}  /  {d.name}"
+                except Exception:
+                    run_label = d.name
+
+                date_str = self._get_run_datetime_str(d)
+
+                row = QWidget()
+                row.setObjectName("CompareQueueRow")
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(6)
+
+                name_lbl = QLabel(f"\u2022  {run_label}")
+                name_lbl.setObjectName("CompareQueueItemLabel")
+                name_lbl.setMinimumWidth(0)
+                name_lbl.setSizePolicy(name_lbl.sizePolicy().horizontalPolicy(), name_lbl.sizePolicy().verticalPolicy())
+                row_layout.addWidget(name_lbl, 1)
+
+                if date_str:
+                    date_lbl = QLabel(date_str)
+                    date_lbl.setObjectName("CompareQueueItemDate")
+                    date_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    row_layout.addWidget(date_lbl)
+
+                layout.addWidget(row)
+
+            frame.show()
+        except Exception:
+            pass
+
+    def _deselect_all_compare(self) -> None:
+        """Clear all compare selections and refresh the UI."""
+        try:
+            if self._compare_selected_dirs is not None:
+                self._compare_selected_dirs.clear()
+            else:
+                self._compare_selected_dirs = set()
+        except Exception:
+            self._compare_selected_dirs = set()
+        self._apply_compare_selection_to_view()
+        self._update_compare_btn_state()
+
     def _update_compare_btn_state(self) -> None:
         try:
             if self._compare_btn is None:
@@ -408,6 +530,8 @@ class BenchmarkController:
             self._compare_btn.setEnabled(len(valid) >= 2)
         except Exception:
             pass
+
+        self._update_compare_selection_panel()
 
     @staticmethod
     def _is_compare_result_dir(run_dir: Path) -> bool:
@@ -594,7 +718,21 @@ class BenchmarkController:
             if sensor_sets:
                 common = set.intersection(*sensor_sets) if sensor_sets else set()
 
-            title = f"Compare ({len(run_dirs)} results)"
+            title = "Compare"
+
+            run_labels: list[str] = []
+            run_dates: list[str] = []
+            for _rd in run_dirs:
+                try:
+                    _parent = _rd.parent
+                    _runs_root_resolved = self._runs_root.resolve() if self._runs_root else None
+                    if _runs_root_resolved and _parent.resolve() == _runs_root_resolved:
+                        run_labels.append(_rd.name)
+                    else:
+                        run_labels.append(f"{_parent.name}  /  {_rd.name}")
+                except Exception:
+                    run_labels.append(_rd.name)
+                run_dates.append(self._get_run_datetime_str(_rd))
 
             # Best-effort: group sensors by their HWiNFO device group (cached from SM2).
             # This is the same device grouping used by the sensor picker dialogs.
@@ -614,6 +752,8 @@ class BenchmarkController:
                 title=title,
                 sensors=sorted(common),
                 group_map=group_map,
+                run_labels=run_labels,
+                run_dates=run_dates,
                 on_close=self._close_compare_popup,
                 on_compare=self._create_compare_result_from_popup,
                 theme_mode=str(getattr(self.parent, "theme_mode", "device") or "device"),
@@ -790,12 +930,37 @@ class BenchmarkController:
                 pass
             self._update_compare_btn_state()
 
+            # Refresh the tree so the newly created compare folder is visible.
+            # The source model still holds a pre-creation snapshot; we must rebuild it
+            # before trying to look up the new index.  We also navigate to the current
+            # real month because the compare result is stamped with today's date, and
+            # the user may have been browsing an older month.
+            try:
+                new_month = datetime.now().strftime("%Y-%m")
+                if hasattr(self._runs_source_model, "set_current_month"):
+                    self._runs_source_model.set_current_month(new_month)
+            except Exception:
+                pass
+            self._refresh_results_models()
+            try:
+                if hasattr(self.parent, "_refresh_results_month_nav"):
+                    self.parent._refresh_results_month_nav()
+            except Exception:
+                pass
+
             # Select and preview the new compare run
             try:
                 idx = self._path_to_proxy_index(str(out_run_dir))
                 if idx is not None and (not hasattr(idx, "isValid") or idx.isValid()):
                     sm = self._runs_tree.selectionModel()
                     if sm is not None:
+                        # Expand the parent case folder first so the run is visible
+                        try:
+                            parent_idx = idx.parent()
+                            if parent_idx.isValid():
+                                self._runs_tree.expand(parent_idx)
+                        except Exception:
+                            pass
                         self._suppress_selection_preview = True
                         try:
                             sm.setCurrentIndex(
@@ -1006,7 +1171,7 @@ class BenchmarkController:
         if log_elapsed < self._log_total:
             self._live_timer.setText(f"Log  {self._fmt_mmss(self._log_total - log_elapsed)}")
             return
-        self._live_timer.setText("Done  00:00")
+        self._live_timer.setText("Finishing…")
 
     # -------------------------------------------------------------------------
     # Results Browser
@@ -1216,6 +1381,219 @@ class BenchmarkController:
             return hits
         except Exception:
             return []
+
+    def _confirm_cascade_delete_dialog(
+        self,
+        *,
+        blocked_run_names: list[str],
+        compare_refs: list[str],
+    ) -> bool:
+        """Show a dialog blocking deletion until linked compare results are removed.
+
+        Returns True if the user chose to cascade-delete the compare results and then
+        the runs; False to cancel everything.
+        """
+        try:
+            try:
+                theme_mode = str(getattr(self.parent, "theme_mode", "device") or "device")
+            except Exception:
+                theme_mode = "device"
+
+            effective_mode = resolve_effective_theme_mode(theme_mode, QApplication.instance())
+            is_light = effective_mode == "light"
+
+            dlg = QDialog(self.parent)
+            try:
+                dlg.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+            except Exception:
+                pass
+            dlg.setModal(True)
+
+            top = None
+            try:
+                top = self.parent.window() if hasattr(self.parent, "window") else self.parent
+            except Exception:
+                top = self.parent
+
+            dim = None
+            try:
+                from ui.graph_preview.ui_dim_overlay import DimOverlay as _DimOverlay
+                dim = _DimOverlay(top, on_click=lambda: dlg.reject())
+                try:
+                    dim.setGeometry(top.rect())
+                except Exception:
+                    pass
+                dim.show()
+            except Exception:
+                dim = None
+
+            root_layout = QVBoxLayout(dlg)
+            root_layout.setContentsMargins(16, 14, 16, 14)
+            root_layout.setSpacing(10)
+
+            # Title
+            lab_title = QLabel("Blocked by Compare Results")
+            try:
+                lab_title.setStyleSheet("font-weight: 600;")
+            except Exception:
+                pass
+            root_layout.addWidget(lab_title)
+
+            # Description
+            n_runs = len(blocked_run_names)
+            n_refs = len(compare_refs)
+            run_word = "run" if n_runs == 1 else "runs"
+            ref_word = "compare result" if n_refs == 1 else "compare results"
+            lab_body = QLabel(
+                f"The {n_runs} selected {run_word} {'is' if n_runs == 1 else 'are'} "
+                f"referenced by {n_refs} {ref_word} listed below.\n\n"
+                f"To proceed, the {ref_word} must be deleted first. "
+                f"You can remove them automatically and then delete the {run_word}, "
+                f"or cancel to keep everything."
+            )
+            try:
+                lab_body.setWordWrap(True)
+            except Exception:
+                pass
+            root_layout.addWidget(lab_body)
+
+            # Detail box: runs to be deleted
+            runs_box = QTextEdit()
+            runs_box.setReadOnly(True)
+            runs_label = QLabel(f"{'Run' if n_runs == 1 else 'Runs'} to delete:")
+            try:
+                runs_label.setStyleSheet("font-weight: 600;")
+            except Exception:
+                pass
+            root_layout.addWidget(runs_label)
+            runs_box.setPlainText("\n".join(blocked_run_names))
+            try:
+                runs_box.setMinimumHeight(60)
+                runs_box.setMaximumHeight(100)
+            except Exception:
+                pass
+            root_layout.addWidget(runs_box)
+
+            # Detail box: compare results that block the delete
+            refs_label = QLabel(f"Compare {ref_word} that will also be deleted:")
+            try:
+                refs_label.setStyleSheet("font-weight: 600;")
+            except Exception:
+                pass
+            root_layout.addWidget(refs_label)
+            refs_box = QTextEdit()
+            refs_box.setReadOnly(True)
+            refs_box.setPlainText("\n".join(compare_refs))
+            try:
+                refs_box.setMinimumHeight(80)
+                refs_box.setMaximumHeight(160)
+            except Exception:
+                pass
+            root_layout.addWidget(refs_box)
+
+            # Buttons
+            btn_row = QHBoxLayout()
+            btn_row.setContentsMargins(0, 4, 0, 0)
+            btn_row.setSpacing(8)
+            btn_row.addStretch(1)
+
+            cancel_btn = QPushButton("Cancel")
+            cascade_btn = QPushButton(
+                f"Remove compare {ref_word} && delete {run_word}"
+            )
+            try:
+                cancel_btn.setDefault(True)
+                cancel_btn.clicked.connect(dlg.reject)
+                cascade_btn.clicked.connect(dlg.accept)
+            except Exception:
+                pass
+
+            btn_row.addWidget(cascade_btn)
+            btn_row.addWidget(cancel_btn)
+            root_layout.addLayout(btn_row)
+
+            # Stylesheet
+            try:
+                dlg.setStyleSheet(
+                    (
+                        """
+                        QDialog {
+                            background-color: #FFFFFF;
+                            border: 1px solid #D0D0D0;
+                            border-radius: 10px;
+                        }
+                        QLabel { color: #1A1A1A; }
+                        QTextEdit {
+                            background-color: #FFFFFF;
+                            color: #1A1A1A;
+                            border: 1px solid #D0D0D0;
+                            border-radius: 8px;
+                            padding: 8px 10px;
+                            selection-background-color: #CFE4FF;
+                            selection-color: #1A1A1A;
+                        }
+                        QPushButton {
+                            background: #FFFFFF;
+                            border: 1px solid #D0D0D0;
+                            color: #1A1A1A;
+                            padding: 6px 16px;
+                            border-radius: 8px;
+                        }
+                        QPushButton:hover { background: #F0F0F0; }
+                        QPushButton:pressed { background: #E6E6E6; }
+                        """
+                        if is_light
+                        else
+                        """
+                        QDialog {
+                            background-color: #151515;
+                            border: 1px solid rgba(128, 128, 128, 0.35);
+                            border-radius: 10px;
+                        }
+                        QLabel { color: #EAEAEA; }
+                        QTextEdit {
+                            background-color: #0F0F0F;
+                            color: #EAEAEA;
+                            border: 1px solid rgba(128, 128, 128, 0.35);
+                            border-radius: 8px;
+                            padding: 8px 10px;
+                        }
+                        QPushButton {
+                            background: #252525;
+                            border: 1px solid rgba(128, 128, 128, 0.35);
+                            color: #EAEAEA;
+                            padding: 6px 16px;
+                            border-radius: 8px;
+                        }
+                        QPushButton:hover { background: #2E2E2E; }
+                        QPushButton:pressed { background: #1F1F1F; }
+                        """
+                    )
+                )
+            except Exception:
+                pass
+
+            try:
+                dlg.setMinimumWidth(560)
+            except Exception:
+                pass
+
+            try:
+                QTimer.singleShot(0, lambda: raise_center_and_focus(parent=top, dlg=dlg, dim_overlay=dim))
+            except Exception:
+                pass
+
+            ok = dlg.exec() == QDialog.Accepted
+
+            try:
+                if dim is not None:
+                    dim.hide()
+                    dim.deleteLater()
+            except Exception:
+                pass
+            return bool(ok)
+        except Exception:
+            return False
 
     def _confirm_delete_dialog(
         self,
@@ -1869,33 +2247,55 @@ class BenchmarkController:
             n = len(final)
             name_block = self._build_delete_details_text(final)
 
-            # Warn if any run folders being deleted are referenced by compare results.
-            warn_block = ""
+            # If any selected item is a run folder that compare results depend on,
+            # block the delete and offer a cascade flow instead.
+            refs: list[str] = []
             try:
                 run_rel = self._collect_run_rel_paths_for_targets(final)
                 refs = self._find_compare_results_referencing_runs(run_rel)
-                if refs:
-                    preview_refs = refs[:6]
-                    more_refs = "" if len(refs) <= 6 else f"\n(+{len(refs) - 6} more)"
-                    warn_block = (
-                        "\n\nWARNING: One or more selected run(s) are used by compare result(s).\n"
-                        "Deleting them may break those compare results.\n\n"
-                        + "\n".join(preview_refs)
-                        + more_refs
-                    )
             except Exception:
-                warn_block = ""
+                refs = []
 
-            prompt = f"Delete {n} item(s)?\nThis action cannot be undone."
-            details = f"{name_block}{warn_block}".strip()
-            if not self._confirm_delete_dialog(
-                title="Remove",
-                prompt_text=prompt,
-                details_text=details,
-                confirm_text="Delete",
-                cancel_text="Cancel",
-            ):
-                return
+            if refs:
+                # Collect human-readable names for the runs being deleted.
+                blocked_run_names = [p.name for p in final]
+                if not self._confirm_cascade_delete_dialog(
+                    blocked_run_names=blocked_run_names,
+                    compare_refs=refs,
+                ):
+                    return
+
+                # User confirmed cascade: delete the compare result folders first.
+                self._release_preview_for_delete_targets(
+                    [self._runs_root / r for r in refs if self._runs_root is not None]
+                )
+                try:
+                    root_r = self._runs_root.resolve() if self._runs_root else None
+                except Exception:
+                    root_r = self._runs_root
+
+                for rel_ref in refs:
+                    try:
+                        ref_path = (self._runs_root / rel_ref) if self._runs_root else None
+                        if ref_path and ref_path.exists():
+                            shutil.rmtree(str(ref_path), ignore_errors=True)
+                    except Exception:
+                        pass
+
+                # After cascade, proceed directly to delete the original runs below
+                # (skip the second confirm dialog — user already said yes).
+            else:
+                # No compare dependencies — show normal confirm dialog.
+                prompt = f"Delete {n} item(s)?\nThis action cannot be undone."
+                details = name_block.strip()
+                if not self._confirm_delete_dialog(
+                    title="Remove",
+                    prompt_text=prompt,
+                    details_text=details,
+                    confirm_text="Delete",
+                    cancel_text="Cancel",
+                ):
+                    return
 
             self._release_preview_for_delete_targets(final)
 
@@ -1945,22 +2345,149 @@ class BenchmarkController:
                     return
 
             # Execute deletes.
+            # Three-pass strategy to handle Windows file locks robustly:
+            #
+            # Pass 1 – shutil.rmtree(ignore_errors=True): handles the normal case.
+            # Pass 2 – os.rename to %TEMP%: on Windows, renaming a *directory*
+            #   succeeds even when files inside are held open by OneDrive, the
+            #   NTFS indexer, or antivirus — the rename only touches the directory
+            #   entry, not the individual file handles.  Moving the folder out of
+            #   OneDrive's watched tree also causes OneDrive to release its sync
+            #   lock, so the subsequent rmtree from %TEMP% succeeds.
+            # Pass 3 – report anything still surviving.
+            import gc as _gc
+            import tempfile as _tempfile
+            try:
+                _gc.collect()
+            except Exception:
+                pass
+
+            def _robust_delete_dir(p: Path) -> bool:
+                """Delete directory p using all available methods. Returns True if gone."""
+                # Pass 1: normal rmtree
+                shutil.rmtree(str(p), ignore_errors=True)
+                if not p.exists():
+                    return True
+
+                # Pass 2: rename to %TEMP% (atomic on same drive; works with locked
+                # files inside because the directory-entry rename doesn't need
+                # exclusive access to individual files).
+                try:
+                    _tmp_container = Path(_tempfile.mkdtemp(prefix="tb_del_"))
+                    _tmp_dest = _tmp_container / p.name
+                    try:
+                        os.rename(str(p), str(_tmp_dest))
+                    except OSError:
+                        try:
+                            _tmp_container.rmdir()
+                        except Exception:
+                            pass
+                        raise
+                    # Original location is now gone — treat as success.
+                    # Best-effort cleanup of the temp copy (may partially fail).
+                    shutil.rmtree(str(_tmp_dest), ignore_errors=True)
+                    try:
+                        _tmp_container.rmdir()
+                    except Exception:
+                        pass
+                    return not p.exists()
+                except Exception:
+                    pass
+
+                return False
+
+            delete_failed: list[tuple[Path, str]] = []
             for p in final:
                 try:
                     if p.is_dir():
-                        shutil.rmtree(str(p), ignore_errors=False)
-                        _cleanup_empty_parents(p)
+                        if _robust_delete_dir(p):
+                            _cleanup_empty_parents(p)
+                        else:
+                            delete_failed.append((p, "Folder could not be fully removed."))
                     else:
-                        p.unlink(missing_ok=True)
-                        _cleanup_empty_parents(p)
-                except Exception:
-                    # Best-effort: keep going.
-                    pass
+                        _deleted = False
+                        try:
+                            p.unlink(missing_ok=True)
+                            _deleted = not p.exists()
+                        except Exception:
+                            pass
+                        if not _deleted:
+                            # Try move-to-temp for individual files too.
+                            try:
+                                _tmp_f = Path(_tempfile.mktemp(prefix="tb_del_", suffix=p.suffix))
+                                os.rename(str(p), str(_tmp_f))
+                                try:
+                                    _tmp_f.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                _deleted = not p.exists()
+                            except Exception:
+                                pass
+                        if _deleted:
+                            _cleanup_empty_parents(p)
+                        else:
+                            delete_failed.append((p, "File could not be fully removed."))
+                except Exception as _de:
+                    delete_failed.append((p, str(_de)))
+                except Exception as _de:
+                    delete_failed.append((p, str(_de)))
+
+            if delete_failed:
+                _msg_lines = [
+                    f"{p.name}: {err}"
+                    for p, err in delete_failed[:5]
+                ]
+                _more = "" if len(delete_failed) <= 5 else f"\n(+{len(delete_failed) - 5} more)"
+                QMessageBox.warning(
+                    self.parent,
+                    "Remove Failed",
+                    "Some items could not be removed:\n\n"
+                    + "\n".join(_msg_lines)
+                    + _more
+                    + "\n\nIf your runs folder is inside OneDrive, pause syncing and try again.",
+                )
+
+            # Prune compare selection for any deleted paths.
+            try:
+                for p in final:
+                    self._compare_selected_dirs.discard(p)
+            except Exception:
+                pass
+
+            self._last_selected_path = None
+
+            try:
+                sm = self._runs_tree.selectionModel()
+                if sm is not None:
+                    sm.clearSelection()
+            except Exception:
+                pass
 
             try:
                 self._update_remove_btn_state()
             except Exception:
                 pass
+            try:
+                self._update_compare_btn_state()
+            except Exception:
+                pass
+
+            # Rebuild the model from disk synchronously so the deleted entries
+            # disappear from the tree immediately — before any other queued event
+            # runs. The deferred timer below handles the selection + preview.
+            try:
+                self._refresh_results_models()
+            except Exception:
+                pass
+            try:
+                self.parent._refresh_results_month_nav()
+            except Exception:
+                pass
+
+            # Select the next available result on the following event-loop tick
+            # (after the view has fully processed the model reset above).
+            QTimer.singleShot(0, self.select_latest_result)
+
         except Exception:
             pass
 
@@ -2069,6 +2596,33 @@ class BenchmarkController:
                 except Exception:
                     return
 
+        import tempfile as _tempfile2
+
+        def _robust_delete_dir2(p: Path) -> bool:
+            shutil.rmtree(str(p), ignore_errors=True)
+            if not p.exists():
+                return True
+            try:
+                _tmp_c = Path(_tempfile2.mkdtemp(prefix="tb_del_"))
+                _tmp_d = _tmp_c / p.name
+                try:
+                    os.rename(str(p), str(_tmp_d))
+                except OSError:
+                    try:
+                        _tmp_c.rmdir()
+                    except Exception:
+                        pass
+                    raise
+                shutil.rmtree(str(_tmp_d), ignore_errors=True)
+                try:
+                    _tmp_c.rmdir()
+                except Exception:
+                    pass
+                return not p.exists()
+            except Exception:
+                pass
+            return False
+
         failed: list[tuple[Path, str]] = []
         for rd in run_dirs:
             try:
@@ -2077,11 +2631,11 @@ class BenchmarkController:
                     parent = rd.parent
                 except Exception:
                     parent = None
-                shutil.rmtree(rd)
-
-                # If the case folder becomes empty, remove it too.
-                if parent is not None:
-                    _cleanup_empty_parents(parent)
+                if _robust_delete_dir2(rd):
+                    if parent is not None:
+                        _cleanup_empty_parents(parent)
+                else:
+                    failed.append((rd, "Folder could not be fully removed."))
             except Exception as exc:
                 failed.append((rd, str(exc)))
 
@@ -2373,6 +2927,20 @@ class BenchmarkController:
             self._pending_run_settings = {}
 
         self.proc.start()
+
+        # Re-raise ThermalBench after stress tools start.  run_case.ps1 launches
+        # FurMark / Prime95 minimised and restores them without activation, but
+        # guard against edge cases (e.g. GeeXLab child spawning its own window)
+        # by explicitly re-focusing ThermalBench a few seconds into the run.
+        try:
+            _win = self.parent.window() if hasattr(self.parent, "window") else self.parent
+            for _ms in (3000, 7000):
+                _t = QTimer(self.parent)
+                _t.setSingleShot(True)
+                _t.timeout.connect(lambda w=_win: (w.raise_(), w.activateWindow()))
+                _t.start(_ms)
+        except Exception:
+            pass
 
     def abort(self):
         if self.proc is None:

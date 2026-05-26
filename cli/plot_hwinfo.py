@@ -22,26 +22,6 @@ from pathlib import Path
 from typing import Optional, Tuple, List
 
 import pandas as pd
-import matplotlib.pyplot as plt
-
-# Apply dark plotting theme similar to provided image
-plt.rcParams.update({
-    "figure.facecolor": "#121212",
-    "axes.facecolor": "#121212",
-    "axes.edgecolor": "#2A2A2A",
-    "axes.labelcolor": "#EAEAEA",
-    "xtick.color": "#BDBDBD",
-    "ytick.color": "#BDBDBD",
-    "text.color": "#EAEAEA",
-    "grid.color": "#2A2A2A",
-    "grid.linestyle": ":",
-    "grid.linewidth": 0.6,
-    "axes.grid": True,
-    "legend.frameon": False,
-})
-
-# default line color palette (teal-ish)
-LINE_COLOR = "#1BE7C7"
 
 
 # ----------------- helpers -----------------
@@ -540,66 +520,13 @@ def main():
                 encoding="utf-8",
             )
 
-    x = build_time_axis(df)
-
     summary = []
     for c in selected:
         y = pd.to_numeric(df[c], errors="coerce")
         if y.notna().sum() < 2:
             continue
 
-        fig = plt.figure(figsize=(8, 3.5))
-        ax = fig.gca()
-        ax.plot(x, y, color=LINE_COLOR, linewidth=2.2)
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Value")
-        ax.set_title(str(c))
-        ax.grid(True, linestyle=':', color="#2A2A2A", linewidth=0.6)
-        # style spines subtle
-        for sp in ax.spines.values():
-            sp.set_color("#2A2A2A")
-        fig.tight_layout()
-        fig.savefig(outdir / f"{sanitize(str(c))}.png", dpi=160, facecolor=fig.get_facecolor())
-        plt.close(fig)
-
         summary.append({"sensor": str(c), "min": float(y.min()), "max": float(y.max()), "avg": float(y.mean())})
-
-    fig = plt.figure(figsize=(10, 4))
-    ax = fig.gca()
-    # color map for distinct series
-    cmap = plt.get_cmap("tab20")
-    color_count = cmap.N
-    for i, c in enumerate(selected):
-        y = pd.to_numeric(df[c], errors="coerce")
-        if y.notna().sum() < 2:
-            continue
-        color = cmap(i % color_count)
-        ax.plot(x, y, linewidth=2.4, color=color, label=str(c))
-
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Value")
-    ax.set_title("Selected sensors")
-    # subtle dotted grid lines horizontally
-    ax.grid(True, which='both', axis='y', linestyle=':', color="#2A2A2A", linewidth=0.6)
-    # style spines and ticks
-    for sp in ax.spines.values():
-        sp.set_color("#2A2A2A")
-    ax.tick_params(axis='x', colors="#BDBDBD")
-    ax.tick_params(axis='y', colors="#BDBDBD")
-
-    # legend small, semi-transparent background matching theme
-    leg = ax.legend(fontsize=8, frameon=True)
-    if leg:
-        try:
-            leg.get_frame().set_facecolor('#171717')
-            leg.get_frame().set_edgecolor('#2A2A2A')
-            leg.get_frame().set_alpha(0.9)
-        except Exception:
-            pass
-
-    fig.tight_layout()
-    fig.savefig(outdir / "ALL_SELECTED.png", dpi=160, facecolor=fig.get_facecolor())
-    plt.close(fig)
 
     pd.DataFrame(summary).to_csv(outdir / "summary.csv", index=False)
 

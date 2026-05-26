@@ -95,10 +95,22 @@ def _legacy_runs_roots() -> list[Path]:
     """
     Old locations that may contain historical results.
 
-    Important old default:
-      %LOCALAPPDATA%/Programs/ThermalBench/runs
+    Covers every default that was used in previous releases:
+      1. Documents/ThermalBench/runs  — default before 2026 (OneDrive-unsafe)
+      2. Inno Setup InstallDir/runs   — old bundled layout
+      3. LOCALAPPDATA/Programs/ThermalBench/runs  — early installer layout
+      4. <app_root>/runs              — dev / portable layout
     """
     candidates: list[Path] = []
+
+    # Old default: Documents/ThermalBench/runs.
+    # Use the proper shell-API resolver so OneDrive-redirected Documents is
+    # found correctly on machines where Documents lives inside OneDrive.
+    try:
+        from core.user_paths import documents_dir as _docs_dir
+        candidates.append(_docs_dir() / "ThermalBench" / "runs")
+    except Exception:
+        candidates.append(_documents_dir() / "ThermalBench" / "runs")
 
     old_install_dir = _read_hkcu_string("InstallDir")
     if old_install_dir:
@@ -136,11 +148,22 @@ def migrate_legacy_runs_to_data_root() -> RunsMigrationResult:
       <old install>/runs/<case>/<run>
 
     To new:
-      Documents/ThermalBench/runs/<case>/<run>
+      %LOCALAPPDATA%/ThermalBench/runs/<case>/<run>
 
     Existing destination folders are never overwritten.
+    A sentinel file is written on completion so this never re-runs on future
+    startups — preventing deleted runs from being re-imported from the old
+    location.
     """
+    from core.user_paths import local_data_root as _local_data_root
+
     dest_root = resolve_runs_root()
+
+    # Sentinel lives next to the runs folder, not inside it, so it survives
+    # the user deleting all runs.
+    _sentinel = _local_data_root() / "migration_v1.done"
+    if _sentinel.exists():
+        return RunsMigrationResult(destination=str(dest_root), copied=0, skipped=0, errors=[])
 
     result = RunsMigrationResult(
         destination=str(dest_root),
@@ -190,5 +213,11 @@ def migrate_legacy_runs_to_data_root() -> RunsMigrationResult:
 
         except Exception as exc:
             result.errors.append(f"{src_root}: {exc}")
+
+    # Write sentinel so migration never re-runs.
+    try:
+        _sentinel.write_text("done", encoding="utf-8")
+    except Exception as exc:
+        result.errors.append(f"sentinel write failed: {exc}")
 
     return result

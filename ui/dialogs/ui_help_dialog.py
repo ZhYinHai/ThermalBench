@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -557,10 +559,247 @@ class HelpDialog(QDialog):
                 widget = self._build_inline_image(str(item["image"]), scale=scale)
                 if widget is not None:
                     root.addWidget(widget)
+            elif isinstance(item, dict) and "video" in item:
+                _flush()
+                widget = self._build_inline_video(str(item["video"]))
+                if widget is not None:
+                    root.addWidget(widget)
+            elif isinstance(item, dict) and "video_expandable" in item:
+                _flush()
+                widget = self._build_collapsible_video(
+                    str(item["video_expandable"]),
+                    str(item.get("label", "Show video walkthrough")),
+                )
+                if widget is not None:
+                    root.addWidget(widget)
             elif isinstance(item, str):
                 text_buf.append(item)
 
         _flush()
+
+    def _build_inline_video(self, video_path: str) -> QWidget | None:
+        """Render a looping video player inline."""
+        try:
+            if not Path(video_path).exists():
+                return None
+
+            # Keep strong Python references on self so PySide6 GC never touches
+            # the player/audio while the dialog is alive.
+            if not hasattr(self, '_video_players'):
+                self._video_players: list = []
+
+            container = QFrame()
+            container.setObjectName("InlineVideo")
+            container.setStyleSheet(
+                f"QFrame#InlineVideo {{ background:{self._theme['card_bg']}; border:1px solid {self._theme['card_border']};"
+                " border-radius:8px; }"
+            )
+            layout = QVBoxLayout(container)
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(6)
+
+            video_widget = QVideoWidget()
+            video_widget.setAspectRatioMode(Qt.IgnoreAspectRatio)
+            video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            video_widget.setFixedHeight(4)  # placeholder until native size arrives
+            layout.addWidget(video_widget)
+
+            # Create without a Qt parent; lifetime managed by self._video_players.
+            player = QMediaPlayer()
+            audio = QAudioOutput()
+            audio.setVolume(0.0)
+            player.setAudioOutput(audio)
+            player.setVideoOutput(video_widget)
+            self._video_players.append((player, audio))
+
+            def _on_native_size(vw=video_widget, _player=player):
+                sz = _player.videoSink().videoSize()
+                if sz.width() > 0 and sz.height() > 0:
+                    ar = sz.height() / sz.width()
+                    def _apply(vw=vw, ar=ar):
+                        w = vw.width()
+                        if w <= 0:
+                            w = 400
+                        vw.setFixedHeight(int(w * ar))
+                    QTimer.singleShot(50, _apply)
+
+            player.videoSink().videoSizeChanged.connect(_on_native_size)
+
+            # Defer setSource+play until after the event loop has processed the
+            # widget tree; this prevents FFmpeg's interrupt callback from firing
+            # before Qt Multimedia's pipeline is fully initialised.
+            video_url = QUrl.fromLocalFile(str(Path(video_path)))
+
+            def _start(p=player, u=video_url):
+                p.setSource(u)
+                p.setLoops(-1)
+                p.play()
+
+            QTimer.singleShot(0, _start)
+
+            controls_row = QHBoxLayout()
+            controls_row.setContentsMargins(0, 0, 0, 0)
+            controls_row.setSpacing(8)
+
+            btn = QPushButton("⏸  Pause")
+            btn.setFixedWidth(90)
+            btn.setStyleSheet(
+                f"QPushButton#VideoCtrl {{ background:{self._theme['button_bg']}; color:{self._theme['text']};"
+                f" border:1px solid {self._theme['button_border']};"
+                " border-radius:5px; font-size:11px; padding:3px 8px; }"
+                f" QPushButton#VideoCtrl:hover {{ background:{self._theme.get('button_hover_bg', self._theme['button_bg'])}; }}"
+            )
+            btn.setObjectName("VideoCtrl")
+
+            def _toggle(checked=False, _btn=btn, _player=player):
+                if _player.playbackState() == QMediaPlayer.PlayingState:
+                    _player.pause()
+                    _btn.setText("▶  Play")
+                else:
+                    _player.play()
+                    _btn.setText("⏸  Pause")
+
+            btn.clicked.connect(_toggle)
+            controls_row.addWidget(btn)
+            controls_row.addStretch(1)
+            layout.addLayout(controls_row)
+
+            return container
+        except Exception:
+            return None
+
+    def _build_collapsible_video(self, video_path: str, label: str) -> QWidget | None:
+        """Render a button that lazily reveals a looping video player when clicked."""
+        try:
+            if not Path(video_path).exists():
+                return None
+
+            if not hasattr(self, '_video_players'):
+                self._video_players: list = []
+
+            wrapper = QWidget()
+            outer = QVBoxLayout(wrapper)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(6)
+
+            reveal_btn = QPushButton(f"▶  {label}")
+            reveal_btn.setCursor(Qt.PointingHandCursor)
+            reveal_btn.setStyleSheet(
+                f"QPushButton {{ background:{self._theme['button_bg']}; color:{self._theme['text']};"
+                f" border:1px solid {self._theme['button_border']};"
+                " border-radius:6px; font-size:12px; padding:6px 12px; text-align:left; }}"
+                f"QPushButton:hover {{ background:{self._theme.get('button_hover_bg', self._theme['button_bg'])}; }}"
+            )
+            outer.addWidget(reveal_btn)
+
+            video_holder = QWidget()
+            holder_layout = QVBoxLayout(video_holder)
+            holder_layout.setContentsMargins(0, 0, 0, 0)
+            video_holder.hide()
+            outer.addWidget(video_holder)
+
+            _state: dict = {"built": False, "player": None}
+
+            def _build_player() -> None:
+                vcontainer = QFrame()
+                vcontainer.setObjectName("InlineVideo")
+                vcontainer.setStyleSheet(
+                    f"QFrame#InlineVideo {{ background:{self._theme['card_bg']}; border:1px solid {self._theme['card_border']};"
+                    " border-radius:8px; }"
+                )
+                c_layout = QVBoxLayout(vcontainer)
+                c_layout.setContentsMargins(8, 8, 8, 8)
+                c_layout.setSpacing(6)
+
+                video_widget = QVideoWidget()
+                video_widget.setAspectRatioMode(Qt.IgnoreAspectRatio)
+                video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                video_widget.setFixedHeight(4)
+                c_layout.addWidget(video_widget)
+
+                player = QMediaPlayer()
+                audio = QAudioOutput()
+                audio.setVolume(0.0)
+                player.setAudioOutput(audio)
+                player.setVideoOutput(video_widget)
+                self._video_players.append((player, audio))
+                _state["player"] = player
+
+                def _on_native_size(vw=video_widget, _player=player):
+                    sz = _player.videoSink().videoSize()
+                    if sz.width() > 0 and sz.height() > 0:
+                        ar = sz.height() / sz.width()
+                        def _apply(vw=vw, ar=ar):
+                            w = vw.width()
+                            if w <= 0:
+                                w = 400
+                            vw.setFixedHeight(int(w * ar))
+                        QTimer.singleShot(50, _apply)
+
+                player.videoSink().videoSizeChanged.connect(_on_native_size)
+
+                url = QUrl.fromLocalFile(str(Path(video_path)))
+
+                def _start(p=player, u=url):
+                    p.setSource(u)
+                    p.setLoops(-1)
+                    p.play()
+
+                QTimer.singleShot(0, _start)
+
+                ctrl_row = QHBoxLayout()
+                ctrl_row.setContentsMargins(0, 0, 0, 0)
+                ctrl_row.setSpacing(8)
+
+                pause_btn = QPushButton("⏸  Pause")
+                pause_btn.setFixedWidth(90)
+                pause_btn.setStyleSheet(
+                    f"QPushButton#VideoCtrl {{ background:{self._theme['button_bg']}; color:{self._theme['text']};"
+                    f" border:1px solid {self._theme['button_border']};"
+                    " border-radius:5px; font-size:11px; padding:3px 8px; }"
+                    f" QPushButton#VideoCtrl:hover {{ background:{self._theme.get('button_hover_bg', self._theme['button_bg'])}; }}"
+                )
+                pause_btn.setObjectName("VideoCtrl")
+
+                def _toggle_pause(checked=False, _btn=pause_btn, _player=player):
+                    if _player.playbackState() == QMediaPlayer.PlayingState:
+                        _player.pause()
+                        _btn.setText("▶  Play")
+                    else:
+                        _player.play()
+                        _btn.setText("⏸  Pause")
+
+                pause_btn.clicked.connect(_toggle_pause)
+                ctrl_row.addWidget(pause_btn)
+                ctrl_row.addStretch(1)
+                c_layout.addLayout(ctrl_row)
+                holder_layout.addWidget(vcontainer)
+
+            def _on_reveal():
+                if not _state["built"]:
+                    _state["built"] = True
+                    _build_player()
+
+                visible = not video_holder.isVisible()
+                video_holder.setVisible(visible)
+
+                p = _state["player"]
+                if p is not None:
+                    if visible:
+                        p.setPosition(0)
+                        p.play()
+                    else:
+                        p.pause()
+
+                if visible:
+                    reveal_btn.setText("▲  Hide video")
+                else:
+                    reveal_btn.setText(f"▶  {label}")
+
+            reveal_btn.clicked.connect(_on_reveal)
+            return wrapper
+        except Exception:
+            return None
 
     def _build_inline_image(self, image_path: str, scale: float = 1.0) -> QWidget | None:
         """Render an image inline. scale=0.5 renders at 50% of natural size."""
@@ -848,10 +1087,247 @@ class _HelpContentMixin:
                 widget = self._build_inline_image(str(item["image"]), scale=scale)
                 if widget is not None:
                     root.addWidget(widget)
+            elif isinstance(item, dict) and "video" in item:
+                _flush()
+                widget = self._build_inline_video(str(item["video"]))
+                if widget is not None:
+                    root.addWidget(widget)
+            elif isinstance(item, dict) and "video_expandable" in item:
+                _flush()
+                widget = self._build_collapsible_video(
+                    str(item["video_expandable"]),
+                    str(item.get("label", "Show video walkthrough")),
+                )
+                if widget is not None:
+                    root.addWidget(widget)
             elif isinstance(item, str):
                 text_buf.append(item)
 
         _flush()
+
+    def _build_inline_video(self, video_path: str) -> QWidget | None:
+        """Render a looping video player inline."""
+        try:
+            if not Path(video_path).exists():
+                return None
+
+            # Keep strong Python references on self so PySide6 GC never touches
+            # the player/audio while the dialog is alive.
+            if not hasattr(self, '_video_players'):
+                self._video_players: list = []
+
+            container = QFrame()
+            container.setObjectName("InlineVideo")
+            container.setStyleSheet(
+                f"QFrame#InlineVideo {{ background:{self._theme['card_bg']}; border:1px solid {self._theme['card_border']};"
+                " border-radius:8px; }"
+            )
+            layout = QVBoxLayout(container)
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(6)
+
+            video_widget = QVideoWidget()
+            video_widget.setAspectRatioMode(Qt.IgnoreAspectRatio)
+            video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            video_widget.setFixedHeight(4)  # placeholder until native size arrives
+            layout.addWidget(video_widget)
+
+            # Create without a Qt parent; lifetime managed by self._video_players.
+            player = QMediaPlayer()
+            audio = QAudioOutput()
+            audio.setVolume(0.0)
+            player.setAudioOutput(audio)
+            player.setVideoOutput(video_widget)
+            self._video_players.append((player, audio))
+
+            def _on_native_size(vw=video_widget, _player=player):
+                sz = _player.videoSink().videoSize()
+                if sz.width() > 0 and sz.height() > 0:
+                    ar = sz.height() / sz.width()
+                    def _apply(vw=vw, ar=ar):
+                        w = vw.width()
+                        if w <= 0:
+                            w = 400
+                        vw.setFixedHeight(int(w * ar))
+                    QTimer.singleShot(50, _apply)
+
+            player.videoSink().videoSizeChanged.connect(_on_native_size)
+
+            # Defer setSource+play until after the event loop has processed the
+            # widget tree; this prevents FFmpeg's interrupt callback from firing
+            # before Qt Multimedia's pipeline is fully initialised.
+            video_url = QUrl.fromLocalFile(str(Path(video_path)))
+
+            def _start(p=player, u=video_url):
+                p.setSource(u)
+                p.setLoops(-1)
+                p.play()
+
+            QTimer.singleShot(0, _start)
+
+            controls_row = QHBoxLayout()
+            controls_row.setContentsMargins(0, 0, 0, 0)
+            controls_row.setSpacing(8)
+
+            btn = QPushButton("\u23f8  Pause")
+            btn.setFixedWidth(90)
+            btn.setStyleSheet(
+                f"QPushButton#VideoCtrl {{ background:{self._theme['button_bg']}; color:{self._theme['text']};"
+                f" border:1px solid {self._theme['button_border']};"
+                " border-radius:5px; font-size:11px; padding:3px 8px; }"
+                f" QPushButton#VideoCtrl:hover {{ background:{self._theme.get('button_hover_bg', self._theme['button_bg'])}; }}"
+            )
+            btn.setObjectName("VideoCtrl")
+
+            def _toggle(checked=False, _btn=btn, _player=player):
+                if _player.playbackState() == QMediaPlayer.PlayingState:
+                    _player.pause()
+                    _btn.setText("\u25b6  Play")
+                else:
+                    _player.play()
+                    _btn.setText("\u23f8  Pause")
+
+            btn.clicked.connect(_toggle)
+            controls_row.addWidget(btn)
+            controls_row.addStretch(1)
+            layout.addLayout(controls_row)
+
+            return container
+        except Exception:
+            return None
+
+    def _build_collapsible_video(self, video_path: str, label: str) -> QWidget | None:
+        """Render a button that lazily reveals a looping video player when clicked."""
+        try:
+            if not Path(video_path).exists():
+                return None
+
+            if not hasattr(self, '_video_players'):
+                self._video_players: list = []
+
+            wrapper = QWidget()
+            outer = QVBoxLayout(wrapper)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(6)
+
+            reveal_btn = QPushButton(f"▶  {label}")
+            reveal_btn.setCursor(Qt.PointingHandCursor)
+            reveal_btn.setStyleSheet(
+                f"QPushButton {{ background:{self._theme['button_bg']}; color:{self._theme['text']};"
+                f" border:1px solid {self._theme['button_border']};"
+                " border-radius:6px; font-size:12px; padding:6px 12px; text-align:left; }}"
+                f"QPushButton:hover {{ background:{self._theme.get('button_hover_bg', self._theme['button_bg'])}; }}"
+            )
+            outer.addWidget(reveal_btn)
+
+            video_holder = QWidget()
+            holder_layout = QVBoxLayout(video_holder)
+            holder_layout.setContentsMargins(0, 0, 0, 0)
+            video_holder.hide()
+            outer.addWidget(video_holder)
+
+            _state: dict = {"built": False, "player": None}
+
+            def _build_player() -> None:
+                vcontainer = QFrame()
+                vcontainer.setObjectName("InlineVideo")
+                vcontainer.setStyleSheet(
+                    f"QFrame#InlineVideo {{ background:{self._theme['card_bg']}; border:1px solid {self._theme['card_border']};"
+                    " border-radius:8px; }"
+                )
+                c_layout = QVBoxLayout(vcontainer)
+                c_layout.setContentsMargins(8, 8, 8, 8)
+                c_layout.setSpacing(6)
+
+                video_widget = QVideoWidget()
+                video_widget.setAspectRatioMode(Qt.IgnoreAspectRatio)
+                video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                video_widget.setFixedHeight(4)
+                c_layout.addWidget(video_widget)
+
+                player = QMediaPlayer()
+                audio = QAudioOutput()
+                audio.setVolume(0.0)
+                player.setAudioOutput(audio)
+                player.setVideoOutput(video_widget)
+                self._video_players.append((player, audio))
+                _state["player"] = player
+
+                def _on_native_size(vw=video_widget, _player=player):
+                    sz = _player.videoSink().videoSize()
+                    if sz.width() > 0 and sz.height() > 0:
+                        ar = sz.height() / sz.width()
+                        def _apply(vw=vw, ar=ar):
+                            w = vw.width()
+                            if w <= 0:
+                                w = 400
+                            vw.setFixedHeight(int(w * ar))
+                        QTimer.singleShot(50, _apply)
+
+                player.videoSink().videoSizeChanged.connect(_on_native_size)
+
+                url = QUrl.fromLocalFile(str(Path(video_path)))
+
+                def _start(p=player, u=url):
+                    p.setSource(u)
+                    p.setLoops(-1)
+                    p.play()
+
+                QTimer.singleShot(0, _start)
+
+                ctrl_row = QHBoxLayout()
+                ctrl_row.setContentsMargins(0, 0, 0, 0)
+                ctrl_row.setSpacing(8)
+
+                pause_btn = QPushButton("⏸  Pause")
+                pause_btn.setFixedWidth(90)
+                pause_btn.setStyleSheet(
+                    f"QPushButton#VideoCtrl {{ background:{self._theme['button_bg']}; color:{self._theme['text']};"
+                    f" border:1px solid {self._theme['button_border']};"
+                    " border-radius:5px; font-size:11px; padding:3px 8px; }"
+                    f" QPushButton#VideoCtrl:hover {{ background:{self._theme.get('button_hover_bg', self._theme['button_bg'])}; }}"
+                )
+                pause_btn.setObjectName("VideoCtrl")
+
+                def _toggle_pause(checked=False, _btn=pause_btn, _player=player):
+                    if _player.playbackState() == QMediaPlayer.PlayingState:
+                        _player.pause()
+                        _btn.setText("▶  Play")
+                    else:
+                        _player.play()
+                        _btn.setText("⏸  Pause")
+
+                pause_btn.clicked.connect(_toggle_pause)
+                ctrl_row.addWidget(pause_btn)
+                ctrl_row.addStretch(1)
+                c_layout.addLayout(ctrl_row)
+                holder_layout.addWidget(vcontainer)
+
+            def _on_reveal():
+                if not _state["built"]:
+                    _state["built"] = True
+                    _build_player()
+
+                visible = not video_holder.isVisible()
+                video_holder.setVisible(visible)
+
+                p = _state["player"]
+                if p is not None:
+                    if visible:
+                        p.setPosition(0)
+                        p.play()
+                    else:
+                        p.pause()
+
+                if visible:
+                    reveal_btn.setText("▲  Hide video")
+                else:
+                    reveal_btn.setText(f"▶  {label}")
+
+            reveal_btn.clicked.connect(_on_reveal)
+            return wrapper
+        except Exception:
+            return None
 
     def _build_inline_image(self, image_path: str, scale: float = 1.0) -> QWidget | None:
         try:
@@ -979,6 +1455,7 @@ class _HelpContentMixin:
                     {"image": str(Path(__file__).resolve().parents[2] / "resources" / "helper_window_images" / "csv_to_log_to.png")},
                     "Follow the steps in the image below. HWiNFO must then be actively writing to that path.",
                     {"image": str(Path(__file__).resolve().parents[2] / "resources" / "helper_window_images" / "instruc.png")},
+                    {"video_expandable": str(Path(__file__).resolve().parents[2] / "resources" / "videos" / "first_time_pathing_setup.mp4"), "label": "Having trouble with the CSV path setup? Click here for a step-by-step video walkthrough."},
                     "<b>Note:<br></b> <b>Step 1</b> is mandatory only at first installation. Once you have done it once, HWiNFO will remember the logging path and automatically log to it every time you start HWiNFO in the future. You only need to do Step 1 again if you change your HWiNFO logging path or install ThermalBench on a new system.<br><b>Step 2 and 3</b> are recurrent and must be done at the start of every boot/session to ensure HWiNFO is actively logging to the correct path.",
                     "Back in ThermalBench, confirm the <b>CSV status indicator</b> (next to the path field) shows a healthy/green state. If it shows an error, verify that HWiNFO is running, logging is active, and the output path matches exactly.",
                 ],

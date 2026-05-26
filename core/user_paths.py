@@ -94,7 +94,14 @@ def user_data_root() -> Path:
 
 
 def thermalbench_runs_root() -> Path:
-    path = user_data_root() / "runs"
+    """
+    Canonical location for all benchmark run data.
+
+    Uses AppData\\Local\\ThermalBench\\runs so the folder is never inside
+    OneDrive (or any other cloud-sync path), which avoids file-locking
+    conflicts during and after runs.
+    """
+    path = local_data_root() / "runs"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

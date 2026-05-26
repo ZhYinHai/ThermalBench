@@ -60,7 +60,7 @@ from PySide6.QtWidgets import (
 
 from .widgets.ui_theme import apply_theme, resolve_effective_theme_mode, style_combobox_popup
 from .widgets.ui_widgets import CustomComboBox
-from .dialogs import HelpDialog, HelpPanel, SettingsDialog
+from .dialogs import HelpDialog, HelpPanel, SettingsDialog, UpdateAvailableDialog
 from .widgets.ui_titlebar import TitleBar
 from .widgets.ui_time_spin import make_time_spin
 from .graph_preview import GraphPreview
@@ -1738,9 +1738,57 @@ class MainWindow(QWidget):
         tree_footer = QVBoxLayout()
         tree_footer.setContentsMargins(10, 0, 10, 5)
         tree_footer.setSpacing(4)
+
+        # Compare-queue panel: shows which runs are currently selected for comparison.
+        # Visible only when at least one run has been double-clicked; persists across
+        # month navigation.
+        self._compare_queue_frame = QFrame()
+        self._compare_queue_frame.setObjectName("CompareQueueFrame")
+        self._compare_queue_frame.setFrameShape(QFrame.NoFrame)
+        self._compare_queue_frame.hide()
+        _cq_layout = QVBoxLayout(self._compare_queue_frame)
+        _cq_layout.setContentsMargins(8, 6, 8, 6)
+        _cq_layout.setSpacing(3)
+
+        # Header row: "Selected for comparison:" label + "Deselect all" button
+        _cq_header_row = QHBoxLayout()
+        _cq_header_row.setContentsMargins(0, 0, 0, 0)
+        _cq_header_row.setSpacing(6)
+
+        self._compare_queue_header_label = QLabel("Selected for comparison:")
+        self._compare_queue_header_label.setObjectName("CompareQueueHeader")
+        _cq_header_row.addWidget(self._compare_queue_header_label, 1)
+
+        self._compare_queue_deselect_btn = QPushButton("Deselect all")
+        self._compare_queue_deselect_btn.setObjectName("CompareQueueDeselectBtn")
+        self._compare_queue_deselect_btn.setCursor(Qt.PointingHandCursor)
+        self._compare_queue_deselect_btn.setFocusPolicy(Qt.NoFocus)
+        _cq_header_row.addWidget(self._compare_queue_deselect_btn)
+        _cq_layout.addLayout(_cq_header_row)
+
+        # List container: rows rebuilt dynamically per selected run
+        self._compare_queue_list_widget = QWidget()
+        self._compare_queue_list_widget.setObjectName("CompareQueueListWidget")
+        _cq_list_layout = QVBoxLayout(self._compare_queue_list_widget)
+        _cq_list_layout.setContentsMargins(0, 0, 0, 0)
+        _cq_list_layout.setSpacing(1)
+        _cq_layout.addWidget(self._compare_queue_list_widget)
+
+        tree_footer.addWidget(self._compare_queue_frame)
         tree_footer.addWidget(self.compare_btn)
         # Removed: bottom delete button
         tree_panel_layout.addLayout(tree_footer)
+
+        # Wire the compare-queue display panel into the benchmark controller now
+        # that the widgets exist.
+        try:
+            self.benchmark.set_compare_selection_panel(
+                self._compare_queue_frame,
+                self._compare_queue_list_widget,
+                self._compare_queue_deselect_btn,
+            )
+        except Exception:
+            pass
 
         splitter.addWidget(tree_panel)
 
@@ -1908,6 +1956,13 @@ class MainWindow(QWidget):
         self._update_ui_set_status = None
         self._update_ui_set_button_text = None
         self._update_ui_set_button_enabled = None
+
+        # Silent background pre-download (started as soon as an update is detected)
+        self._silent_dl_thread = None
+        self._silent_dl_worker = None
+        self._silent_dl_bytes: int = 0
+        self._silent_dl_total: int = -1
+        self._silent_dl_done: bool = False
 
         self._search_section_trees: list[QTreeView] = []
         self._search_section_models: list[tuple[MonthGroupedRunsModel, RunsProxyModel]] = []
@@ -3425,6 +3480,64 @@ class MainWindow(QWidget):
                 pass
 
             try:
+                if effective_mode == "light":
+                    queue_bg = "rgba(0, 0, 0, 0.05)"
+                    queue_border = "rgba(0, 0, 0, 0.12)"
+                    queue_header_color = "#5B6472"
+                    queue_text_color = "#1A1A1A"
+                else:
+                    queue_bg = "rgba(255, 255, 255, 0.05)"
+                    queue_border = "rgba(255, 255, 255, 0.12)"
+                    queue_header_color = "#7F7F7F"
+                    queue_text_color = "#C8C8C8"
+
+                self._compare_queue_frame.setStyleSheet(
+                    f"""
+                    QFrame#CompareQueueFrame {{
+                        background-color: {queue_bg};
+                        border: 1px solid {queue_border};
+                        border-radius: 6px;
+                    }}
+                    QWidget#CompareQueueListWidget, QWidget#CompareQueueRow {{
+                        background: transparent;
+                        border: none;
+                    }}
+                    QLabel#CompareQueueHeader {{
+                        color: {queue_header_color};
+                        font-size: 11px;
+                        font-weight: 600;
+                        background: transparent;
+                        border: none;
+                    }}
+                    QLabel#CompareQueueItemLabel {{
+                        color: {queue_text_color};
+                        font-size: 11px;
+                        background: transparent;
+                        border: none;
+                    }}
+                    QLabel#CompareQueueItemDate {{
+                        color: {queue_header_color};
+                        font-size: 10px;
+                        background: transparent;
+                        border: none;
+                    }}
+                    QPushButton#CompareQueueDeselectBtn {{
+                        color: {queue_header_color};
+                        font-size: 10px;
+                        font-weight: 500;
+                        background: transparent;
+                        border: none;
+                        padding: 0px 2px;
+                    }}
+                    QPushButton#CompareQueueDeselectBtn:hover {{
+                        color: {queue_text_color};
+                    }}
+                    """
+                )
+            except Exception:
+                pass
+
+            try:
                 self._apply_results_preview_theme()
             except Exception:
                 pass
@@ -4880,6 +4993,26 @@ class MainWindow(QWidget):
         thread.start()
 
     def _start_update_download(self, release: ReleaseInfo) -> None:
+        # Pre-download already finished — skip straight to the install step.
+        if self._update_downloaded_installer is not None:
+            self._on_update_downloaded(str(self._update_downloaded_installer))
+            return
+
+        # Silent download is still in progress — adopt it; show current progress
+        # and let the silent slots forward subsequent updates via _update_ui.
+        if self._silent_dl_thread is not None:
+            self._update_ui(
+                status_text=(
+                    f"Downloading… {int(round(self._silent_dl_bytes / self._silent_dl_total * 100))}%"
+                    if self._silent_dl_total > 0
+                    else "Downloading…"
+                ),
+                status_level="info",
+                button_text="Downloading…",
+                button_enabled=False,
+            )
+            return
+
         if getattr(self, "_update_in_progress", False):
             self._update_ui(status_text="Busy…", status_level="info")
             return
@@ -4909,6 +5042,141 @@ class MainWindow(QWidget):
         self._update_download_thread = thread
         self._update_download_worker = worker
         thread.start()
+
+    # ---------- startup (silent) update check ----------
+    def _startup_update_check(self) -> None:
+        """Run silently at startup; only prompt the user if a newer version exists."""
+        if sys.platform != "win32":
+            return
+        if not GITHUB_OWNER or not GITHUB_REPO:
+            return
+        # Don't interfere with a manual check already in progress.
+        if getattr(self, "_update_in_progress", False):
+            return
+
+        thread = QThread(self)
+        worker = _FetchLatestReleaseWorker(GITHUB_OWNER, GITHUB_REPO, INSTALLER_PREFIX)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_startup_update_found)
+        # Silently swallow failures — no UI noise on startup.
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        # Keep references so they aren't garbage-collected.
+        self._startup_fetch_thread = thread
+        self._startup_fetch_worker = worker
+        thread.start()
+
+    def _on_startup_update_found(self, release: ReleaseInfo) -> None:
+        """Called (on the main thread) when the startup check receives release info."""
+        try:
+            newer = is_newer_version(__version__, release.version)
+        except Exception:
+            return
+
+        if not newer:
+            return
+
+        # Store immediately so Settings can use it regardless of what the user does.
+        self._update_last_release = release
+
+        # Begin silently pre-downloading in the background straight away.
+        self._start_silent_download(release)
+
+        dlg = UpdateAvailableDialog(
+            self,
+            current_version=__version__,
+            new_version=release.version,
+            release_notes=release.notes,
+            theme_mode=getattr(self, "theme_mode", "device"),
+        )
+        if dlg.exec() == UpdateAvailableDialog.Accepted:
+            try:
+                self._open_settings_to_updates()
+            except Exception:
+                pass
+
+    # ---------- silent background pre-download ----------
+    def _start_silent_download(self, release: ReleaseInfo) -> None:
+        """Download the installer silently; no UI feedback until Settings is opened."""
+        if sys.platform != "win32":
+            return
+        # Already running or already finished.
+        if self._silent_dl_thread is not None or self._silent_dl_done:
+            return
+        if self._update_downloaded_installer is not None:
+            return
+
+        self._silent_dl_bytes = 0
+        self._silent_dl_total = -1
+        self._silent_dl_done = False
+
+        thread = QThread(self)
+        worker = _DownloadInstallerWorker(release)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_silent_dl_progress)
+        worker.finished.connect(self._on_silent_dl_done)
+        worker.failed.connect(self._on_silent_dl_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_silent_dl_thread_finished)
+
+        self._silent_dl_thread = thread
+        self._silent_dl_worker = worker
+        thread.start()
+
+    def _on_silent_dl_progress(self, downloaded: int, total: int) -> None:
+        self._silent_dl_bytes = downloaded
+        self._silent_dl_total = total
+        # Forward to Settings dialog if it is currently open.
+        try:
+            if total > 0:
+                pct = int(round(downloaded / total * 100))
+                self._update_ui(status_text=f"Downloading… {pct}%", status_level="info")
+            else:
+                self._update_ui(status_text="Downloading…", status_level="info")
+        except Exception:
+            pass
+
+    def _on_silent_dl_done(self, installer_path_str: str) -> None:
+        self._silent_dl_done = True
+        self._update_downloaded_installer = Path(installer_path_str)
+        # If Settings is open, flip it straight to the install state.
+        self._set_update_busy(False)
+        self._update_ui(
+            status_text="Downloaded. Ready to install.",
+            status_level="warn",
+            button_text="Install update",
+            button_enabled=True,
+        )
+
+    def _on_silent_dl_failed(self, reason: str) -> None:
+        # Silently discard; the manual flow will offer a retry if Settings is opened.
+        self._silent_dl_done = False
+        self._silent_dl_bytes = 0
+        self._silent_dl_total = -1
+
+    def _on_silent_dl_thread_finished(self) -> None:
+        self._silent_dl_thread = None
+        self._silent_dl_worker = None
+
+    def _open_settings_to_updates(self) -> None:
+        """Open the Settings dialog and navigate to the Updates section."""
+        try:
+            # Re-use the existing mechanism that opens the settings dialog.
+            self.open_settings()
+        except Exception:
+            pass
 
     def _on_update_failed(self, reason: str) -> None:
         self._set_update_busy(False)
@@ -5824,13 +6092,35 @@ class MainWindow(QWidget):
             except Exception:
                 pass
 
+            act_open_explorer = menu.addAction("Open in File Explorer")
+            menu.addSeparator()
             act_rename = None
             if is_case:
-                act_rename = menu.addAction("Rename…")
+                _proxy = getattr(self, "_runs_proxy", None)
+                _is_compare_case = (
+                    bool(_proxy.is_compare_case_dir_path(str(target)))
+                    if _proxy is not None and hasattr(_proxy, "is_compare_case_dir_path")
+                    else False
+                )
+                if not _is_compare_case:
+                    act_rename = menu.addAction("Rename…")
             act_remove = menu.addAction("Remove")
 
             chosen = menu.exec(self._runs_tree.viewport().mapToGlobal(pos))
             if chosen is None:
+                return
+
+            if chosen == act_open_explorer:
+                try:
+                    import subprocess
+                    # If target is a file, select it in Explorer; if a folder, open it.
+                    explore_path = target if target.is_dir() else target.parent
+                    if target.is_file():
+                        subprocess.Popen(["explorer", "/select,", str(target)])
+                    else:
+                        subprocess.Popen(["explorer", str(explore_path)])
+                except Exception:
+                    pass
                 return
 
             if chosen == act_remove:
@@ -5902,32 +6192,59 @@ class MainWindow(QWidget):
                     root.addWidget(edit)
                     root.addLayout(btn_row)
 
-                    # Dark styling to match the app; include hover for buttons.
+                    # Style the dialog to match the current app theme.
                     try:
+                        _eff = resolve_effective_theme_mode(self.theme_mode, QApplication.instance())
+                        if _eff == "light":
+                            _dlg_bg       = "#F7F7F7"
+                            _dlg_border   = "rgba(0,0,0,0.15)"
+                            _text         = "#111111"
+                            _input_bg     = "#FFFFFF"
+                            _input_border = "rgba(0,0,0,0.20)"
+                            _input_focus  = "#2F6FEB"
+                            _btn_bg       = "#FFFFFF"
+                            _btn_border   = "rgba(0,0,0,0.18)"
+                            _btn_hover    = "#EFEFEF"
+                            _btn_pressed  = "#E4E4E4"
+                        else:
+                            _dlg_bg       = "#151515"
+                            _dlg_border   = "rgba(128,128,128,0.35)"
+                            _text         = "#EAEAEA"
+                            _input_bg     = "#0F0F0F"
+                            _input_border = "rgba(128,128,128,0.35)"
+                            _input_focus  = "#5B9BFF"
+                            _btn_bg       = "#252525"
+                            _btn_border   = "rgba(128,128,128,0.35)"
+                            _btn_hover    = "#2E2E2E"
+                            _btn_pressed  = "#1F1F1F"
+
                         dlg.setStyleSheet(
-                            """
-                            QDialog {
-                                background-color: #151515;
-                                border: 1px solid rgba(128, 128, 128, 0.35);
+                            f"""
+                            QDialog {{
+                                background-color: {_dlg_bg};
+                                border: 1px solid {_dlg_border};
                                 border-radius: 10px;
-                            }
-                            QLabel { color: #EAEAEA; }
-                            QLineEdit {
-                                background-color: #0F0F0F;
-                                color: #EAEAEA;
-                                border: 1px solid rgba(128, 128, 128, 0.35);
+                            }}
+                            QLabel {{ color: {_text}; background: transparent; }}
+                            QLineEdit {{
+                                background-color: {_input_bg};
+                                color: {_text};
+                                border: 1px solid {_input_border};
                                 border-radius: 8px;
                                 padding: 8px 10px;
-                            }
-                            QPushButton {
-                                background: #252525;
-                                border: 1px solid rgba(128, 128, 128, 0.35);
-                                color: #EAEAEA;
+                            }}
+                            QLineEdit:focus {{
+                                border: 1px solid {_input_focus};
+                            }}
+                            QPushButton {{
+                                background: {_btn_bg};
+                                border: 1px solid {_btn_border};
+                                color: {_text};
                                 padding: 6px 16px;
                                 border-radius: 8px;
-                            }
-                            QPushButton:hover { background: #2E2E2E; }
-                            QPushButton:pressed { background: #1F1F1F; }
+                            }}
+                            QPushButton:hover   {{ background: {_btn_hover};   }}
+                            QPushButton:pressed {{ background: {_btn_pressed}; }}
                             """
                         )
                     except Exception:
@@ -5981,6 +6298,41 @@ class MainWindow(QWidget):
                 except Exception:
                     pass
 
+                # Warn if this case folder's runs span more than one month.
+                # Because there is only one physical folder on disk, renaming it
+                # updates every month that shows it — make sure the user knows that.
+                try:
+                    source_model = getattr(self, "_runs_source_model", None)
+                    months_spanned: set[str] = set()
+                    for _run_ent in os.scandir(str(case_dir)):
+                        if _run_ent.is_dir() and _RESULT_RUN_FOLDER_RE.match(_run_ent.name):
+                            try:
+                                _mkey = source_model._month_key_for_run(Path(_run_ent.path)) if source_model else None
+                                if _mkey:
+                                    months_spanned.add(_mkey)
+                            except Exception:
+                                pass
+                    if len(months_spanned) > 1:
+                        _month_labels = [_month_key_to_label(m) for m in sorted(months_spanned)]
+                        _msg = (
+                            f"<b>{html.escape(cur_name)}</b> contains runs from "
+                            f"<b>{len(months_spanned)} different months</b>:<br><br>"
+                            + "<br>".join(f"&nbsp;&nbsp;• {html.escape(lbl)}" for lbl in _month_labels)
+                            + "<br><br>Because all months share the same folder on disk, "
+                            "renaming it will update <b>every</b> month listed above.<br><br>"
+                            "Do you want to continue?"
+                        )
+                        _warn_box = QMessageBox(self)
+                        _warn_box.setWindowTitle("Rename Affects Multiple Months")
+                        _warn_box.setTextFormat(Qt.RichText)
+                        _warn_box.setText(_msg)
+                        _warn_box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+                        _warn_box.setDefaultButton(QMessageBox.Cancel)
+                        if _warn_box.exec() != QMessageBox.Yes:
+                            return
+                except Exception:
+                    pass  # if the check fails, proceed with the rename anyway
+
                 try:
                     case_dir.rename(dest)
                 except Exception as e:
@@ -5999,7 +6351,15 @@ class MainWindow(QWidget):
                 except Exception:
                     pass
 
-                # Re-select renamed folder (best-effort; model updates async).
+                # Rebuild the tree model from disk so the new name is visible
+                # immediately without needing to navigate away and back.
+                try:
+                    self.benchmark._refresh_results_models()
+                    self._refresh_results_month_nav()
+                except Exception:
+                    pass
+
+                # Re-select renamed folder after the model has been refreshed.
                 def _reselect():
                     try:
                         src_idx = self._runs_source_model.index_for_path(str(dest))
@@ -6016,7 +6376,7 @@ class MainWindow(QWidget):
                     except Exception:
                         pass
 
-                QTimer.singleShot(150, _reselect)
+                QTimer.singleShot(0, _reselect)
                 return
 
         except Exception:
@@ -6192,6 +6552,13 @@ class MainWindow(QWidget):
             QTimer.singleShot(0, self._apply_window_corner_preference)
         except Exception:
             pass
+        # Run once: check for updates silently 3 seconds after the window appears.
+        if not getattr(self, "_startup_update_check_scheduled", False):
+            self._startup_update_check_scheduled = True
+            try:
+                QTimer.singleShot(3000, self._startup_update_check)
+            except Exception:
+                pass
 
     def _apply_window_corner_preference(self) -> None:
         try:
