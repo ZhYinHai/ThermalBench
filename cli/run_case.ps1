@@ -77,6 +77,21 @@ function Stop-StressToolsByName {
   Stop-Process -Name "furmark","prime95" -Force -ErrorAction SilentlyContinue
 }
 
+function Write-FurMarkLogTail {
+  param([string]$FurDir = "")
+
+  try {
+    if ([string]::IsNullOrWhiteSpace($FurDir)) { return }
+    $furLog = Join-Path $FurDir "_furmark_log.txt"
+    if (-not (Test-Path -LiteralPath $furLog)) { return }
+    $logLines = Get-Content -LiteralPath $furLog -Tail 30 -ErrorAction SilentlyContinue
+    if (-not $logLines) { return }
+    Write-Host "--- FurMark log (last 30 lines) ---"
+    $logLines | ForEach-Object { Write-Host $_ }
+    Write-Host "---"
+  } catch {}
+}
+
 function Resolve-DefaultRunsRoot {
   $docs = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
 
@@ -169,6 +184,7 @@ function Countdown-OrAbort($seconds, $label, [string[]]$MonitorNames = @()) {
     # PID (which belongs to the short-lived launcher, not the render worker).
     foreach ($name in $MonitorNames) {
       if (-not (Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+        if ($name -eq "furmark") { Write-FurMarkLogTail $script:FurMarkDirForLogs }
         throw "Stress tool '$name' stopped unexpectedly during the test."
       }
     }
@@ -265,7 +281,14 @@ function Start-StressTools {
   if ($StressGPU.IsPresent) {
     Assert-File $FurMarkExe "FurMarkExe"
     $furDir = Split-Path -Parent $FurMarkExe
+    $script:FurMarkDirForLogs = $furDir
     $furArgs = @("--demo",$FurDemo,"--width",$FurWidth,"--height",$FurHeight,"--vsync","0","--hpgfx","1")
+    if ($FurDemo -match '-vk$') {
+      # Vulkan swapchain creation can fail when Windows window decorations make
+      # the actual client/window size larger than the requested resolution.
+      # Borderless Vulkan demos avoid that failure while keeping OpenGL unchanged.
+      $furArgs += @("--title-bar","0")
+    }
     Write-Host "Start FurMark2: $FurMarkExe $($furArgs -join ' ')"
     # Start minimised so FurMark does not steal focus from ThermalBench;
     # Show-ProcessNoActivate restores it to normal size without activating it.
@@ -285,13 +308,7 @@ function Start-StressTools {
     }
     if (-not $furRunning) {
       # Surface the GeeXLab / FurMark log to help diagnose the crash.
-      $furLog = Join-Path $furDir "_geexlab_log.txt"
-      if (Test-Path $furLog) {
-        $logLines = Get-Content $furLog -Tail 30 -ErrorAction SilentlyContinue
-        Write-Host "--- FurMark log (last 30 lines) ---"
-        $logLines | ForEach-Object { Write-Host $_ }
-        Write-Host "---"
-      }
+      Write-FurMarkLogTail $furDir
       throw "FurMark2 exited immediately."
     }
     $furPid = [int]$fur.Id

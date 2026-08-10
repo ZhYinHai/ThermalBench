@@ -198,7 +198,13 @@ class RunsProxyModel(QSortFilterProxyModel):
                     from matplotlib import cm
                     from matplotlib import colors as mcolors
 
-                    cmaps = [cm.get_cmap("tab20"), cm.get_cmap("tab20b"), cm.get_cmap("tab20c")]
+                    get_cmap = getattr(cm, "get_cmap", None)
+                    if callable(get_cmap):
+                        cmaps = [get_cmap("tab20"), get_cmap("tab20b"), get_cmap("tab20c")]
+                    else:
+                        from matplotlib import colormaps
+
+                        cmaps = [colormaps["tab20"], colormaps["tab20b"], colormaps["tab20c"]]
                     palette: list[str] = []
                     for cmap in cmaps:
                         for k in range(int(getattr(cmap, "N", 20) or 20)):
@@ -307,7 +313,7 @@ class RunsProxyModel(QSortFilterProxyModel):
                 return False
             name = str(sm.fileName(source_index) or "")
             path = str(sm.filePath(source_index) or "")
-            return bool(path) and bool(_RUN_FOLDER_RE.match(name))
+            return bool(path) and (bool(_RUN_FOLDER_RE.match(name)) or self._is_compare_run_dir_path(path))
         except Exception:
             return False
 

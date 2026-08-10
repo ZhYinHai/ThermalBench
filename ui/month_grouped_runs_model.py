@@ -212,7 +212,7 @@ class MonthGroupedRunsModel(QAbstractItemModel):
                         continue
 
                     run_dir = Path(run_ent.path)
-                    if not _RUN_FOLDER_RE.match(run_dir.name):
+                    if not self._is_result_run_dir(run_dir):
                         continue
 
                     month_key = self._month_key_for_run(run_dir)
@@ -269,6 +269,26 @@ class MonthGroupedRunsModel(QAbstractItemModel):
         hay = f"{case_name} {run_name}".casefold()
         return filt in hay
 
+    def _is_result_run_dir(self, run_dir: Path) -> bool:
+        """True for normal result folders and compare result folders.
+
+        Compare run folder names can receive extra collision suffixes, especially
+        for 3+ source-run compares. The manifest is the authoritative marker.
+        """
+        try:
+            if _RUN_FOLDER_RE.match(run_dir.name):
+                return True
+            mp = run_dir / "compare_manifest.json"
+            if not mp.is_file():
+                return False
+            try:
+                payload = json.loads(mp.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+            return str((payload or {}).get("type") or "").strip().lower() == "compare"
+        except Exception:
+            return False
+
     def _month_key_for_run(self, run_dir: Path) -> str:
         return self._run_datetime(run_dir).strftime("%Y-%m")
 
@@ -283,6 +303,16 @@ class MonthGroupedRunsModel(QAbstractItemModel):
                 recorded_at = str(payload.get("recorded_at") or "").strip()
                 if recorded_at:
                     return datetime.fromisoformat(recorded_at.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                pass
+
+        manifest_path = run_dir / "compare_manifest.json"
+        if manifest_path.is_file():
+            try:
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                created_at = str(payload.get("created_at") or "").strip()
+                if created_at:
+                    return datetime.fromisoformat(created_at.replace("Z", "+00:00")).replace(tzinfo=None)
             except Exception:
                 pass
 

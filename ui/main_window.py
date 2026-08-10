@@ -343,6 +343,20 @@ class _CompareNameDelegate(QStyledItemDelegate):
                         dt = None
 
             if dt is None:
+                manifest_path = run_dir / "compare_manifest.json"
+                if manifest_path.is_file():
+                    try:
+                        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        payload = {}
+                    created_at = str(payload.get("created_at") or "").strip()
+                    if created_at:
+                        try:
+                            dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                        except Exception:
+                            dt = None
+
+            if dt is None:
                 try:
                     dt = datetime.strptime(run_dir.name, "%Y%m%d_%H%M%S")
                 except Exception:

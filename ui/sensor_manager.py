@@ -10,9 +10,9 @@ from PySide6.QtWidgets import QLabel, QMessageBox, QDialog
 
 from core.hwinfo_csv import read_hwinfo_headers, sensor_leafs_from_header, make_unique
 from core.hwinfo_metadata import build_precise_group_map, load_sensor_map, save_sensor_map
-from core.hwinfo_status import try_open_hwinfo_sm2
 from core.resources import resource_path
 from core.bundled_tools import resolve_hwinfo_csv
+from core.user_paths import sensor_map_cache_path
 
 from .dialogs import SensorPickerDialog, SPD_MAX_TOKEN, SelectedSensorsDialog
 
@@ -310,11 +310,9 @@ class SensorManager:
         # match (different machine, reinstall, or CSV not yet read) the picker
         # would also miss the cache and show a flat list, so the dot must agree.
         try:
-            from core.resources import resource_path  # noqa: PLC0415
-            from core.hwinfo_metadata import load_sensor_map  # noqa: PLC0415
-            payload = load_sensor_map(resource_path("resources", "sensor_map.json"))
+            current_unique = self._csv_unique_leafs
+            payload = self._load_cached_sensor_map(current_unique)
             if payload and payload.get("schema") == 1:
-                current_unique = self._csv_unique_leafs
                 if current_unique and payload.get("header_unique") == current_unique:
                     groups = {g for g in payload.get("mapping", {}).values() if g and g != "Other"}
                     if len(groups) >= 2:
@@ -322,6 +320,16 @@ class SensorManager:
         except Exception:
             pass
         return False, "none"
+
+    def _load_cached_sensor_map(self, expected_header_unique: list[str] | None = None) -> dict | None:
+        """Load writable cache first, then bundled read-only fallback."""
+        for path in (sensor_map_cache_path(), resource_path("resources", "sensor_map.json")):
+            payload = load_sensor_map(path)
+            if isinstance(payload, dict) and payload.get("schema") == 1:
+                if expected_header_unique is not None and payload.get("header_unique") != expected_header_unique:
+                    continue
+                return payload
+        return None
 
     def _sm2_has_real_groups(self) -> bool:
         """Return True only when live SM2 produces ≥2 distinct non-Other groups
@@ -374,13 +382,15 @@ class SensorManager:
 
     def _ensure_precise_map(self, csv_leafs: list[str], csv_unique_leafs: list[str]) -> dict[str, str]:
         """Ensure precise group mapping exists, creating it if needed."""
-        cache_path = resource_path("resources", "sensor_map.json")
-        payload = load_sensor_map(cache_path)
+        payload = self._load_cached_sensor_map(csv_unique_leafs)
         if payload and payload.get("schema") == 1 and payload.get("header_unique") == csv_unique_leafs:
             return dict(payload.get("mapping", {}))
 
         mapping = build_precise_group_map(csv_leafs, csv_unique_leafs)
-        save_sensor_map(cache_path, csv_unique_leafs, mapping)
+        try:
+            save_sensor_map(sensor_map_cache_path(), csv_unique_leafs, mapping)
+        except Exception:
+            pass
         return mapping
 
     def open_selected_sensors_view(self) -> None:

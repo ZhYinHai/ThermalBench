@@ -137,6 +137,11 @@ def local_data_root() -> Path:
     return root
 
 
+def sensor_map_cache_path() -> Path:
+    """Writable cache for HWiNFO CSV-column to device-group mapping."""
+    return local_data_root() / "sensor_map.json"
+
+
 def thermalbench_hwinfo_runtime_dir() -> Path:
     """
     Writable runtime copy of HWiNFO.

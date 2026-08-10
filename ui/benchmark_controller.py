@@ -6,6 +6,7 @@ import re
 import shutil
 import time
 import json
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -28,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from core.ps_helpers import RUNMAP_RE, ps_quote, build_ps_array_literal
 
-from core.user_paths import thermalbench_runs_root
+from core.user_paths import sensor_map_cache_path, thermalbench_runs_root
 from core.bundled_tools import resolve_hwinfo_csv, resolve_furmark_exe, resolve_prime95_exe
 from core.resources import resource_path
 from core.hwinfo_metadata import load_sensor_map
@@ -50,6 +51,48 @@ _RUN_FOLDER_RE = re.compile(
     r")$",
     re.IGNORECASE,
 )
+
+
+def _load_sensor_group_map() -> dict[str, str]:
+    """Load the current writable sensor grouping cache, with bundled fallback."""
+    for path in (sensor_map_cache_path(), resource_path("resources", "sensor_map.json")):
+        try:
+            payload = load_sensor_map(path)
+            if isinstance(payload, dict) and payload.get("schema") == 1:
+                return dict(payload.get("mapping") or {})
+        except Exception:
+            pass
+    return {}
+
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _safe_fs_name(name: str, *, max_len: int = 80, fallback: str = "compare") -> str:
+    """Return a bounded Windows-safe path component, preserving uniqueness with a hash."""
+    original = str(name or "").strip()
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", original)
+    safe = re.sub(r"\s+", " ", safe).strip(" .")
+    if not safe:
+        safe = fallback
+    if safe.upper() in _WINDOWS_RESERVED_NAMES:
+        safe = f"{safe}_"
+
+    max_len = max(24, int(max_len or 80))
+    if len(safe) <= max_len:
+        return safe
+
+    digest = hashlib.sha1(original.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    suffix = f"~{digest}"
+    keep = max_len - len(suffix)
+    return f"{safe[:keep].rstrip(' .')}{suffix}"
 
 
 class BenchmarkController:
@@ -232,6 +275,17 @@ class BenchmarkController:
                 except Exception:
                     pass
 
+            manifest_path = run_dir / "compare_manifest.json"
+            if manifest_path.is_file():
+                try:
+                    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    created_at = str(payload.get("created_at") or "").strip()
+                    if created_at:
+                        dt = datetime.fromisoformat(created_at.replace("Z", "+00:00")).replace(tzinfo=None)
+                        return dt.strftime("%Y-%m")
+                except Exception:
+                    pass
+
             try:
                 dt = datetime.strptime(run_dir.name, "%Y%m%d_%H%M%S")
                 return dt.strftime("%Y-%m")
@@ -268,7 +322,7 @@ class BenchmarkController:
                     continue
 
                 cand = Path(ent.path)
-                if not _RUN_FOLDER_RE.match(cand.name):
+                if not self._is_result_run_dir(cand):
                     continue
 
                 if current_month:
@@ -347,7 +401,7 @@ class BenchmarkController:
             except Exception:
                 return None
 
-            if not _RUN_FOLDER_RE.match(run_dir.name):
+            if not self._is_result_run_dir(run_dir):
                 return None
 
             return run_dir
@@ -546,6 +600,17 @@ class BenchmarkController:
         except Exception:
             return False
 
+    def _is_result_run_dir(self, run_dir: Path) -> bool:
+        try:
+            if run_dir is None:
+                return False
+            p = Path(run_dir)
+            if _RUN_FOLDER_RE.match(p.name):
+                return True
+            return self._is_compare_result_dir(p)
+        except Exception:
+            return False
+
     @staticmethod
     def _sort_sensors_for_compare(sensors: list[str], group_map: dict[str, str] | None = None) -> list[str]:
         """Sort sensor column names for compare plotting.
@@ -736,13 +801,7 @@ class BenchmarkController:
 
             # Best-effort: group sensors by their HWiNFO device group (cached from SM2).
             # This is the same device grouping used by the sensor picker dialogs.
-            group_map: dict[str, str] = {}
-            try:
-                payload = load_sensor_map(resource_path("resources", "sensor_map.json"))
-                if isinstance(payload, dict) and payload.get("schema") == 1:
-                    group_map = dict(payload.get("mapping") or {})
-            except Exception:
-                group_map = {}
+            group_map = _load_sensor_group_map()
 
             top = self.parent.window() if hasattr(self.parent, "window") else self.parent
             self._set_compare_dimmed(True)
@@ -756,6 +815,7 @@ class BenchmarkController:
                 run_dates=run_dates,
                 on_close=self._close_compare_popup,
                 on_compare=self._create_compare_result_from_popup,
+                duplicate_check=self._compare_duplicate_message_for_sensors,
                 theme_mode=str(getattr(self.parent, "theme_mode", "device") or "device"),
             )
 
@@ -785,16 +845,16 @@ class BenchmarkController:
 
             # Sort sensors so compare plots are consistently ordered.
             try:
-                group_map: dict[str, str] = {}
-                payload = load_sensor_map(resource_path("resources", "sensor_map.json"))
-                if isinstance(payload, dict) and payload.get("schema") == 1:
-                    group_map = dict(payload.get("mapping") or {})
+                group_map = _load_sensor_group_map()
                 sensors = self._sort_sensors_for_compare(sensors, group_map=group_map)
             except Exception:
                 sensors = self._sort_sensors_for_compare(sensors)
 
             run_dirs = self._valid_compare_input_dirs()
             if len(run_dirs) < 2:
+                return
+
+            if self._find_existing_compare_result_for(run_dirs, sensors) is not None:
                 return
 
             def _case_label(rd: Path) -> str:
@@ -859,23 +919,38 @@ class BenchmarkController:
             case_a = _case_label(run_dirs[0]) or run_dirs[0].name
             case_b = _case_label(run_dirs[1]) or run_dirs[1].name
             if len(run_dirs) == 2:
-                case_name = f"{case_a} vs {case_b}"
+                case_name_for_fs = f"{case_a} vs {case_b}"
             else:
-                case_name = f"{case_a} vs {case_b} +{len(run_dirs) - 2}"
+                case_name_for_fs = f"{case_a} vs {case_b} +{len(run_dirs) - 2}"
 
+            try:
+                root_len = len(str(self._runs_root.resolve()))
+            except Exception:
+                root_len = len(str(self._runs_root))
+            # Keep runs_root/case/run/compare_manifest.json under the classic Windows
+            # MAX_PATH boundary for installations where long paths are not enabled.
+            component_budget = max(32, min(80, (240 - root_len - len("compare_manifest.json") - 3) // 2))
+
+            case_name = _safe_fs_name(case_name_for_fs, max_len=component_budget, fallback="compare")
             out_case_dir = (self._runs_root / case_name)
             out_case_dir.mkdir(parents=True, exist_ok=True)
 
-            base_run_name = _compare_run_dir_fs_name(run_dirs[0], run_dirs[1])
+            base_run_name_for_fs = _compare_run_dir_fs_name(run_dirs[0], run_dirs[1])
             if len(run_dirs) != 2:
-                base_run_name = f"{base_run_name} +{len(run_dirs) - 2}"
+                base_run_name_for_fs = f"{base_run_name_for_fs} +{len(run_dirs) - 2}"
 
+            base_run_name = _safe_fs_name(base_run_name_for_fs, max_len=component_budget, fallback="compare run")
             out_run_dir = out_case_dir / base_run_name
             if out_run_dir.exists():
                 # Avoid collisions while keeping names readable.
                 i = 1
                 while True:
-                    cand = out_case_dir / f"{base_run_name} +{i}"
+                    cand_name = _safe_fs_name(
+                        f"{base_run_name_for_fs} +{i}",
+                        max_len=component_budget,
+                        fallback="compare run",
+                    )
+                    cand = out_case_dir / cand_name
                     if not cand.exists():
                         out_run_dir = cand
                         break
@@ -1037,14 +1112,14 @@ class BenchmarkController:
             if not run_dir.exists() or not run_dir.is_dir():
                 return None
 
-            # Ensure inside runs root and shaped like a run folder
+            # Ensure inside runs root and shaped like a result run folder.
             try:
                 root = self._runs_root.resolve()
                 run_dir.resolve().relative_to(root)
             except Exception:
                 return None
 
-            if not _RUN_FOLDER_RE.match(run_dir.name):
+            if not self._is_result_run_dir(run_dir):
                 return None
 
             return run_dir
@@ -1206,7 +1281,7 @@ class BenchmarkController:
 
                 # If user selected a run folder directly.
                 try:
-                    if pr.is_dir() and _RUN_FOLDER_RE.match(pr.name):
+                    if pr.is_dir() and self._is_result_run_dir(pr):
                         rel = str(pr.relative_to(root_r)).replace("\\", "/")
                         out.add(rel)
                         continue
@@ -1221,7 +1296,7 @@ class BenchmarkController:
                                 if not ent.is_dir():
                                     continue
                                 rd = Path(ent.path)
-                                if not _RUN_FOLDER_RE.match(rd.name):
+                                if not self._is_result_run_dir(rd):
                                     continue
                                 try:
                                     rel = str(rd.resolve().relative_to(root_r)).replace("\\", "/")
@@ -1273,13 +1348,13 @@ class BenchmarkController:
                                 p_r.is_dir()
                                 and p_r.parent is not None
                                 and p_r.parent.resolve() == root_r
-                                and (not _RUN_FOLDER_RE.match(p_r.name))
+                                and (not self._is_result_run_dir(p_r))
                             )
                         except Exception:
                             is_case_dir = (
                                 p.is_dir()
                                 and p.parent == root
-                                and (not _RUN_FOLDER_RE.match(p.name))
+                                and (not self._is_result_run_dir(p))
                             )
 
                         if is_case_dir:
@@ -1381,6 +1456,92 @@ class BenchmarkController:
             return hits
         except Exception:
             return []
+
+    def _run_dir_to_compare_manifest_rel(self, run_dir: Path) -> str:
+        """Return the normalized run path format used inside compare_manifest.json."""
+        try:
+            return str(Path(run_dir).resolve().relative_to(self._runs_root.resolve())).replace("\\", "/")
+        except Exception:
+            return str(run_dir).replace("\\", "/")
+
+    @staticmethod
+    def _same_string_set(a: list[str], b: list[str]) -> bool:
+        aa = {str(x).strip() for x in (a or []) if str(x).strip()}
+        bb = {str(x).strip() for x in (b or []) if str(x).strip()}
+        return aa == bb and len(aa) == len(bb)
+
+    def _find_existing_compare_result_for(self, run_dirs: list[Path], sensors: list[str]) -> Path | None:
+        """Return an existing compare result for the exact same source runs and sensors."""
+        try:
+            if not run_dirs or not sensors or self._runs_root is None:
+                return None
+
+            root = self._runs_root
+            if not root.exists():
+                return None
+
+            expected_runs = [self._run_dir_to_compare_manifest_rel(rd) for rd in run_dirs]
+            expected_sensors = [str(s).strip() for s in (sensors or []) if str(s).strip()]
+
+            try:
+                root_r = root.resolve()
+            except Exception:
+                root_r = root
+
+            for mp in root_r.rglob("compare_manifest.json"):
+                try:
+                    if not mp.is_file():
+                        continue
+                    try:
+                        manifest = json.loads(mp.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    if (manifest or {}).get("type") != "compare":
+                        continue
+
+                    manifest_runs = [str(r).replace("\\", "/") for r in ((manifest or {}).get("runs") or [])]
+                    manifest_sensors = [str(s).strip() for s in ((manifest or {}).get("sensors") or []) if str(s).strip()]
+
+                    if not self._same_string_set(manifest_runs, expected_runs):
+                        continue
+                    if not self._same_string_set(manifest_sensors, expected_sensors):
+                        continue
+
+                    return mp.parent
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    def _compare_duplicate_message_for_sensors(self, sensors: list[str]) -> str | None:
+        """Return a user-facing duplicate message if this compare result already exists."""
+        try:
+            sensors = [str(s).strip() for s in (sensors or []) if str(s).strip()]
+            if not sensors:
+                return None
+
+            try:
+                group_map = _load_sensor_group_map()
+                sensors = self._sort_sensors_for_compare(sensors, group_map=group_map)
+            except Exception:
+                sensors = self._sort_sensors_for_compare(sensors)
+
+            run_dirs = self._valid_compare_input_dirs()
+            if len(run_dirs) < 2:
+                return None
+
+            existing = self._find_existing_compare_result_for(run_dirs, sensors)
+            if existing is None:
+                return None
+
+            try:
+                rel = str(existing.resolve().relative_to(self._runs_root.resolve())).replace("\\", "/")
+            except Exception:
+                rel = existing.name
+            return f"Compare result already exists: {rel}"
+        except Exception:
+            return None
 
     def _confirm_cascade_delete_dialog(
         self,
@@ -1784,7 +1945,7 @@ class BenchmarkController:
 
             def _is_run_folder(p: Path) -> bool:
                 try:
-                    return bool(p is not None and p.is_dir() and _RUN_FOLDER_RE.match(p.name))
+                    return bool(p is not None and p.is_dir() and self._is_result_run_dir(p))
                 except Exception:
                     return False
 
@@ -1928,13 +2089,13 @@ class BenchmarkController:
                     p_r.is_dir()
                     and p_r.parent is not None
                     and p_r.parent.resolve() == root_r
-                    and (not _RUN_FOLDER_RE.match(p_r.name))
+                    and (not self._is_result_run_dir(p_r))
                 )
             except Exception:
                 is_case_dir = (
                     p.is_dir()
                     and p.parent == root
-                    and (not _RUN_FOLDER_RE.match(p.name))
+                    and (not self._is_result_run_dir(p))
                 )
 
             if not is_case_dir:

@@ -16,6 +16,17 @@ import matplotlib.dates as mdates
 import matplotlib.patheffects as pe
 
 
+def get_mpl_cmap(name: str):
+    """Return a Matplotlib colormap across old and new Matplotlib APIs."""
+    get_cmap = getattr(cm, "get_cmap", None)
+    if callable(get_cmap):
+        return get_cmap(name)
+
+    from matplotlib import colormaps
+
+    return colormaps[name]
+
+
 def _parse_dt_flexible(s: pd.Series) -> pd.Series:
     """Parse a datetime Series, supporting both EU (dd.mm.yyyy) and Asia (yyyy/mm/dd) formats."""
     for fmt in (
@@ -235,7 +246,7 @@ def apply_light_axes_style(fig, ax, *, grid_color: str, dot_dashes) -> None:
 
 
 def build_tab20_color_map(cols: list[str]) -> dict[str, str]:
-    cmap = cm.get_cmap("tab20")
+    cmap = get_mpl_cmap("tab20")
     color_map: dict[str, str] = {}
     for idx, name in enumerate(cols):
         colc = cmap(idx % 20)
@@ -282,10 +293,10 @@ def plot_lines_with_glow(
         colc = color_map.get(str(c), "#FFFFFF")
         colors.append(colc)
 
-        if is_dt:
-            ln = ax.plot_date(x_vals, y, "-", color=colc, **line_kwargs)[0]
-        else:
-            ln = ax.plot(x_vals, y, "-", color=colc, **line_kwargs)[0]
+        # Matplotlib 3.11 removed Axes.plot_date; date values are already
+        # converted to Matplotlib floats by compute_x_vals(), so plot() works
+        # for both datetime and numeric x data.
+        ln = ax.plot(x_vals, y, "-", color=colc, **line_kwargs)[0]
 
         try:
             ln.set_path_effects([

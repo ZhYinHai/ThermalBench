@@ -12,7 +12,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from PySide6.QtCore import QTimer, Qt, QEvent, QObject, QEasingCurve, QPropertyAnimation
+from PySide6.QtCore import QTimer, Qt, QEvent, QObject, QEasingCurve, QPropertyAnimation, QMimeData, QByteArray
 from PySide6.QtGui import QImage, QPixmap, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QGraphicsOpacityEffect,
+    QMessageBox,
 )
 
 from matplotlib.figure import Figure
@@ -50,6 +51,7 @@ from .graph_plot_helpers import (
     extract_unit_from_column,
     group_columns_by_unit,
     get_measurement_type_label,
+    get_mpl_cmap,
 )
 from ..widgets.ui_theme import resolve_effective_theme_mode
 
@@ -1691,6 +1693,8 @@ class GraphPreview(QObject):
             def _plot_cols(ax, x_vals, df, cols, color_map, is_dt):
                 handles = []
                 for c in cols:
+                    if c not in df.columns:
+                        continue
                     y = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
                     colc = str(color_map.get(str(c), "#FFFFFF"))
                     kw = dict(
@@ -1701,10 +1705,9 @@ class GraphPreview(QObject):
                         antialiased=True,
                         zorder=10,
                     )
-                    if is_dt:
-                        ln = ax.plot_date(x_vals, y, "-", color=colc, **kw)[0]
-                    else:
-                        ln = ax.plot(x_vals, y, "-", color=colc, **kw)[0]
+                    # Matplotlib 3.11 removed Axes.plot_date. x_vals are already
+                    # Matplotlib date floats for datetime data, so plot() works for both.
+                    ln = ax.plot(x_vals, y, "-", color=colc, **kw)[0]
                     try:
                         ln.set_path_effects([
                             pe.Stroke(linewidth=glow_lw, foreground=colc, alpha=glow_alpha),
@@ -1780,6 +1783,7 @@ class GraphPreview(QObject):
             elif is_multi:
                 axis_state = getattr(self, "_single_axis_state", {}) or {}
                 single_axes = list(getattr(self, "_single_axes", []) or [])
+                active_set = set(self._effective_active_cols())
 
                 if axis_indices is not None:
                     sel = [i for i in axis_indices if i < len(single_axes)]
@@ -1804,11 +1808,14 @@ class GraphPreview(QObject):
 
                     x_vals = np.asarray(st["x"], dtype=float)
                     df = st["df"]
-                    cols = st["cols"]
+                    cols = [str(c) for c in (st["cols"] or []) if str(c) in active_set]
+                    if not cols:
+                        continue
                     colors = st["colors"]
                     is_dt = bool(st.get("is_dt", True))
                     unit = str(st.get("unit", ""))
-                    cmap_local = {str(c): str(clr) for c, clr in zip(cols, colors)}
+                    cmap_local_all = {str(c): str(clr) for c, clr in zip(st["cols"], colors)}
+                    cmap_local = {str(c): str(cmap_local_all.get(str(c), "#FFFFFF")) for c in cols}
 
                     handles = _plot_cols(dst_ax, x_vals, df, cols, cmap_local, is_dt)
                     measurement_label = self._measurement_title_for_unit(unit, fallback="Graph")
@@ -1885,13 +1892,20 @@ class GraphPreview(QObject):
                 bbox_inches="tight",
                 pad_inches=0.08,
             )
-            buf.seek(0)
+            png_bytes = buf.getvalue()
 
             qimg = QImage()
-            qimg.loadFromData(buf.read())
+            if not qimg.loadFromData(png_bytes, "PNG") or qimg.isNull():
+                raise RuntimeError("Generated graph PNG could not be loaded for clipboard copy.")
+
             clipboard = QApplication.clipboard()
-            if clipboard is not None:
-                clipboard.setImage(qimg)
+            if clipboard is None:
+                raise RuntimeError("Qt clipboard is unavailable.")
+
+            mime_data = QMimeData()
+            mime_data.setImageData(qimg)
+            mime_data.setData("image/png", QByteArray(png_bytes))
+            clipboard.setMimeData(mime_data)
 
             buf.close()
             try:
@@ -1911,6 +1925,15 @@ class GraphPreview(QObject):
         except Exception as e:
             import traceback
             traceback.print_exc()
+            try:
+                copy_btn = getattr(self, "_preview_header_copy_btn", None)
+                QMessageBox.warning(
+                    copy_btn or self.parent,
+                    "Copy Graph",
+                    f"Could not copy the graph image to the clipboard.\n\n{type(e).__name__}: {e}",
+                )
+            except Exception:
+                pass
 
     def _apply_preview_surface_theme(self) -> None:
         try:
@@ -7286,7 +7309,7 @@ class GraphPreview(QObject):
         # Stable per-run palette (run -> color)
         # -----------------------------
         try:
-            cmaps = [cm.get_cmap("tab20"), cm.get_cmap("tab20b"), cm.get_cmap("tab20c")]
+            cmaps = [get_mpl_cmap("tab20"), get_mpl_cmap("tab20b"), get_mpl_cmap("tab20c")]
             palette: list[str] = []
             for cmap in cmaps:
                 for k in range(int(getattr(cmap, "N", 20) or 20)):

@@ -5,6 +5,8 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
+from core.hwinfo_csv import _norm_hwinfo_text
+
 # ----------------------------
 # Cache helpers (unchanged)
 # ----------------------------
@@ -19,6 +21,7 @@ def load_sensor_map(path: Path) -> dict[str, Any] | None:
 
 def save_sensor_map(path: Path, header_unique: list[str], mapping: dict[str, str]) -> None:
     payload = {"schema": 1, "header_unique": header_unique, "mapping": mapping}
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -242,7 +245,7 @@ def _read_entries_v2(base_ptr: int) -> list[tuple[str, str]]:
         if not rname:
             continue
 
-        label = f"{rname} [{unit}]" if unit else rname
+        label = _norm_hwinfo_text(f"{rname} [{unit}]" if unit else rname)
         out.append((label, group))
 
     return out
@@ -279,7 +282,7 @@ def _read_entries_legacy(base_ptr: int) -> list[tuple[str, str]]:
         unit = _cstr(bytes(r.unit)).strip()
         if not rname:
             continue
-        label = f"{rname} [{unit}]" if unit else rname
+        label = _norm_hwinfo_text(f"{rname} [{unit}]" if unit else rname)
         out.append((label, group))
     return out
 

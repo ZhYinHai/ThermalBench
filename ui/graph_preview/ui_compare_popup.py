@@ -41,6 +41,7 @@ class ComparePopup(QDialog):
         run_dates: Optional[list[str]] = None,
         on_close: Optional[Callable[[], None]] = None,
         on_compare: Optional[Callable[[list[str]], None]] = None,
+        duplicate_check: Optional[Callable[[list[str]], str | None]] = None,
         theme_mode: str = "device",
     ):
         super().__init__(parent)
@@ -55,6 +56,7 @@ class ComparePopup(QDialog):
 
         self._on_close = on_close
         self._on_compare = on_compare
+        self._duplicate_check = duplicate_check
 
         root = QVBoxLayout(self)
         root.setSizeConstraint(QLayout.SetDefaultConstraint)
@@ -206,6 +208,14 @@ class ComparePopup(QDialog):
         tree_wrap.addWidget(self.tree, 1)
         root.addLayout(tree_wrap, 1)
 
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(
+            f"color: {self._theme['warning_fg']}; font-size: 11px; padding: 0 2px;"
+        )
+        self.status_label.hide()
+        root.addWidget(self.status_label)
+
         footer = QHBoxLayout()
         footer.setContentsMargins(0, 0, 0, 0)
         footer.setSpacing(8)
@@ -302,6 +312,7 @@ class ComparePopup(QDialog):
                 "button_disabled_fg": "#7A7A7A",
                 "button_disabled_bg": "#202020",
                 "button_disabled_border": "#2D2D2D",
+                "warning_fg": "#D7A84F",
             }
         return {
             "dialog_bg": "#F7F7F7",
@@ -320,6 +331,7 @@ class ComparePopup(QDialog):
             "button_disabled_fg": "#8E8E8E",
             "button_disabled_bg": "#F1F1F1",
             "button_disabled_border": "#D8D8D8",
+            "warning_fg": "#8A5B00",
         }
 
     def _select_all(self) -> None:
@@ -373,6 +385,9 @@ class ComparePopup(QDialog):
 
     def _emit_compare(self) -> None:
         try:
+            self._update_compare_btn_state()
+            if not self.compare_btn.isEnabled():
+                return
             cb = getattr(self, "_on_compare", None)
             if callable(cb):
                 cb(self.selected_sensors())
@@ -381,7 +396,25 @@ class ComparePopup(QDialog):
 
     def _update_compare_btn_state(self) -> None:
         try:
-            self.compare_btn.setEnabled(bool(self.selected_sensors()))
+            sensors = self.selected_sensors()
+            msg = None
+            checker = getattr(self, "_duplicate_check", None)
+            if sensors and callable(checker):
+                try:
+                    msg = checker(sensors)
+                except Exception:
+                    msg = None
+
+            if msg:
+                self.compare_btn.setEnabled(False)
+                self.compare_btn.setToolTip(str(msg))
+                self.status_label.setText(str(msg))
+                self.status_label.show()
+            else:
+                self.compare_btn.setEnabled(bool(sensors))
+                self.compare_btn.setToolTip("")
+                self.status_label.clear()
+                self.status_label.hide()
         except Exception:
             pass
 
