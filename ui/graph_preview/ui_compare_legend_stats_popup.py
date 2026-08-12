@@ -192,7 +192,7 @@ class CompareLegendStatsPopup(QDialog):
         settings_btn = QPushButton("Settings")
         settings_btn.setCursor(Qt.PointingHandCursor)
         settings_btn.setCheckable(True)
-        settings_btn.setChecked(False)
+        settings_btn.setChecked(True)
         settings_btn.clicked.connect(self._toggle_settings_panel)
         settings_btn.setStyleSheet(self._button_stylesheet(checkable=True))
 
@@ -272,21 +272,43 @@ class CompareLegendStatsPopup(QDialog):
         self._settings_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         self._settings_panel.setMinimumWidth(170)
         self._settings_panel.setMaximumWidth(240)
-        self._settings_panel.setVisible(False)
+        self._settings_panel.setVisible(True)
 
         sp_root = QVBoxLayout(self._settings_panel)
         sp_root.setContentsMargins(8, 8, 8, 8)
         sp_root.setSpacing(6)
 
         sp_title = QLabel("Test Settings")
+        sp_title.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         sp_title.setStyleSheet(
             f"color:{self._theme['secondary_text']}; font-weight:600; font-size:11px;"
         )
-        sp_root.addWidget(sp_title)
+
+        copy_settings_btn = QPushButton("Copy Settings")
+        copy_settings_btn.setCursor(Qt.PointingHandCursor)
+        copy_settings_btn.clicked.connect(self._copy_settings_to_clipboard)
+        copy_settings_btn.setStyleSheet(
+            self._button_stylesheet() + "QPushButton { padding: 0px 12px; font-size: 11px; }"
+        )
+        try:
+            copy_settings_btn.setFixedHeight(max(18, int(sp_title.sizeHint().height())))
+        except Exception:
+            pass
+
+        sp_header = QHBoxLayout()
+        sp_header.setContentsMargins(0, 0, 0, 0)
+        sp_header.setSpacing(6)
+        sp_header.addWidget(sp_title)
+        sp_header.addStretch(1)
+        sp_header.addWidget(copy_settings_btn)
+        sp_root.addLayout(sp_header)
+
+        self._copy_settings_btn = copy_settings_btn
 
         self._settings_label = QLabel()
         self._settings_label.setTextFormat(Qt.RichText)
         self._settings_label.setWordWrap(True)
+        self._settings_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self._settings_label.setStyleSheet(
             f"color:{self._theme['text']}; font-size:11px;"
         )
@@ -308,6 +330,14 @@ class CompareLegendStatsPopup(QDialog):
         sp_root.addWidget(sp_sc, 1)
 
         self._render_compare_settings()
+
+        # _apply_fixed_dialog_size() runs early in __init__ (before settings
+        # controls exist), so re-apply settings width now that the panel/button
+        # are created to avoid first-open overlap.
+        try:
+            self._update_fixed_size_for_settings_panel(bool(self._settings_btn.isChecked()))
+        except Exception:
+            pass
 
         # Disable tooltip if nothing is recorded anywhere.
         try:
@@ -366,6 +396,7 @@ class CompareLegendStatsPopup(QDialog):
         # Fixed-size dialog (same for all result counts).
 
         QTimer.singleShot(0, self._autosize_columns)
+        QTimer.singleShot(0, lambda: self._update_fixed_size_for_settings_panel(bool(self._settings_btn.isChecked())))
         QTimer.singleShot(0, lambda: self._update_header_widths(tree))
         QTimer.singleShot(0, lambda: self._update_header_scrollbar_spacer(tree))
         QTimer.singleShot(0, lambda: self._fit_columns_if_needed(tree))
@@ -1597,6 +1628,15 @@ class CompareLegendStatsPopup(QDialog):
             self._screen_max_h = int(max_h)
 
             self.setFixedSize(int(target_w), int(target_h))
+
+            # If Settings is enabled by default, reserve its width now so the
+            # panel does not overlap the stats table on first open.
+            try:
+                btn = getattr(self, "_settings_btn", None)
+                if btn is not None and bool(btn.isChecked()):
+                    self._update_fixed_size_for_settings_panel(True)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1610,6 +1650,109 @@ class CompareLegendStatsPopup(QDialog):
             want_on = bool(btn.isChecked()) if btn is not None else (not sp.isVisible())
             sp.setVisible(want_on)
             self._update_fixed_size_for_settings_panel(want_on)
+        except Exception:
+            pass
+
+    def _copy_settings_to_clipboard(self) -> None:
+        """Copy the currently visible compare-run settings to the clipboard as plain text."""
+        try:
+            lines: list[str] = []
+            for rt in (self._run_tables or []):
+                ts = rt.get("test_settings")
+                if not isinstance(ts, dict) or not ts:
+                    continue
+
+                label = str(rt.get("label") or "Settings").strip() or "Settings"
+                lines.append(label)
+                lines.append("-" * max(4, len(label)))
+
+                def g(key: str, default: str = "") -> str:
+                    try:
+                        v = ts.get(key)
+                        return str(v).strip() if v is not None else default
+                    except Exception:
+                        return default
+
+                def gb(key: str) -> bool | None:
+                    try:
+                        if key not in ts:
+                            return None
+                        value = ts.get(key)
+                        if isinstance(value, bool):
+                            return value
+                        text = str(value).strip().lower()
+                        if text in {"1", "true", "yes", "on"}:
+                            return True
+                        if text in {"0", "false", "no", "off"}:
+                            return False
+                    except Exception:
+                        pass
+                    return None
+
+                def glist(key: str) -> list[str]:
+                    try:
+                        value = ts.get(key)
+                        if isinstance(value, list):
+                            return [str(v).strip() for v in value if str(v).strip()]
+                        if value is None:
+                            return []
+                        text = str(value).strip()
+                        return [text] if text else []
+                    except Exception:
+                        return []
+
+                warm = g("warmup_display") or g("warmup_total_sec")
+                logt = g("log_display") or g("log_total_sec")
+                stress = g("stress_mode")
+                demo = g("furmark_demo")
+                res = g("furmark_resolution_display") or g("furmark_resolution")
+                prime95_summary = g("prime95_torture_settings_display")
+                prime95_preset = g("prime95_inferred_preset_name")
+                if not prime95_preset:
+                    try:
+                        inferred = ts.get("prime95_inferred_preset")
+                        if isinstance(inferred, dict):
+                            prime95_preset = str(inferred.get("preset_name") or "").strip()
+                    except Exception:
+                        prime95_preset = ""
+                sensor_devices = glist("selected_sensor_devices")
+                stress_cpu = gb("stress_cpu")
+                stress_gpu = gb("stress_gpu")
+                if stress_gpu is None:
+                    stress_gpu = "gpu" in stress.lower()
+                if stress_cpu is False:
+                    prime95_preset = ""
+                    prime95_summary = ""
+
+                if warm:
+                    lines.append(f"Warm up time: {warm}")
+                if logt:
+                    lines.append(f"Log time: {logt}")
+                if stress:
+                    lines.append(f"Stresstest: {stress}")
+                if prime95_preset:
+                    lines.append(f"Prime95 inferred preset: {prime95_preset}")
+                if prime95_summary:
+                    lines.append(f"Prime95 torture settings: {prime95_summary}")
+                if stress_gpu and demo:
+                    lines.append(f"FurMark demo: {demo}")
+                if stress_gpu and res:
+                    lines.append(f"FurMark resolution: {res}")
+                if sensor_devices:
+                    lines.append("Selected sensor devices:")
+                    lines.extend(f"- {dev}" for dev in sensor_devices)
+                if lines and lines[-1] != "":
+                    lines.append("")
+
+            text = "\n".join(lines).strip() or "No settings recorded for these runs."
+            QApplication.clipboard().setText(text)
+
+            if hasattr(self, "sender") and self.sender():
+                btn = self.sender()
+                if isinstance(btn, QPushButton):
+                    original_text = btn.text()
+                    btn.setText("✓ Copied!")
+                    QTimer.singleShot(1500, lambda: btn.setText(original_text))
         except Exception:
             pass
 
@@ -1679,21 +1822,54 @@ class CompareLegendStatsPopup(QDialog):
                 stress = g("stress_mode")
                 demo = g("furmark_demo")
                 res = g("furmark_resolution_display") or g("furmark_resolution")
+                prime95_summary = g("prime95_torture_settings_display")
+                prime95_preset = g("prime95_inferred_preset_name")
+                if not prime95_preset:
+                    try:
+                        inferred = s.get("prime95_inferred_preset")
+                        if isinstance(inferred, dict):
+                            prime95_preset = str(inferred.get("preset_name") or "").strip()
+                    except Exception:
+                        prime95_preset = ""
+                sensor_devices_raw = s.get("selected_sensor_devices")
+                sensor_devices: list[str] = []
+                try:
+                    if isinstance(sensor_devices_raw, list):
+                        sensor_devices = [str(x).strip() for x in sensor_devices_raw if str(x).strip()]
+                    elif sensor_devices_raw is not None:
+                        text = str(sensor_devices_raw).strip()
+                        sensor_devices = [text] if text else []
+                except Exception:
+                    sensor_devices = []
+                stress_cpu = gb("stress_cpu")
                 stress_gpu = gb("stress_gpu")
                 if stress_gpu is None:
                     stress_gpu = "gpu" in stress.lower()
+                if stress_cpu is False:
+                    prime95_preset = ""
+                    prime95_summary = ""
 
                 lines: list[str] = []
                 if warm:
-                    lines.append(f"Warm up time: {warm}")
+                    lines.append(f"<b>Warm up time:</b> {html.escape(str(warm))}")
                 if logt:
-                    lines.append(f"Log time: {logt}")
+                    lines.append(f"<b>Log time:</b> {html.escape(str(logt))}")
                 if stress:
-                    lines.append(f"Stresstest: {stress}")
+                    lines.append(f"<b>Stresstest:</b> {html.escape(str(stress))}")
+                if prime95_preset:
+                    lines.append(f"<b>Prime95 inferred preset:</b> {html.escape(prime95_preset)}")
+                if prime95_summary:
+                    lines.append(f"<b>Prime95 torture settings:</b> {html.escape(prime95_summary)}")
                 if stress_gpu and demo:
-                    lines.append(f"FurMark demo: {demo}")
+                    lines.append(f"<b>FurMark demo:</b> {html.escape(str(demo))}")
                 if stress_gpu and res:
-                    lines.append(f"FurMark resolution: {res}")
+                    lines.append(f"<b>FurMark resolution:</b> {html.escape(str(res))}")
+                if sensor_devices:
+                    sensor_lines = "<br>".join(
+                        f"<span style='display:inline-block; margin-left:12px; text-indent:-12px;'>- {html.escape(str(dev))}</span>"
+                        for dev in sensor_devices
+                    )
+                    lines.append(f"<b>Selected sensor devices:</b><br>{sensor_lines}")
                 return lines
 
             blocks: list[str] = []

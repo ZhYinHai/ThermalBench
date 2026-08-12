@@ -1,6 +1,7 @@
 import json
 import ctypes
 import struct as _struct
+import re
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
@@ -325,6 +326,16 @@ def _read_sm2_entries() -> list[tuple[str, str]]:
     finally:
         CloseHandle(hmap)
 
+
+def _normalize_group_match_label(label: str) -> str:
+    """Normalize labels for resilient CSV/SM2 matching."""
+    text = _norm_hwinfo_text(label or "")
+    # Drop trailing unit block so labels with/without units match.
+    text = re.sub(r"\s*\[[^\]]+\]\s*$", "", text)
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
 def build_precise_group_map(csv_leafs: list[str], csv_unique_leafs: list[str]) -> dict[str, str]:
     """
     Map each UNIQUE CSV column name to its HWiNFO sensor group title.
@@ -335,8 +346,12 @@ def build_precise_group_map(csv_leafs: list[str], csv_unique_leafs: list[str]) -
     entries = _read_sm2_entries()
 
     label_to_groups: dict[str, list[str]] = {}
+    normalized_label_to_groups: dict[str, list[str]] = {}
     for label, group in entries:
         label_to_groups.setdefault(label, []).append(group)
+        normalized = _normalize_group_match_label(label)
+        if normalized:
+            normalized_label_to_groups.setdefault(normalized, []).append(group)
 
     occ: dict[str, int] = {}
     mapping: dict[str, str] = {}
@@ -347,5 +362,11 @@ def build_precise_group_map(csv_leafs: list[str], csv_unique_leafs: list[str]) -
         groups = label_to_groups.get(base, [])
         if k < len(groups):
             mapping[uniq] = groups[k]
+            continue
+
+        normalized_base = _normalize_group_match_label(base)
+        normalized_groups = normalized_label_to_groups.get(normalized_base, [])
+        if k < len(normalized_groups):
+            mapping[uniq] = normalized_groups[k]
 
     return mapping

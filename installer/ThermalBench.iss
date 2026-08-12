@@ -62,7 +62,17 @@ Name: "desktopicon"; Description: "Create a &desktop icon"; GroupDescription: "A
 ; Install the full PyInstaller onedir bundle.
 ; Runtime data such as hwinfo.csv and runs/ belongs in Documents\ThermalBench,
 ; not inside Program Files.
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion; Excludes: "tools\HWiNFO\hwinfo.csv,runs\*"
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion; Excludes: "tools\HWiNFO\hwinfo.csv,tools\Prime95\*,runs\*"
+; Prime95 must be writable (local.txt/results.txt), so install bundle files
+; directly under LOCALAPPDATA instead of Program Files.
+Source: "{#SourceDir}\tools\Prime95\*"; DestDir: "{localappdata}\ThermalBench\tools\Prime95"; Flags: recursesubdirs createallsubdirs ignoreversion
+
+[InstallDelete]
+; Upgrade cleanup: remove legacy Prime95 copies from Program Files so runtime
+; always relies on the writable AppData location.
+Type: filesandordirs; Name: "{app}\tools\Prime95"
+Type: filesandordirs; Name: "{app}\tools\prime95"
+Type: files; Name: "{app}\tools\prime95.exe"
 
 [Registry]
 Root: HKCU; Subkey: "Software\ThermalBench"; ValueType: string; ValueName: "InstallDir"; ValueData: "{app}"; Flags: uninsdeletekeyifempty

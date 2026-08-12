@@ -329,6 +329,37 @@ def ensure_prime95_runtime_dir() -> Path:
     return dst
 
 
+def _prime95_runtime_candidates(runtime_dir: Path) -> list[Path]:
+    return [
+        runtime_dir / "prime95.exe",
+        runtime_dir / "prime95" / "prime95.exe",
+    ]
+
+
+def _seed_prime95_runtime_from_exe(runtime_dir: Path, source_exe: str | Path | None) -> bool:
+    """Best-effort seed of runtime Prime95 files from an existing executable path."""
+    found = _existing_file(source_exe)
+    if not found:
+        return False
+
+    src_exe = Path(found)
+    src_dir = src_exe.parent
+    if not src_dir.exists():
+        return False
+
+    try:
+        shutil.copytree(
+            src_dir,
+            runtime_dir,
+            dirs_exist_ok=True,
+            ignore=_ignore_prime95_runtime_files,
+        )
+    except Exception:
+        return False
+
+    return bool(_first_existing(_prime95_runtime_candidates(runtime_dir)))
+
+
 def resolve_furmark_exe(configured: str = "") -> str:
     runtime = ensure_furmark_runtime_dir()
     bundled = _bundled_furmark_dir()
@@ -352,17 +383,23 @@ def resolve_furmark_exe(configured: str = "") -> str:
 def resolve_prime95_exe(configured: str = "") -> str:
     runtime = ensure_prime95_runtime_dir()
     bundled = _bundled_prime95_dir()
+    runtime_exe = _first_existing(_prime95_runtime_candidates(runtime))
+    if runtime_exe:
+        return runtime_exe
 
-    return _first_existing(
-        [
-            runtime / "prime95.exe",
-            runtime / "prime95" / "prime95.exe",
-            configured,
-            _read_hkcu_string("PrimeExe"),
-            bundled / "prime95.exe",
-            bundled / "prime95" / "prime95.exe",
-        ]
-    )
+    # Migration path: seed runtime from any existing configured/legacy/bundled
+    # Prime95 executable, then continue using runtime only.
+    sources = [
+        configured,
+        _read_hkcu_string("PrimeExe"),
+        bundled / "prime95.exe",
+        bundled / "prime95" / "prime95.exe",
+    ]
+    for source in sources:
+        if _seed_prime95_runtime_from_exe(runtime, source):
+            break
+
+    return _first_existing(_prime95_runtime_candidates(runtime))
 
 
 def hwinfo_dir() -> Path:

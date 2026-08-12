@@ -60,7 +60,7 @@ from PySide6.QtWidgets import (
 
 from .widgets.ui_theme import apply_theme, resolve_effective_theme_mode, style_combobox_popup
 from .widgets.ui_widgets import CustomComboBox
-from .dialogs import HelpDialog, HelpPanel, SettingsDialog, UpdateAvailableDialog
+from .dialogs import HelpDialog, HelpPanel, SettingsDialog, UpdateAvailableDialog, Prime95SettingsDialog
 from .widgets.ui_titlebar import TitleBar
 from .widgets.ui_time_spin import make_time_spin
 from .graph_preview import GraphPreview
@@ -104,6 +104,7 @@ from core.bundled_tools import (
     launch_hwinfo,
     hwinfo_dir,
 )
+from core.prime95_compat_v305 import load_prime95_torture_snapshot
 from core.user_paths import thermalbench_runs_root
 
 from PySide6.QtWidgets import QGridLayout
@@ -1072,6 +1073,11 @@ class MainWindow(QWidget):
             self.fur_res_combo.addItem(k)
         self.fur_res_combo.setCurrentText("3840 x 1600")
 
+        self._prime95_torture_snapshot = {}
+        self.prime95_settings_btn = QPushButton("Prime95 torture settings")
+        self.prime95_settings_btn.setCursor(Qt.PointingHandCursor)
+        self.prime95_settings_btn.clicked.connect(self._show_prime95_torture_settings_popup)
+
         # Sensors summary (clickable)
         self.sensors_summary = QLineEdit()
         self.sensors_summary.setReadOnly(True)
@@ -1094,8 +1100,6 @@ class MainWindow(QWidget):
         self.run_btn = QPushButton("Run")
         self.abort_btn = QPushButton("Abort")
         self.abort_btn.setEnabled(False)
-        self.open_btn = QPushButton("Open Run Folder")
-        self.open_btn.setEnabled(False)
         self.pick_hwinfo_btn = QPushButton("Open HWiNFO")
         self.pick_hwinfo_btn.setToolTip(
             "Open bundled HWiNFO.\n"
@@ -1235,7 +1239,7 @@ class MainWindow(QWidget):
             log_widget=self.log,
             run_btn=self.run_btn,
             abort_btn=self.abort_btn,
-            open_btn=self.open_btn,
+            open_btn=None,
             live_timer=self.live_timer,
             remove_btn=None,
             compare_btn=self.compare_btn,
@@ -1260,9 +1264,9 @@ class MainWindow(QWidget):
         self.pick_sensors_btn.clicked.connect(self.sensors.open_sensor_picker)
         self.run_btn.clicked.connect(self.benchmark.run)
         self.abort_btn.clicked.connect(self.benchmark.abort)
-        self.open_btn.clicked.connect(self.benchmark.open_run_folder)
         self.compare_btn.clicked.connect(self.benchmark.compare_selected_results)
-        self.gpu_btn.toggled.connect(lambda *_: self._sync_furmark_gpu_controls())
+        self.cpu_btn.toggled.connect(self._sync_furmark_gpu_controls)
+        self.gpu_btn.toggled.connect(self._sync_furmark_gpu_controls)
         # Removed: bottom delete button
 
         try:
@@ -1411,8 +1415,10 @@ class MainWindow(QWidget):
         stress_toggle_row.setSpacing(10)
         stress_toggle_row.addWidget(self.cpu_btn)
         stress_toggle_row.addWidget(self.gpu_btn)
+        stress_toggle_row.addWidget(self.prime95_settings_btn)
         stress_toggle_row.addStretch(1)
         stress_col.addLayout(stress_toggle_row)
+        stress_col.addStretch(1)
 
         warm_col = QVBoxLayout()
         warm_col.setSpacing(4)
@@ -1425,6 +1431,7 @@ class MainWindow(QWidget):
         warm_row.addWidget(self._unit_label("sec"))
         warm_row.addStretch(1)
         warm_col.addLayout(warm_row)
+        warm_col.addStretch(1)
 
         log_col = QVBoxLayout()
         log_col.setSpacing(4)
@@ -1437,10 +1444,11 @@ class MainWindow(QWidget):
         log_row.addWidget(self._unit_label("sec"))
         log_row.addStretch(1)
         log_col.addLayout(log_row)
+        log_col.addStretch(1)
 
-        time_row.addLayout(stress_col)
-        time_row.addLayout(warm_col)
-        time_row.addLayout(log_col)
+        time_row.addLayout(stress_col, 1)
+        time_row.addLayout(warm_col, 1)
+        time_row.addLayout(log_col, 1)
         root.addLayout(time_row)
 
         fur_row = QHBoxLayout()
@@ -1472,7 +1480,6 @@ class MainWindow(QWidget):
         btns = QHBoxLayout()
         btns.addWidget(self.run_btn)
         btns.addWidget(self.abort_btn)
-        btns.addWidget(self.open_btn)
         root.addLayout(btns)
 
         # Output area: Live monitor (during run) + Console (log)
@@ -1942,6 +1949,7 @@ class MainWindow(QWidget):
         # Load settings and initialize state
         self.load_settings()
         self._sync_furmark_gpu_controls()
+        self._refresh_prime95_torture_display()
         self.sensors.refresh_sensors_summary()
         self._update_run_button_state()
 
@@ -3211,7 +3219,11 @@ class MainWindow(QWidget):
 
     def _sync_furmark_gpu_controls(self) -> None:
         try:
+            cpu_enabled = bool(self.cpu_btn.isChecked())
             gpu_enabled = bool(self.gpu_btn.isChecked())
+
+            self.prime95_settings_btn.setEnabled(cpu_enabled)
+            self._set_widget_dimmed(self.prime95_settings_btn, not cpu_enabled)
 
             self.fur_demo_combo.setEnabled(gpu_enabled)
             self.fur_res_combo.setEnabled(gpu_enabled)
@@ -3220,6 +3232,192 @@ class MainWindow(QWidget):
             self._set_widget_dimmed(self.fur_demo_combo, not gpu_enabled)
             self._set_widget_dimmed(self._fur_res_label, not gpu_enabled)
             self._set_widget_dimmed(self.fur_res_combo, not gpu_enabled)
+        except Exception:
+            pass
+
+    def _refresh_prime95_torture_display(self) -> None:
+        try:
+            snapshot = load_prime95_torture_snapshot(self.prime_exe)
+            self._prime95_torture_snapshot = dict(snapshot or {})
+            settings_summary = str(snapshot.get("settings_summary") or "No Prime95 torture settings found.")
+            has_settings = bool((snapshot.get("settings") or {}))
+            inferred = snapshot.get("inferred_preset") if isinstance(snapshot.get("inferred_preset"), dict) else {}
+            preset_name = str((inferred or {}).get("preset_name") or "unknown")
+            confidence = str((inferred or {}).get("confidence") or "low")
+            rationale = str((inferred or {}).get("rationale") or "")
+
+            if has_settings:
+                self.prime95_settings_btn.setText("Prime95 torture settings")
+                self.prime95_settings_btn.setToolTip("Click to view the captured Prime95 torture settings.")
+            else:
+                self.prime95_settings_btn.setText("Prime95 torture settings (no data)")
+                self.prime95_settings_btn.setToolTip(settings_summary)
+
+            preset_display = preset_name if preset_name else "unknown"
+            if confidence and confidence not in {"", "low"}:
+                preset_display = f"{preset_display} ({confidence})"
+            self.prime95_preset_edit.setText(preset_display)
+
+            tooltip = preset_display
+            if rationale:
+                tooltip = f"{preset_display}\n{rationale}"
+            self.prime95_preset_edit.setToolTip(tooltip)
+        except Exception:
+            pass
+
+    def _latest_prime95_txt_path(self) -> Path | None:
+        roots: list[Path] = []
+
+        try:
+            exe_path = Path(str(self.prime_exe or "").strip())
+            if exe_path:
+                roots.append(exe_path.parent if exe_path.suffix.lower() == ".exe" else exe_path)
+        except Exception:
+            pass
+
+        try:
+            snap = dict(getattr(self, "_prime95_torture_snapshot", {}) or {})
+            for src in (snap.get("source_files") or []):
+                s = str(src or "").strip()
+                if not s:
+                    continue
+                p = Path(s)
+                roots.append(p.parent if p.suffix else p)
+        except Exception:
+            pass
+
+        dedup: dict[str, Path] = {}
+        for r in roots:
+            try:
+                dedup[str(r.resolve())] = r
+            except Exception:
+                dedup[str(r)] = r
+
+        latest_path: Path | None = None
+        latest_mtime = -1.0
+        for root in dedup.values():
+            try:
+                if not root.exists():
+                    continue
+                for p in root.rglob("prime.txt"):
+                    try:
+                        mt = float(p.stat().st_mtime)
+                    except Exception:
+                        continue
+                    if mt > latest_mtime:
+                        latest_mtime = mt
+                        latest_path = p
+            except Exception:
+                continue
+
+        return latest_path
+
+    def _show_prime95_torture_settings_popup(self) -> None:
+        try:
+            def _dialog_payload_from_snapshot(snapshot_obj: dict) -> dict[str, object]:
+                settings_obj = snapshot_obj.get("settings") if isinstance(snapshot_obj.get("settings"), dict) else {}
+                inferred_obj = snapshot_obj.get("inferred_preset") if isinstance(snapshot_obj.get("inferred_preset"), dict) else {}
+
+                settings_lines_obj: list[str] = []
+                weak_lines_obj: list[str] = []
+                label_map_obj = {
+                    "MinTortureFFT": "Min FFT size (in K)",
+                    "MaxTortureFFT": "Max FFT size (in K)",
+                    "TortureMem": "Memory to use (in MB)",
+                    "TortureTime": "Time to run each FFT size (in minutes)",
+                }
+                for key in ("MinTortureFFT", "MaxTortureFFT", "TortureMem", "TortureTime"):
+                    value = settings_obj.get(key)
+                    text = str(value).strip() if value is not None else ""
+                    if key == "TortureMem" and text == "8":
+                        # Prime95 may persist 8 as an internal sentinel for GUI value 0.
+                        text = "0"
+                    if text:
+                        settings_lines_obj.append(f"{label_map_obj[key]}: {text}")
+
+                run_in_place = str(settings_obj.get("RunFFTsInPlace") or "").strip()
+                torture_mem_raw = str(settings_obj.get("TortureMem") or "").strip()
+                in_place_sentinel = False
+                try:
+                    in_place_sentinel = int(torture_mem_raw) == 8
+                except Exception:
+                    in_place_sentinel = False
+                if run_in_place or in_place_sentinel:
+                    settings_lines_obj.append(
+                        f"Run FFTs in-place: {'true' if run_in_place not in {'', '0', 'False', 'false'} or in_place_sentinel else run_in_place}"
+                    )
+
+                weak_raw = settings_obj.get("TortureWeak")
+                weak_value = None
+                try:
+                    weak_value = int(str(weak_raw).strip())
+                except Exception:
+                    weak_value = None
+
+                if weak_value is not None:
+                    # Prime95 stores weak-mode checkboxes in a bitmask.
+                    avx512_on = bool(weak_value & 0x100000)
+                    avx2_on = bool(weak_value & 0x8000)
+                    avx_on = bool(weak_value & 0x4000)
+                    sse2_on = bool(weak_value & 0x0200)
+                    weaker_on = bool(weak_value != 0)
+
+                    def _bool_text(v: bool) -> str:
+                        return "true" if v else "false"
+
+                    weak_lines_obj.append(f"Run a Weaker Torture Test (not recommended): {_bool_text(weaker_on)}")
+                    weak_lines_obj.append(f"Disable AVX-512: {_bool_text(avx512_on)}")
+                    weak_lines_obj.append(f"Disable AVX2 (fused multiply-add): {_bool_text(avx2_on)}")
+                    weak_lines_obj.append(f"Disable AVX: {_bool_text(avx_on)}")
+                    weak_lines_obj.append(f"Disable SSE2: {_bool_text(sse2_on)}")
+                    weak_lines_obj.append(f"TortureWeak raw value: {weak_value}")
+                elif weak_raw is not None:
+                    weak_lines_obj.append(f"TortureWeak: {weak_raw}")
+
+                return {
+                    "settings_lines": settings_lines_obj,
+                    "weak_lines": weak_lines_obj,
+                    "preset_name": str((inferred_obj or {}).get("preset_name") or "unknown"),
+                    "confidence": str((inferred_obj or {}).get("confidence") or "low"),
+                    "rationale": str((inferred_obj or {}).get("rationale") or "").strip(),
+                }
+
+            latest_prime_txt = self._latest_prime95_txt_path()
+            if latest_prime_txt is not None:
+                snapshot = load_prime95_torture_snapshot(latest_prime_txt)
+            else:
+                snapshot = dict(getattr(self, "_prime95_torture_snapshot", {}) or {})
+                if not snapshot:
+                    snapshot = load_prime95_torture_snapshot(self.prime_exe)
+
+            self._prime95_torture_snapshot = dict(snapshot or {})
+
+            settings = snapshot.get("settings") if isinstance(snapshot.get("settings"), dict) else {}
+            inferred = snapshot.get("inferred_preset") if isinstance(snapshot.get("inferred_preset"), dict) else {}
+
+            if not settings:
+                QMessageBox.information(self, "Prime95 torture settings", "No Prime95 torture settings found.")
+                return
+
+            payload = _dialog_payload_from_snapshot(snapshot)
+
+            def _refresh_payload() -> dict[str, object]:
+                fresh_txt = self._latest_prime95_txt_path()
+                fresh_snapshot = load_prime95_torture_snapshot(fresh_txt if fresh_txt is not None else self.prime_exe)
+                self._prime95_torture_snapshot = dict(fresh_snapshot or {})
+                return _dialog_payload_from_snapshot(fresh_snapshot)
+            dlg = Prime95SettingsDialog(
+                self,
+                settings_lines=list(payload.get("settings_lines") or []),
+                weak_lines=list(payload.get("weak_lines") or []),
+                preset_name=str(payload.get("preset_name") or "unknown"),
+                confidence=str(payload.get("confidence") or "low"),
+                rationale=str(payload.get("rationale") or ""),
+                prime_exe=self.prime_exe,
+                refresh_payload=_refresh_payload,
+                theme_mode=self.theme_mode,
+            )
+            dlg.exec()
         except Exception:
             pass
 
@@ -5407,6 +5605,7 @@ class MainWindow(QWidget):
         self.cpu_btn.blockSignals(False)
         self.gpu_btn.blockSignals(False)
         self._sync_furmark_gpu_controls()
+        self._refresh_prime95_torture_display()
 
     def _apply_saved_window_state(self, data: dict) -> None:
         try:
@@ -5515,6 +5714,7 @@ class MainWindow(QWidget):
             self._refresh_left_rail_icons()
             self._refresh_month_nav_icons()
             self._sync_furmark_gpu_controls()
+            self._refresh_prime95_torture_display()
             self._refresh_compare_delegate_theme()
 
         self.hwinfo_exe = resolve_hwinfo_exe("")

@@ -31,6 +31,7 @@ from core.ps_helpers import RUNMAP_RE, ps_quote, build_ps_array_literal
 
 from core.user_paths import sensor_map_cache_path, thermalbench_runs_root
 from core.bundled_tools import resolve_hwinfo_csv, resolve_furmark_exe, resolve_prime95_exe
+from core.prime95_compat_v305 import load_prime95_torture_snapshot
 from core.resources import resource_path
 from core.hwinfo_metadata import load_sensor_map
 from ui.graph_preview.graph_plot_helpers import load_run_csv_dataframe
@@ -2967,7 +2968,8 @@ class BenchmarkController:
         self._save_settings()
 
         self.last_run_dir = None
-        self._open_btn.setEnabled(False)
+        if self._open_btn is not None:
+            self._open_btn.setEnabled(False)
         self._log.clear()
 
         settings = self._get_settings()
@@ -2982,9 +2984,18 @@ class BenchmarkController:
         fur_res_display = settings.get("fur_res_display", "").strip()
         furmark_exe = resolve_furmark_exe(settings.get("furmark_exe", ""))
         prime_exe = resolve_prime95_exe(settings.get("prime_exe", ""))
+        prime95_snapshot = load_prime95_torture_snapshot(prime_exe)
 
         if warm <= 0 or logsec <= 0:
             QMessageBox.warning(self.parent, "Invalid time", "Warmup and Log must be > 0 seconds.")
+            return
+
+        if not self._sensor_manager.can_run(furmark_exe, prime_exe):
+            QMessageBox.warning(
+                self.parent,
+                "Cannot start test",
+                "\n".join(self._sensor_manager.missing_reasons(furmark_exe, prime_exe)),
+            )
             return
 
         # Reject characters that would create sub-folders or break the run tree.
@@ -3057,6 +3068,14 @@ class BenchmarkController:
         try:
             stress_cpu = bool(getattr(self._sensor_manager, "stress_cpu", True))
             stress_gpu = bool(getattr(self._sensor_manager, "stress_gpu", True))
+            selected_sensor_devices = []
+            try:
+                resolver = getattr(self._sensor_manager, "selected_sensor_device_names", None)
+                if callable(resolver):
+                    selected_sensor_devices = [str(x) for x in (resolver() or []) if str(x).strip()]
+            except Exception:
+                selected_sensor_devices = []
+
             if stress_cpu and stress_gpu:
                 stress_mode = "CPU + GPU"
             elif stress_cpu:
@@ -3068,6 +3087,17 @@ class BenchmarkController:
 
             demo_disp = fur_demo_display or str(fur_demo)
             res_disp = fur_res_display or f"{fur_w}x{fur_h}"
+
+            if not stress_cpu:
+                prime95_settings = {}
+                prime95_summary = ""
+                prime95_preset = {}
+                prime95_preset_name = ""
+            else:
+                prime95_settings = dict(prime95_snapshot.get("settings") or {})
+                prime95_summary = str(prime95_snapshot.get("settings_summary") or "")
+                prime95_preset = dict(prime95_snapshot.get("inferred_preset") or {})
+                prime95_preset_name = str((prime95_snapshot.get("inferred_preset") or {}).get("preset_name") or "unknown")
 
             self._pending_run_settings = {
                 "case_name": str(case),
@@ -3081,6 +3111,11 @@ class BenchmarkController:
                 "furmark_demo": str(demo_disp),
                 "furmark_resolution": f"{int(fur_w)}x{int(fur_h)}",
                 "furmark_resolution_display": str(res_disp),
+                "prime95_torture_settings": prime95_settings,
+                "prime95_torture_settings_display": prime95_summary,
+                "prime95_inferred_preset": prime95_preset,
+                "prime95_inferred_preset_name": prime95_preset_name,
+                "selected_sensor_devices": list(selected_sensor_devices),
                 "recorded_at": datetime.now().isoformat(timespec="seconds"),
                 "runs_root": str(self._runs_root),
             }
@@ -3202,7 +3237,8 @@ class BenchmarkController:
         self._run_btn.setEnabled(True)
         self._abort_btn.setEnabled(False)
         self.stop_live_timer("Idle" if code == 0 else "Stopped")
-        self._open_btn.setEnabled(bool(self.last_run_dir and Path(self.last_run_dir).exists()))
+        if self._open_btn is not None:
+            self._open_btn.setEnabled(bool(self.last_run_dir and Path(self.last_run_dir).exists()))
 
         # Make sure the new run exists in the tree model before any UI tries to select it.
         try:

@@ -3,6 +3,7 @@
 """Legend and statistics popup dialog for graph preview."""
 
 import math
+import html
 from typing import Optional, Callable
 
 from PySide6.QtCore import QTimer, Qt, QEvent, QMimeData
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QPushButton,
     QApplication,
+    QScrollArea,
 )
 
 from ui.graph_preview.graph_plot_helpers import group_columns_by_unit, get_measurement_type_label
@@ -113,7 +115,7 @@ class LegendStatsPopup(QDialog):
         settings_btn = QPushButton("Settings")
         settings_btn.setCursor(Qt.PointingHandCursor)
         settings_btn.setCheckable(True)
-        settings_btn.setChecked(False)
+        settings_btn.setChecked(True)
         settings_btn.clicked.connect(self._toggle_settings_panel)
         settings_btn.setStyleSheet(self._button_stylesheet(checkable=True))
         
@@ -191,8 +193,8 @@ class LegendStatsPopup(QDialog):
         self._settings_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         self._settings_panel.setMinimumWidth(170)
         self._settings_panel.setMaximumWidth(210)
-        # Default to the original Legend & Stats view (no settings panel).
-        self._settings_panel.setVisible(False)
+        # Default to showing settings when the popup opens.
+        self._settings_panel.setVisible(True)
 
         # Older runs may not have recorded settings; keep the button enabled and
         # show a friendly message in the panel instead.
@@ -208,19 +210,56 @@ class LegendStatsPopup(QDialog):
         sp_root.setSpacing(6)
 
         sp_title = QLabel("Test Settings")
+        sp_title.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         sp_title.setStyleSheet(
             f"color:{self._theme['secondary_text']}; font-weight:600; font-size:11px;"
         )
-        sp_root.addWidget(sp_title)
+
+        copy_settings_btn = QPushButton("Copy Settings")
+        copy_settings_btn.setCursor(Qt.PointingHandCursor)
+        copy_settings_btn.clicked.connect(self._copy_settings_to_clipboard)
+        copy_settings_btn.setStyleSheet(
+            self._button_stylesheet() + "QPushButton { padding: 0px 12px; font-size: 11px; }"
+        )
+        try:
+            copy_settings_btn.setFixedHeight(max(18, int(sp_title.sizeHint().height())))
+        except Exception:
+            pass
+
+        sp_header = QHBoxLayout()
+        sp_header.setContentsMargins(0, 0, 0, 0)
+        sp_header.setSpacing(6)
+        sp_header.addWidget(sp_title)
+        sp_header.addStretch(1)
+        sp_header.addWidget(copy_settings_btn)
+        sp_root.addLayout(sp_header)
+
+        self._copy_settings_btn = copy_settings_btn
 
         self._settings_label = QLabel()
         self._settings_label.setTextFormat(Qt.RichText)
         self._settings_label.setWordWrap(True)
+        self._settings_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self._settings_label.setStyleSheet(
             f"color:{self._theme['text']}; font-size:11px;"
         )
-        sp_root.addWidget(self._settings_label, 1)
 
+        sp_sc = QScrollArea()
+        sp_sc.setFrameShape(QFrame.NoFrame)
+        sp_sc.setWidgetResizable(True)
+        sp_sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sp_sc.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        sp_inner = QWidget()
+        sp_inner_l = QVBoxLayout(sp_inner)
+        sp_inner_l.setContentsMargins(0, 0, 0, 0)
+        sp_inner_l.setSpacing(0)
+        sp_inner_l.addWidget(self._settings_label, 1)
+        sp_sc.setWidget(sp_inner)
+
+        sp_root.addWidget(sp_sc, 1)
+
+        self._settings_label_scroll = sp_sc
         self._render_test_settings()
 
         body_row.addWidget(self._settings_panel, 0)
@@ -523,16 +562,42 @@ class LegendStatsPopup(QDialog):
                     pass
                 return None
 
+            def glist(key: str) -> list[str]:
+                try:
+                    value = s.get(key)
+                    if isinstance(value, list):
+                        return [str(v).strip() for v in value if str(v).strip()]
+                    if value is None:
+                        return []
+                    text = str(value).strip()
+                    return [text] if text else []
+                except Exception:
+                    return []
+
             warm = g("warmup_display") or g("warmup_total_sec")
             logt = g("log_display") or g("log_total_sec")
             stress = g("stress_mode")
             demo = g("furmark_demo")
             res = g("furmark_resolution_display") or g("furmark_resolution")
+            prime95_summary = g("prime95_torture_settings_display")
+            prime95_preset = g("prime95_inferred_preset_name")
+            if not prime95_preset:
+                try:
+                    inferred = s.get("prime95_inferred_preset")
+                    if isinstance(inferred, dict):
+                        prime95_preset = str(inferred.get("preset_name") or "").strip()
+                except Exception:
+                    prime95_preset = ""
+            sensor_devices = glist("selected_sensor_devices")
+            stress_cpu = gb("stress_cpu")
             stress_gpu = gb("stress_gpu")
             if stress_gpu is None:
                 stress_gpu = "gpu" in stress.lower()
+            if stress_cpu is False:
+                prime95_preset = ""
+                prime95_summary = ""
 
-            if not any([warm, logt, stress, demo, res]):
+            if not any([warm, logt, stress, demo, res, prime95_preset, prime95_summary, sensor_devices]):
                 self._settings_label.setText(self._empty_settings_html("No settings recorded for this run."))
                 return
 
@@ -543,10 +608,20 @@ class LegendStatsPopup(QDialog):
                 lines.append(f"<b>Log time:</b> {logt}")
             if stress:
                 lines.append(f"<b>Stresstest:</b> {stress}")
+            if prime95_preset:
+                lines.append(f"<b>Prime95 inferred preset:</b> {html.escape(prime95_preset)}")
+            if prime95_summary:
+                lines.append(f"<b>Prime95 torture settings:</b> {html.escape(prime95_summary)}")
             if stress_gpu and demo:
                 lines.append(f"<b>FurMark demo:</b> {demo}")
             if stress_gpu and res:
                 lines.append(f"<b>FurMark resolution:</b> {res}")
+            if sensor_devices:
+                device_lines = "".join(
+                    f"<div style='margin:0; margin-left:12px; text-indent:-12px;'>- {html.escape(str(dev))}</div>"
+                    for dev in sensor_devices
+                )
+                lines.append(f"<b>Selected sensor devices:</b>{device_lines}")
 
             self._settings_label.setText("<br>".join(lines))
         except Exception:
@@ -562,6 +637,112 @@ class LegendStatsPopup(QDialog):
         except Exception:
             pass
         super().closeEvent(event)
+
+    def _build_settings_clipboard_text(self) -> str:
+        """Serialize the currently displayed test settings into plain text for the clipboard."""
+        try:
+            s = self._test_settings or {}
+            if not isinstance(s, dict):
+                s = {}
+
+            def g(key: str, default: str = "") -> str:
+                try:
+                    v = s.get(key)
+                    return str(v).strip() if v is not None else default
+                except Exception:
+                    return default
+
+            def gb(key: str) -> bool | None:
+                try:
+                    if key not in s:
+                        return None
+                    value = s.get(key)
+                    if isinstance(value, bool):
+                        return value
+                    text = str(value).strip().lower()
+                    if text in {"1", "true", "yes", "on"}:
+                        return True
+                    if text in {"0", "false", "no", "off"}:
+                        return False
+                except Exception:
+                    pass
+                return None
+
+            def glist(key: str) -> list[str]:
+                try:
+                    value = s.get(key)
+                    if isinstance(value, list):
+                        return [str(v).strip() for v in value if str(v).strip()]
+                    if value is None:
+                        return []
+                    text = str(value).strip()
+                    return [text] if text else []
+                except Exception:
+                    return []
+
+            warm = g("warmup_display") or g("warmup_total_sec")
+            logt = g("log_display") or g("log_total_sec")
+            stress = g("stress_mode")
+            demo = g("furmark_demo")
+            res = g("furmark_resolution_display") or g("furmark_resolution")
+            prime95_summary = g("prime95_torture_settings_display")
+            prime95_preset = g("prime95_inferred_preset_name")
+            if not prime95_preset:
+                try:
+                    inferred = s.get("prime95_inferred_preset")
+                    if isinstance(inferred, dict):
+                        prime95_preset = str(inferred.get("preset_name") or "").strip()
+                except Exception:
+                    prime95_preset = ""
+            sensor_devices = glist("selected_sensor_devices")
+            stress_cpu = gb("stress_cpu")
+            stress_gpu = gb("stress_gpu")
+            if stress_gpu is None:
+                stress_gpu = "gpu" in stress.lower()
+            if stress_cpu is False:
+                prime95_preset = ""
+                prime95_summary = ""
+
+            if not any([warm, logt, stress, demo, res, prime95_preset, prime95_summary, sensor_devices]):
+                return "No settings recorded for this run."
+
+            lines: list[str] = []
+            if warm:
+                lines.append(f"Warm up time: {warm}")
+            if logt:
+                lines.append(f"Log time: {logt}")
+            if stress:
+                lines.append(f"Stresstest: {stress}")
+            if prime95_preset:
+                lines.append(f"Prime95 inferred preset: {prime95_preset}")
+            if prime95_summary:
+                lines.append(f"Prime95 torture settings: {prime95_summary}")
+            if stress_gpu and demo:
+                lines.append(f"FurMark demo: {demo}")
+            if stress_gpu and res:
+                lines.append(f"FurMark resolution: {res}")
+            if sensor_devices:
+                lines.append("Selected sensor devices:")
+                lines.extend(f"- {dev}" for dev in sensor_devices)
+
+            return "\n".join(lines)
+        except Exception:
+            return "No settings recorded for this run."
+
+    def _copy_settings_to_clipboard(self) -> None:
+        """Copy the currently displayed test settings to the clipboard as plain text."""
+        try:
+            text = self._build_settings_clipboard_text()
+            QApplication.clipboard().setText(text)
+
+            if hasattr(self, "sender") and self.sender():
+                btn = self.sender()
+                if isinstance(btn, QPushButton):
+                    original_text = btn.text()
+                    btn.setText("✓ Copied!")
+                    QTimer.singleShot(1500, lambda: btn.setText(original_text))
+        except Exception:
+            pass
 
     # ---------- Copy table to clipboard ----------
     def build_table_clipboard_payload(self) -> tuple[str, str] | None:

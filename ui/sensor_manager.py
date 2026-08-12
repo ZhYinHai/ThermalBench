@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QLabel, QMessageBox, QDialog
+from PySide6.QtWidgets import QLabel, QMessageBox, QDialog, QPushButton
 
 from core.hwinfo_csv import read_hwinfo_headers, sensor_leafs_from_header, make_unique
 from core.hwinfo_metadata import build_precise_group_map, load_sensor_map, save_sensor_map
@@ -64,6 +64,7 @@ class SensorManager:
         self._csv_last_path = ""
         self._csv_unique_leafs: list[str] | None = None  # current CSV columns, used for cache validation
         self._csv_leafs: list[str] | None = None          # base labels (before dedup), used for SM2 matching
+        self._csv_has_spd = False
 
         try:
             fixed_csv = resolve_hwinfo_csv()
@@ -230,11 +231,12 @@ class SensorManager:
                         csv_header_ready = bool(header)
                         if csv_header_ready and header:
                             try:
-                                leafs, _ = sensor_leafs_from_header(header)
+                                leafs, has_spd = sensor_leafs_from_header(header)
                                 self._csv_leafs = leafs
                                 self._csv_unique_leafs = make_unique(leafs)
+                                self._csv_has_spd = bool(has_spd)
                             except Exception:
-                                pass
+                                self._csv_has_spd = False
                     except Exception:
                         csv_header_ready = False
 
@@ -273,7 +275,12 @@ class SensorManager:
         self._csv_exists = csv_exists
         self._csv_updating = csv_updating
         self._csv_header_ready = csv_header_ready
+        if not csv_header_ready:
+            self._csv_has_spd = False
         self._update_run_button_state()
+
+        if csv_exists and csv_header_ready and csv_updating:
+            self._prune_missing_selected_tokens(show_warning=True)
 
     def refresh_sm2_status(self) -> None:
         """Check whether the sensor picker will show a grouped or flat list."""
@@ -368,8 +375,20 @@ class SensorManager:
         except Exception:
             return False
 
+    def _has_live_sm2_entries(self) -> bool:
+        """Return True when live HWiNFO shared-memory entries are readable."""
+        try:
+            from core.hwinfo_metadata import _read_sm2_entries  # noqa: PLC0415
+            entries = _read_sm2_entries()
+            return bool(entries)
+        except Exception:
+            return False
+
     def refresh_sensors_summary(self) -> None:
         """Update the sensors summary display."""
+        if getattr(self, "_sensors_summary", None) is None:
+            return
+
         if not self.selected_tokens:
             self._sensors_summary.setText("")
             self._sensors_summary.setPlaceholderText("No sensors selected (will use defaults).")
@@ -380,8 +399,87 @@ class SensorManager:
             "; ".join(display[:4]) + (f"; … (+{len(display)-4})" if len(display) > 4 else "")
         )
 
+    def _available_sensor_tokens(self) -> set[str]:
+        """Return the sensor tokens currently present in the live HWiNFO CSV."""
+        available = set(self._csv_unique_leafs or [])
+        if self._csv_has_spd:
+            available.add(SPD_MAX_TOKEN)
+        return available
+
+    def _prune_missing_selected_tokens(self, show_warning: bool = True) -> list[str]:
+        """Remove selected sensors that no longer exist in the live CSV and optionally warn the user."""
+        missing = self._missing_selected_tokens()
+        if not missing:
+            return list(self.selected_tokens)
+
+        kept = [tok for tok in self.selected_tokens if tok not in {t for t in self.selected_tokens if t == SPD_MAX_TOKEN or t in (self._csv_unique_leafs or [])}]
+        # Rebuild from the current selection while removing any token absent from the live CSV.
+        available = self._available_sensor_tokens()
+        kept = []
+        for tok in self.selected_tokens:
+            if tok == SPD_MAX_TOKEN:
+                if self._csv_has_spd:
+                    kept.append(tok)
+                continue
+            if tok in available:
+                kept.append(tok)
+
+        if kept != self.selected_tokens:
+            self.selected_tokens = kept
+            self.refresh_sensors_summary()
+            save_settings = getattr(self, "_save_settings", None)
+            if callable(save_settings):
+                save_settings()
+            if show_warning:
+                self._show_stale_sensor_warning(missing)
+        return list(self.selected_tokens)
+
+    def _show_stale_sensor_warning(self, missing: list[str]) -> None:
+        """Show a modal warning dialog with only an OK button when stale sensors are pruned."""
+        try:
+            msg = (
+                "Some previously selected sensors are no longer present in the current HWiNFO log and were removed from the selection."
+                f"\n\nRemoved sensors:\n- {'\n- '.join(missing)}"
+            )
+            dlg = QMessageBox(self.parent)
+            dlg.setWindowTitle("Sensor selection updated")
+            dlg.setText(msg)
+            dlg.setIcon(QMessageBox.Warning)
+            dlg.setStandardButtons(QMessageBox.Ok)
+            dlg.setDefaultButton(QMessageBox.Ok)
+            dlg.button(QMessageBox.Ok).setText("Ok")
+            dlg.exec()
+        except Exception:
+            pass
+
+    def _missing_selected_tokens(self) -> list[str]:
+        """Return selected tokens that are no longer available in the current CSV."""
+        if not self.selected_tokens:
+            return []
+
+        available = self._available_sensor_tokens()
+        missing: list[str] = []
+        for tok in self.selected_tokens:
+            if tok == SPD_MAX_TOKEN:
+                if not self._csv_has_spd:
+                    missing.append("SPD Hub (Max of DIMMs)")
+                continue
+            if tok not in available:
+                missing.append(tok)
+        return missing
+
     def _ensure_precise_map(self, csv_leafs: list[str], csv_unique_leafs: list[str]) -> dict[str, str]:
         """Ensure precise group mapping exists, creating it if needed."""
+        # Prefer live SM2 mapping when available so stale cached maps don't keep
+        # temperature sensors in "Other" after label-matching improvements.
+        if self._has_live_sm2_entries():
+            mapping = build_precise_group_map(csv_leafs, csv_unique_leafs)
+            try:
+                save_sensor_map(sensor_map_cache_path(), csv_unique_leafs, mapping)
+            except Exception:
+                pass
+            return mapping
+
         payload = self._load_cached_sensor_map(csv_unique_leafs)
         if payload and payload.get("schema") == 1 and payload.get("header_unique") == csv_unique_leafs:
             return dict(payload.get("mapping", {}))
@@ -438,7 +536,10 @@ class SensorManager:
         except Exception:
             group_map = {}
 
-        pre = set(self.selected_tokens)
+        available_tokens = set(csv_unique_leafs)
+        if has_spd:
+            available_tokens.add(SPD_MAX_TOKEN)
+        pre = {tok for tok in self.selected_tokens if tok in available_tokens}
         dlg = SensorPickerDialog(
             self.parent,
             csv_unique_leafs=csv_unique_leafs,
@@ -484,6 +585,43 @@ class SensorManager:
                 out.append(c)
         return out
 
+    def selected_sensor_device_names(self) -> list[str]:
+        """Return unique non-Other device-group names for currently selected sensors."""
+        if not self.selected_tokens:
+            return []
+
+        csv_leafs = list(self._csv_leafs or [])
+        csv_unique_leafs = list(self._csv_unique_leafs or [])
+        has_spd = bool(self._csv_has_spd)
+
+        if not csv_leafs or not csv_unique_leafs:
+            try:
+                header = read_hwinfo_headers(self._fixed_hwinfo_csv_path())
+                csv_leafs, has_spd = sensor_leafs_from_header(header)
+                csv_unique_leafs = make_unique(csv_leafs)
+            except Exception:
+                return []
+
+        try:
+            group_map = self._ensure_precise_map(csv_leafs, csv_unique_leafs)
+        except Exception:
+            group_map = {}
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for tok in self.selected_tokens:
+            if tok == SPD_MAX_TOKEN:
+                dev = "Memory / SPD" if has_spd else ""
+            else:
+                dev = str(group_map.get(tok, "") or "").strip()
+
+            if not dev or dev == "Other" or dev in seen:
+                continue
+            seen.add(dev)
+            out.append(dev)
+
+        return out
+
     def can_run(self, furmark_exe: str, prime_exe: str) -> bool:
         """
         Check if prerequisites are met to run benchmark.
@@ -496,6 +634,9 @@ class SensorManager:
             True if all requirements satisfied
         """
         if not (self._csv_exists and self._csv_header_ready and self._csv_updating):
+            return False
+        missing_tokens = self._missing_selected_tokens()
+        if missing_tokens:
             return False
         if self.stress_cpu:
             if not prime_exe or not os.path.exists(prime_exe):
@@ -535,6 +676,14 @@ class SensorManager:
                 f"{fixed_csv}"
             )
 
+        missing_tokens = self._missing_selected_tokens()
+        if missing_tokens:
+            reasons.append(
+                "The selected sensor(s) are no longer present in the current HWiNFO CSV:\n- "
+                + "\n- ".join(missing_tokens)
+                + "\n\nOpen the sensor picker and choose a currently available sensor."
+            )
+
         if self.stress_cpu:
             if not prime_exe:
                 reasons.append("Prime95 path not set in Settings.")
@@ -547,8 +696,6 @@ class SensorManager:
             elif not os.path.exists(furmark_exe):
                 reasons.append(f"FurMark not found at: {furmark_exe}")
 
-        if not reasons:
-            reasons.append("Unknown: prerequisites not met.")
         return reasons
 
     def _on_cpu_toggled(self, checked: bool) -> None:
