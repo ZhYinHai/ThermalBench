@@ -1,0 +1,28 @@
+# Normalize text files in the repository and keep working-tree line endings stable.
+* text=auto
+
+# Source/config files should use LF consistently across Windows and Unix-like systems.
+*.py text eol=lf
+*.ps1 text eol=lf
+*.spec text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.jsonc text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.iss text eol=lf
+*.svg text eol=lf
+
+# Keep common binary assets out of line-ending normalization.
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.exe binary
+*.dll binary
+*.zip binary

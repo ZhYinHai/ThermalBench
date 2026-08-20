@@ -9,7 +9,7 @@
 #endif
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.37"
+  #define MyAppVersion "0.0.40"
 #endif
 
 #ifndef InstallerPrefix
@@ -62,10 +62,14 @@ Name: "desktopicon"; Description: "Create a &desktop icon"; GroupDescription: "A
 ; Install the full PyInstaller onedir bundle.
 ; Runtime data such as hwinfo.csv and runs/ belongs in Documents\ThermalBench,
 ; not inside Program Files.
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion; Excludes: "tools\HWiNFO\hwinfo.csv,tools\Prime95\*,runs\*"
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion; Excludes: "tools\HWiNFO\hwinfo.csv,tools\Prime95\*,tools\MSI Afterburner\*,runs\*"
 ; Prime95 must be writable (local.txt/results.txt), so install bundle files
 ; directly under LOCALAPPDATA instead of Program Files.
 Source: "{#SourceDir}\tools\Prime95\*"; DestDir: "{localappdata}\ThermalBench\tools\Prime95"; Flags: recursesubdirs createallsubdirs ignoreversion
+; MSI Afterburner writes profile/config/runtime files next to its executable,
+; so keep the bundled copy under writable LOCALAPPDATA as well. Do not overwrite
+; local profiles/settings during updates; those are machine/GPU-specific.
+Source: "{#SourceDir}\tools\MSI Afterburner\*"; DestDir: "{localappdata}\ThermalBench\tools\MSI Afterburner"; Flags: recursesubdirs createallsubdirs ignoreversion; Excludes: "Profiles\*,MSIAfterburner.cfg"
 
 [InstallDelete]
 ; Upgrade cleanup: remove legacy Prime95 copies from Program Files so runtime
@@ -73,13 +77,14 @@ Source: "{#SourceDir}\tools\Prime95\*"; DestDir: "{localappdata}\ThermalBench\to
 Type: filesandordirs; Name: "{app}\tools\Prime95"
 Type: filesandordirs; Name: "{app}\tools\prime95"
 Type: files; Name: "{app}\tools\prime95.exe"
+Type: filesandordirs; Name: "{app}\tools\MSI Afterburner"
 
 [Registry]
 Root: HKCU; Subkey: "Software\ThermalBench"; ValueType: string; ValueName: "InstallDir"; ValueData: "{app}"; Flags: uninsdeletekeyifempty
 Root: HKCU; Subkey: "Software\ThermalBench"; ValueType: string; ValueName: "HwinfoExe"; ValueData: "{app}\tools\HWiNFO\HWiNFO64.exe"; Flags: uninsdeletekeyifempty
 ; FurMarkExe and PrimeExe are intentionally not written here.
 ; These tools are copied to %LOCALAPPDATA%\ThermalBench\tools\ at runtime so
-; GeeXLab / Prime95 can write their log files without UAC issues.
+; GeeXLab / Prime95 / MSI Afterburner can write their log files without UAC issues.
 ; The Python resolver (core/bundled_tools.py) handles path resolution.
 
 [Icons]

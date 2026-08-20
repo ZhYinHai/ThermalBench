@@ -89,9 +89,10 @@ class SensorManager:
         self._sm2_timer.timeout.connect(self.refresh_sm2_status)
         self._sm2_timer.start()
 
-        # Initial status check
-        self.refresh_csv_status()
-        self.refresh_sm2_status()
+        # Initial checks can touch HWiNFO CSV/shared-memory state; defer them so
+        # the main window can paint first. The periodic timers keep behavior the same.
+        QTimer.singleShot(0, self.refresh_csv_status)
+        QTimer.singleShot(250, self.refresh_sm2_status)
 
         # Connect stress toggles if provided
         if self._cpu_btn is not None:

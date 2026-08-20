@@ -26,8 +26,9 @@ ThermalBench.zip
 # Build logs
 build_installer_*.log
 
-# Vendor tool binaries (FurMark, Prime95, HWiNFO) — place these manually
+# Vendor tool binaries (FurMark, Prime95, HWiNFO, MSI Afterburner) — place these manually
 # Executables are already caught by *.exe above; this covers DLLs, configs, logs, etc.
 vendor/tools/FurMark/
 vendor/tools/Prime95/
 vendor/tools/HWiNFO/
+vendor/tools/MSI Afterburner/

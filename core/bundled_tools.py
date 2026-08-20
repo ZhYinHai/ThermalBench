@@ -4,6 +4,7 @@ import ctypes
 import subprocess
 import sys
 from pathlib import Path
+import re
 
 import shutil
 
@@ -13,6 +14,7 @@ from core.user_paths import (
     thermalbench_hwinfo_runtime_dir,
     thermalbench_furmark_runtime_dir,
     thermalbench_prime95_runtime_dir,
+    thermalbench_afterburner_runtime_dir,
 )
 
 from core.resources import app_root
@@ -261,6 +263,10 @@ def _bundled_prime95_dir() -> Path:
     return tools_root() / "Prime95"
 
 
+def _bundled_afterburner_dir() -> Path:
+    return tools_root() / "MSI Afterburner"
+
+
 def _ignore_furmark_runtime_files(_dir: str, names: list[str]) -> set[str]:
     """Don't overwrite FurMark's runtime-generated files on re-copy."""
     ignored: set[str] = set()
@@ -277,6 +283,15 @@ def _ignore_prime95_runtime_files(_dir: str, names: list[str]) -> set[str]:
     for name in names:
         lower = name.lower()
         if lower in ("results.txt", "local.txt", "prime.txt"):
+            ignored.add(name)
+    return ignored
+
+
+def _ignore_afterburner_runtime_files(_dir: str, names: list[str]) -> set[str]:
+    """Don't overwrite MSI Afterburner user-created profile files on re-copy."""
+    ignored: set[str] = set()
+    for name in names:
+        if name.lower() == "profiles":
             ignored.add(name)
     return ignored
 
@@ -323,6 +338,25 @@ def ensure_prime95_runtime_dir() -> Path:
             dirs_exist_ok=True,
             ignore=_ignore_prime95_runtime_files,
         )
+    except Exception:
+        pass
+
+    return dst
+
+
+def ensure_afterburner_runtime_dir() -> Path:
+    """
+    Copy bundled MSI Afterburner to a writable runtime folder.
+    """
+    src = _bundled_afterburner_dir()
+    dst = thermalbench_afterburner_runtime_dir()
+
+    if not src.exists():
+        return dst
+
+    try:
+        ignore = _ignore_afterburner_runtime_files if dst.exists() else None
+        shutil.copytree(src, dst, dirs_exist_ok=True, ignore=ignore)
     except Exception:
         pass
 
@@ -400,6 +434,190 @@ def resolve_prime95_exe(configured: str = "") -> str:
             break
 
     return _first_existing(_prime95_runtime_candidates(runtime))
+
+
+def resolve_afterburner_exe(configured: str = "") -> str:
+    runtime = ensure_afterburner_runtime_dir()
+    bundled = _bundled_afterburner_dir()
+
+    return _first_existing(
+        [
+            runtime / "MSIAfterburner.exe",
+            configured,
+            _read_hkcu_string("AfterburnerExe"),
+            bundled / "MSIAfterburner.exe",
+        ]
+    )
+
+
+def available_afterburner_profiles(configured: str = "") -> list[int]:
+    return sorted(afterburner_profile_details(configured).keys())
+
+
+def afterburner_profile_details(configured: str = "") -> dict[int, dict[str, str]]:
+    exe = resolve_afterburner_exe(configured)
+    if not exe:
+        return {}
+
+    return afterburner_profile_details_from_dir(Path(exe).parent / "Profiles")
+
+
+def afterburner_profile_details_from_dir(profiles_dir: str | Path) -> dict[int, dict[str, str]]:
+    profiles_path = Path(profiles_dir)
+    if not profiles_path.exists():
+        return {}
+
+    details: dict[int, dict[str, str]] = {}
+    profile_header = re.compile(r"^\s*\[Profile([1-5])\]\s*$", re.IGNORECASE)
+    meaningful_keys = {
+        "PowerLimit",
+        "ThermalLimit",
+        "ThermalPrioritize",
+        "CoreClkBoost",
+        "CoreClk",
+        "MemClkBoost",
+        "MemClk",
+        "FanMode",
+        "FanSpeed",
+    }
+
+    paths = list(profiles_path.glob("*.cfg"))
+    device_paths = sorted((p for p in paths if p.name.upper().startswith("VEN_")), key=lambda p: p.name.lower())
+    if device_paths:
+        selected_device = _afterburner_current_device_profile(profiles_path, device_paths)
+        paths = [selected_device] if selected_device is not None else device_paths
+    else:
+        paths = sorted(paths, key=lambda p: p.name.lower())
+
+    for path in paths:
+        try:
+            current: int | None = None
+            current_values: dict[str, str] = {}
+
+            def flush_profile() -> None:
+                if current is None or not current_values:
+                    return
+                slot = details.setdefault(current, {})
+                for key, value in current_values.items():
+                    if value.strip() and not slot.get(key):
+                        slot[key] = value.strip()
+
+            with path.open("r", encoding="utf-8", errors="ignore") as fh:
+                lines = fh
+                for line in lines:
+                    header = profile_header.match(line)
+                    if header:
+                        flush_profile()
+                        current = int(header.group(1))
+                        current_values = {}
+                        continue
+                    if current is None or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key in meaningful_keys and value:
+                        current_values[key] = value
+            flush_profile()
+        except Exception:
+            continue
+
+    return {slot: vals for slot, vals in sorted(details.items()) if vals}
+
+
+def _afterburner_current_device_profile(profiles_path: Path, device_paths: list[Path]) -> Path | None:
+    try:
+        cfg_path = profiles_path / "MSIAfterburner.cfg"
+        if not cfg_path.exists():
+            return device_paths[0] if len(device_paths) == 1 else None
+
+        current_gpu: int | None = None
+        with cfg_path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key.strip().lower() == "currentgpu":
+                    try:
+                        current_gpu = int(value.strip())
+                    except Exception:
+                        current_gpu = None
+                    break
+
+        if current_gpu is not None and 0 <= current_gpu < len(device_paths):
+            return device_paths[current_gpu]
+        return device_paths[0] if len(device_paths) == 1 else None
+    except Exception:
+        return device_paths[0] if len(device_paths) == 1 else None
+
+
+def format_afterburner_profile_details(profile: int, details: dict[str, str] | None) -> str:
+    if profile <= 0:
+        return "Afterburner disabled for this run."
+    if not details:
+        return f"Profile {profile}: no settings found."
+
+    def value_or_default(key: str, default: str = "default") -> str:
+        text = str((details or {}).get(key) or "").strip()
+        return text if text else default
+
+    def clock_mhz(key: str) -> str:
+        text = str((details or {}).get(key) or "").strip()
+        if not text:
+            return "0"
+        try:
+            value = int(text)
+            if value % 1000 == 0:
+                mhz: int | float = int(value / 1000)
+            else:
+                mhz = value / 1000
+            if mhz > 0:
+                return f"+{mhz:g}"
+            return f"{mhz:g}"
+        except Exception:
+            return text
+
+    def absolute_clock_mhz(key: str) -> str:
+        text = str((details or {}).get(key) or "").strip()
+        if not text:
+            return "default"
+        try:
+            value = int(text)
+            mhz: int | float = int(value / 1000) if value % 1000 == 0 else value / 1000
+            return f"{mhz:g}"
+        except Exception:
+            return text
+
+    core_label = "Core"
+    core_value = clock_mhz("CoreClkBoost")
+    if not str((details or {}).get("CoreClkBoost") or "").strip() and str((details or {}).get("CoreClk") or "").strip():
+        core_label = "Core clock"
+        core_value = absolute_clock_mhz("CoreClk")
+
+    memory_label = "Memory"
+    memory_value = clock_mhz("MemClkBoost")
+    if not str((details or {}).get("MemClkBoost") or "").strip() and str((details or {}).get("MemClk") or "").strip():
+        memory_label = "Memory clock"
+        memory_value = absolute_clock_mhz("MemClk")
+
+    fan_mode = value_or_default("FanMode")
+    fan_speed = value_or_default("FanSpeed")
+    if fan_mode == "0" and fan_speed != "default":
+        fan = f"manual {fan_speed}%"
+    elif fan_mode == "1":
+        fan = "auto"
+    else:
+        fan = f"mode {fan_mode}, speed {fan_speed}"
+
+    return " • ".join(
+        [
+            f"Power Limit: {value_or_default('PowerLimit')}%",
+            f"Temp Limit: {value_or_default('ThermalLimit')}",
+            f"{core_label}: {core_value} MHz",
+            f"{memory_label}: {memory_value} MHz",
+            f"Fan speed: {fan}",
+        ]
+    )
 
 
 def hwinfo_dir() -> Path:

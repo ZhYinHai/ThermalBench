@@ -20,6 +20,8 @@ param(
   # tools
   [string]$FurMarkExe = "",
   [string]$PrimeExe   = "",
+  [string]$AfterburnerExe = "",
+  [int]$AfterburnerProfile = 0,
 
 
   # FurMark settings
@@ -70,11 +72,78 @@ function Resolve-BundledToolPath {
     } catch {}
   }
 
+  try {
+    if ($env:LOCALAPPDATA) {
+      $localToolsRoot = Join-Path $env:LOCALAPPDATA "ThermalBench"
+      foreach ($rel in $RelativeCandidates) {
+        $candidate = Join-Path $localToolsRoot $rel
+        if (Test-Path -LiteralPath $candidate) {
+          return (Resolve-Path -LiteralPath $candidate).Path
+        }
+      }
+    }
+  } catch {}
+
   return $Current
 }
 
 function Stop-StressToolsByName {
-  Stop-Process -Name "furmark","prime95" -Force -ErrorAction SilentlyContinue
+  Stop-Process -Name "furmark","prime95","MSIAfterburner" -Force -ErrorAction SilentlyContinue
+}
+
+function Start-AfterburnerProfile {
+  param(
+    [string]$Exe,
+    [int]$Profile
+  )
+
+  $state = [ordered]@{
+    Started = $false
+    WasRunning = $false
+    PidsBefore = @()
+  }
+
+  if ($Profile -lt 1 -or $Profile -gt 5) { return $state }
+  if ([string]::IsNullOrWhiteSpace($Exe)) { throw "Afterburner profile selected, but AfterburnerExe is empty." }
+  Assert-File $Exe "AfterburnerExe"
+
+  $before = @(Get-Process -Name "MSIAfterburner" -ErrorAction SilentlyContinue)
+  $state.WasRunning = ($before.Count -gt 0)
+  $state.PidsBefore = @($before | ForEach-Object { [int]$_.Id })
+
+  $abDir = Split-Path -Parent $Exe
+  $args = @("-profile$Profile")
+  Write-Host "Start MSI Afterburner: $Exe $($args -join ' ')"
+  Start-Process -FilePath $Exe -ArgumentList $args -WorkingDirectory $abDir -WindowStyle Minimized | Out-Null
+  Start-Sleep -Seconds 2
+  $state.Started = $true
+  return $state
+}
+
+function Stop-Afterburner($AfterburnerState) {
+  if (-not $AfterburnerState) { return }
+  if (-not [bool]$AfterburnerState.Started) { return }
+
+  if ([bool]$AfterburnerState.WasRunning) {
+    Write-Host "MSI Afterburner was already running before this benchmark; leaving it open."
+    return
+  }
+
+  $procs = @(Get-Process -Name "MSIAfterburner" -ErrorAction SilentlyContinue)
+  if ($procs.Count -eq 0) { return }
+
+  Write-Host "Stop MSI Afterburner..."
+  foreach ($p in $procs) {
+    try { Stop-Process -Id ([int]$p.Id) -ErrorAction SilentlyContinue } catch {}
+  }
+  Start-Sleep -Milliseconds 1000
+  foreach ($p in @(Get-Process -Name "MSIAfterburner" -ErrorAction SilentlyContinue)) {
+    try { Stop-Process -Id ([int]$p.Id) -Force -ErrorAction SilentlyContinue } catch {}
+  }
+
+  if (Get-Process -Name "MSIAfterburner" -ErrorAction SilentlyContinue) {
+    Write-Host "MSI Afterburner is still running after cleanup attempt." -ForegroundColor Yellow
+  }
 }
 
 function Write-FurMarkLogTail {
@@ -842,6 +911,14 @@ $PrimeExe = Resolve-BundledToolPath `
   ) `
   -Label "Prime95"
 
+$AfterburnerExe = Resolve-BundledToolPath `
+  -Current $AfterburnerExe `
+  -AppRoot $repoRoot `
+  -RelativeCandidates @(
+    "tools\MSI Afterburner\MSIAfterburner.exe"
+  ) `
+  -Label "MSI Afterburner"
+
 # Resolve Python runtime early (needed for ambient logger as well as plotting).
 $py = Resolve-PythonRuntime
 $PythonExe = $py.Exe
@@ -852,6 +929,7 @@ $ambientCsv = $null
 
 $furPid = 0
 $prPid  = 0
+$afterburnerState = $null
 $windowStart = $null
 $windowEnd   = $null
 $aborted = $false
@@ -906,6 +984,12 @@ try {
     }
   } else {
     Write-Host "Ambient logging disabled." 
+  }
+
+  if ($AfterburnerProfile -gt 0) {
+    $afterburnerState = Start-AfterburnerProfile -Exe $AfterburnerExe -Profile $AfterburnerProfile
+  } else {
+    Write-Host "MSI Afterburner disabled."
   }
 
   $stress = Start-StressTools
@@ -972,6 +1056,8 @@ try {
   if ($furPid -ne 0 -or $prPid -ne 0) {
     Stop-StressTools -FurPid $furPid -PrimePid $prPid
   }
+
+  Stop-Afterburner -AfterburnerState $afterburnerState
 
   # Stop ambient logger
   if ($ambientPid -and (Get-Process -Id $ambientPid -ErrorAction SilentlyContinue)) {

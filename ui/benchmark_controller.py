@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 from core.ps_helpers import RUNMAP_RE, ps_quote, build_ps_array_literal
 
 from core.user_paths import sensor_map_cache_path, thermalbench_runs_root
-from core.bundled_tools import resolve_hwinfo_csv, resolve_furmark_exe, resolve_prime95_exe
+from core.bundled_tools import resolve_hwinfo_csv, resolve_furmark_exe, resolve_prime95_exe, resolve_afterburner_exe
 from core.prime95_compat_v305 import load_prime95_torture_snapshot
 from core.resources import resource_path
 from core.hwinfo_metadata import load_sensor_map
@@ -2965,12 +2965,35 @@ class BenchmarkController:
             QMessageBox.critical(self.parent, "Missing", f"run_case.ps1 not found: {script}")
             return
 
-        self._save_settings()
-
         self.last_run_dir = None
         if self._open_btn is not None:
             self._open_btn.setEnabled(False)
         self._log.clear()
+        self._append_log("Preparing run...")
+        self._append_log("")
+        self._run_btn.setEnabled(False)
+        self._abort_btn.setEnabled(False)
+
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+        QTimer.singleShot(0, lambda: self._run_after_initial_feedback(script))
+
+    def _restore_run_start_controls(self) -> None:
+        try:
+            updater = getattr(self.parent, "_update_run_button_state", None)
+            if callable(updater):
+                updater()
+            else:
+                self._run_btn.setEnabled(True)
+        except Exception:
+            self._run_btn.setEnabled(True)
+        self._abort_btn.setEnabled(False)
+
+    def _run_after_initial_feedback(self, script: Path) -> None:
+        self._save_settings()
 
         settings = self._get_settings()
         case = settings.get("case_name", "TEST").strip()
@@ -2984,10 +3007,13 @@ class BenchmarkController:
         fur_res_display = settings.get("fur_res_display", "").strip()
         furmark_exe = resolve_furmark_exe(settings.get("furmark_exe", ""))
         prime_exe = resolve_prime95_exe(settings.get("prime_exe", ""))
+        afterburner_profile = int(settings.get("afterburner_profile", 0) or 0)
+        afterburner_exe = resolve_afterburner_exe(settings.get("afterburner_exe", "")) if afterburner_profile > 0 else ""
         prime95_snapshot = load_prime95_torture_snapshot(prime_exe)
 
         if warm <= 0 or logsec <= 0:
             QMessageBox.warning(self.parent, "Invalid time", "Warmup and Log must be > 0 seconds.")
+            self._restore_run_start_controls()
             return
 
         if not self._sensor_manager.can_run(furmark_exe, prime_exe):
@@ -2996,6 +3022,7 @@ class BenchmarkController:
                 "Cannot start test",
                 "\n".join(self._sensor_manager.missing_reasons(furmark_exe, prime_exe)),
             )
+            self._restore_run_start_controls()
             return
 
         # Reject characters that would create sub-folders or break the run tree.
@@ -3009,6 +3036,7 @@ class BenchmarkController:
                 f"{' '.join(repr(c) for c in bad_chars)}\n\n"
                 f"Please remove them and try again.",
             )
+            self._restore_run_start_controls()
             return
 
         columns = self._sensor_manager.build_selected_columns()
@@ -3033,6 +3061,9 @@ class BenchmarkController:
             cmd_parts.append(f"-FurMarkExe {ps_quote(furmark_exe)}")
         if prime_exe:
             cmd_parts.append(f"-PrimeExe {ps_quote(prime_exe)}")
+        if afterburner_exe and afterburner_profile > 0:
+            cmd_parts.append(f"-AfterburnerExe {ps_quote(afterburner_exe)}")
+            cmd_parts.append(f"-AfterburnerProfile {afterburner_profile}")
 
         if columns:
             cmd_parts.append(f"-TempPatterns {build_ps_array_literal(columns)}")
@@ -3048,6 +3079,7 @@ class BenchmarkController:
 
         if self.proc is None:
             QMessageBox.critical(self.parent, "Error", "Cannot start process (QProcess unavailable).")
+            self._restore_run_start_controls()
             return
 
         self.proc.setProgram("powershell")
@@ -3111,6 +3143,8 @@ class BenchmarkController:
                 "furmark_demo": str(demo_disp),
                 "furmark_resolution": f"{int(fur_w)}x{int(fur_h)}",
                 "furmark_resolution_display": str(res_disp),
+                "afterburner_profile": int(afterburner_profile),
+                "afterburner_profile_display": f"Profile {afterburner_profile}" if afterburner_profile > 0 else "Run without Afterburner",
                 "prime95_torture_settings": prime95_settings,
                 "prime95_torture_settings_display": prime95_summary,
                 "prime95_inferred_preset": prime95_preset,

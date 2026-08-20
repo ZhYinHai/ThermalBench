@@ -11,7 +11,7 @@ _MONTHS_EN = (
 )
 from typing import Optional
 
-from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt
+from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt, QTimer
 
 _RUN_FOLDER_RE = re.compile(
     r"^(?:"
@@ -61,7 +61,7 @@ class MonthGroupedRunsModel(QAbstractItemModel):
         self._available_months: list[str] = []
         self._current_month: str = datetime.now().strftime("%Y-%m")
         self._folder_name_filter: str = ""
-        self.refresh()
+        QTimer.singleShot(0, self.refresh)
 
     # -------------------------
     # public API

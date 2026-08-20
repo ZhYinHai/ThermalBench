@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QSize, QTimer, QObject, QThread, Signal, QEvent, QItemSelectionModel, QRectF
+from PySide6.QtCore import Qt, QSize, QTimer, QObject, QThread, Signal, QEvent, QItemSelectionModel, QRectF, QProcess
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtGui import QIcon, QPainter, QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
@@ -100,6 +100,11 @@ from core.bundled_tools import (
     resolve_furmark_exe,
     resolve_prime95_exe,
     resolve_hwinfo_exe,
+    resolve_afterburner_exe,
+    available_afterburner_profiles,
+    afterburner_profile_details,
+    afterburner_profile_details_from_dir,
+    format_afterburner_profile_details,
     resolve_hwinfo_csv,
     launch_hwinfo,
     hwinfo_dir,
@@ -956,6 +961,8 @@ class MainWindow(QWidget):
         self.settings_path = get_settings_path("ThermalBench")
         self.furmark_exe = resolve_furmark_exe("")
         self.prime_exe = resolve_prime95_exe("")
+        self.afterburner_exe = resolve_afterburner_exe("")
+        self.afterburner_profile = 0
         self.hwinfo_exe = resolve_hwinfo_exe("")
         self.hwinfo_csv = resolve_hwinfo_csv()
         self.theme_mode = "device"
@@ -989,7 +996,7 @@ class MainWindow(QWidget):
             except Exception:
                 pass
         self._apply_case_name_completer_theme()
-        self._refresh_case_name_suggestions()
+        QTimer.singleShot(250, self._refresh_case_name_suggestions)
 
         self.warmup_min = make_time_spin(2, 24 * 60, 20)
         self.warmup_sec = make_time_spin(2, 59, 0)
@@ -1072,6 +1079,21 @@ class MainWindow(QWidget):
         for k in self.res_order:
             self.fur_res_combo.addItem(k)
         self.fur_res_combo.setCurrentText("3840 x 1600")
+
+        self.afterburner_profile_combo = CustomComboBox(mode=self.theme_mode)
+        self.afterburner_profile_combo.view().setMouseTracking(True)
+        self.afterburner_profile_combo.view().viewport().setMouseTracking(True)
+        self.afterburner_profile_combo.view().viewport().installEventFilter(self)
+        self.afterburner_profile_details = QLineEdit()
+        self.afterburner_profile_details.setReadOnly(True)
+        self.afterburner_profile_details.setPlaceholderText("No MSI Afterburner profiles found.")
+        self.afterburner_profile_details.setToolTip("Hover an Afterburner profile to preview its settings.")
+        self.open_afterburner_btn = QPushButton("Open Afterburner")
+        self.open_afterburner_btn.setCursor(Qt.PointingHandCursor)
+        self.open_afterburner_btn.setToolTip("Open the MSI Afterburner instance ThermalBench uses.")
+        self._afterburner_profile_label = None
+        self._afterburner_profiles = []
+        self._afterburner_profile_details_map = {}
 
         self._prime95_torture_snapshot = {}
         self.prime95_settings_btn = QPushButton("Prime95 torture settings")
@@ -1466,8 +1488,27 @@ class MainWindow(QWidget):
         res_col.addWidget(self._fur_res_label)
         res_col.addWidget(self.fur_res_combo)
 
+        ab_col = QVBoxLayout()
+        ab_col.setSpacing(6)
+        self._afterburner_profile_label = self._bold_label("MSI Afterburner Profile")
+        ab_col.addWidget(self._afterburner_profile_label)
+        ab_col.addWidget(self.afterburner_profile_combo)
+
+        ab_details_col = QVBoxLayout()
+        ab_details_col.setSpacing(6)
+        self._afterburner_details_label = self._bold_label("Afterburner Settings")
+        ab_details_header = QHBoxLayout()
+        ab_details_header.setContentsMargins(0, 0, 0, 0)
+        ab_details_header.addWidget(self._afterburner_details_label)
+        ab_details_header.addStretch(1)
+        ab_details_header.addWidget(self.open_afterburner_btn)
+        ab_details_col.addLayout(ab_details_header)
+        ab_details_col.addWidget(self.afterburner_profile_details)
+
         fur_row.addLayout(demo_col)
         fur_row.addLayout(res_col)
+        fur_row.addLayout(ab_col)
+        fur_row.addLayout(ab_details_col, 1)
         root.addLayout(fur_row)
 
         root.addWidget(self._bold_label("Sensors to monitor"))
@@ -1952,6 +1993,21 @@ class MainWindow(QWidget):
         self._refresh_prime95_torture_display()
         self.sensors.refresh_sensors_summary()
         self._update_run_button_state()
+        self._afterburner_profile_signature = ()
+        self._afterburner_profile_poll_timer = QTimer(self)
+        self._afterburner_profile_poll_timer.setInterval(1000)
+        self._afterburner_profile_poll_timer.timeout.connect(self._poll_afterburner_profiles_idle)
+        self._afterburner_profile_poll_timer.start()
+        self._afterburner_profile_refresh_timer = QTimer(self)
+        self._afterburner_profile_refresh_timer.setSingleShot(True)
+        self._afterburner_profile_refresh_timer.setInterval(750)
+        self._afterburner_profile_refresh_timer.timeout.connect(self._refresh_afterburner_profiles_after_debounce)
+        QTimer.singleShot(350, lambda: self._refresh_afterburner_profile_combo(getattr(self, "afterburner_profile", 0)))
+        self._prime95_torture_signature = self._prime95_torture_files_signature()
+        self._prime95_torture_poll_timer = QTimer(self)
+        self._prime95_torture_poll_timer.setInterval(1000)
+        self._prime95_torture_poll_timer.timeout.connect(self._poll_prime95_torture_idle)
+        self._prime95_torture_poll_timer.start()
 
         # Connect settings change handlers
         self.case_edit.textChanged.connect(self.save_settings)
@@ -1963,6 +2019,8 @@ class MainWindow(QWidget):
         self.log_sec.valueChanged.connect(lambda *_: self.save_settings())
         self.fur_demo_combo.currentIndexChanged.connect(lambda *_: self.save_settings())
         self.fur_res_combo.currentIndexChanged.connect(lambda *_: self.save_settings())
+        self.afterburner_profile_combo.currentIndexChanged.connect(lambda *_: (self._show_afterburner_profile_details(self._selected_afterburner_profile()), self.save_settings()))
+        self.open_afterburner_btn.clicked.connect(self._open_afterburner)
         self.hwinfo_edit.textChanged.connect(lambda *_: self._update_run_button_state())
 
         # Update threads (kept as attributes to avoid GC)
@@ -3221,17 +3279,216 @@ class MainWindow(QWidget):
         try:
             cpu_enabled = bool(self.cpu_btn.isChecked())
             gpu_enabled = bool(self.gpu_btn.isChecked())
+            afterburner_has_profiles = bool(getattr(self, "_afterburner_profiles", []) or [])
+            afterburner_enabled = bool(gpu_enabled and afterburner_has_profiles)
 
             self.prime95_settings_btn.setEnabled(cpu_enabled)
             self._set_widget_dimmed(self.prime95_settings_btn, not cpu_enabled)
 
             self.fur_demo_combo.setEnabled(gpu_enabled)
             self.fur_res_combo.setEnabled(gpu_enabled)
+            self.afterburner_profile_combo.setEnabled(afterburner_enabled)
 
             self._set_widget_dimmed(self._fur_demo_label, not gpu_enabled)
             self._set_widget_dimmed(self.fur_demo_combo, not gpu_enabled)
             self._set_widget_dimmed(self._fur_res_label, not gpu_enabled)
             self._set_widget_dimmed(self.fur_res_combo, not gpu_enabled)
+            self._set_widget_dimmed(self._afterburner_profile_label, not afterburner_enabled)
+            self._set_widget_dimmed(self.afterburner_profile_combo, not afterburner_enabled)
+            self._set_widget_dimmed(self._afterburner_details_label, not afterburner_enabled)
+            self._set_widget_dimmed(self.afterburner_profile_details, not afterburner_enabled)
+        except Exception:
+            pass
+
+    def _refresh_afterburner_profile_combo(self, selected: int | None = None, profiles_dir: Path | None = None) -> None:
+        try:
+            previous = selected
+            if previous is None:
+                try:
+                    previous = int(self.afterburner_profile_combo.currentData() or self.afterburner_profile or 0)
+                except Exception:
+                    previous = 0
+
+            if profiles_dir is not None:
+                self._afterburner_profile_details_map = afterburner_profile_details_from_dir(profiles_dir)
+            else:
+                self.afterburner_exe = resolve_afterburner_exe(getattr(self, "afterburner_exe", ""))
+                self._afterburner_profile_details_map = afterburner_profile_details(self.afterburner_exe)
+            profiles = sorted(self._afterburner_profile_details_map.keys())
+            self._afterburner_profiles = list(profiles)
+
+            self.afterburner_profile_combo.blockSignals(True)
+            self.afterburner_profile_combo.clear()
+            self.afterburner_profile_combo.addItem("Run without Afterburner", 0)
+            for profile in profiles:
+                self.afterburner_profile_combo.addItem(f"Profile {profile}", int(profile))
+
+            chosen = int(previous or 0)
+            if chosen not in profiles:
+                chosen = 0
+            for i in range(self.afterburner_profile_combo.count()):
+                if int(self.afterburner_profile_combo.itemData(i) or 0) == chosen:
+                    self.afterburner_profile_combo.setCurrentIndex(i)
+                    break
+            self.afterburner_profile = chosen
+
+            if profiles:
+                self.afterburner_profile_combo.setToolTip("Apply an MSI Afterburner profile when the benchmark starts.")
+                self.afterburner_profile_details.setToolTip("Hover an Afterburner profile to preview its settings.")
+            else:
+                self.afterburner_profile_combo.setToolTip("No MSI Afterburner profiles were found.")
+                self.afterburner_profile_details.setToolTip("No MSI Afterburner profiles were found.")
+            self._show_afterburner_profile_details(chosen)
+        except Exception:
+            self._afterburner_profiles = []
+            self._afterburner_profile_details_map = {}
+            self._show_afterburner_profile_details(0)
+        finally:
+            try:
+                self.afterburner_profile_combo.blockSignals(False)
+            except Exception:
+                pass
+            self._sync_furmark_gpu_controls()
+
+    def _is_benchmark_running(self) -> bool:
+        try:
+            proc = getattr(getattr(self, "benchmark", None), "proc", None)
+            return bool(proc is not None and proc.state() != QProcess.NotRunning)
+        except Exception:
+            return False
+
+    def _afterburner_profiles_signature(self) -> tuple[tuple[str, int, int], ...]:
+        return self._afterburner_profiles_signature_and_dir()[0]
+
+    def _afterburner_profiles_signature_and_dir(self) -> tuple[tuple[tuple[str, int, int], ...], Path | None]:
+        try:
+            exe_text = str(getattr(self, "afterburner_exe", "") or "").strip()
+            profiles_dir = None
+            if exe_text:
+                try:
+                    exe_path = Path(exe_text)
+                    if exe_path.is_file():
+                        profiles_dir = exe_path.parent / "Profiles"
+                except Exception:
+                    profiles_dir = None
+            if profiles_dir is None:
+                local = os.environ.get("LOCALAPPDATA") or ""
+                if not local:
+                    return (), None
+                profiles_dir = Path(local) / "ThermalBench" / "tools" / "MSI Afterburner" / "Profiles"
+            if not profiles_dir.exists():
+                return (), profiles_dir
+            rows: list[tuple[str, int, int]] = []
+            for path in profiles_dir.glob("*.cfg"):
+                try:
+                    stat = path.stat()
+                    rows.append((path.name, int(stat.st_size), int(stat.st_mtime_ns)))
+                except Exception:
+                    continue
+            return tuple(sorted(rows)), profiles_dir
+        except Exception:
+            return (), None
+
+    def _poll_afterburner_profiles_idle(self) -> None:
+        if self._is_benchmark_running():
+            return
+        try:
+            signature, profiles_dir = self._afterburner_profiles_signature_and_dir()
+            if signature == getattr(self, "_afterburner_profile_signature", None):
+                return
+            self._afterburner_profile_signature = signature
+            self._afterburner_profile_pending_profiles_dir = profiles_dir
+            self._afterburner_profile_refresh_timer.start()
+        except Exception:
+            pass
+
+    def _refresh_afterburner_profiles_after_debounce(self) -> None:
+        if self._is_benchmark_running():
+            return
+        try:
+            profiles_dir = getattr(self, "_afterburner_profile_pending_profiles_dir", None)
+            self._refresh_afterburner_profile_combo(self._selected_afterburner_profile(), profiles_dir=profiles_dir)
+        except Exception:
+            pass
+
+    def _selected_afterburner_profile(self) -> int:
+        try:
+            return int(self.afterburner_profile_combo.currentData() or 0)
+        except Exception:
+            return 0
+
+    def _open_afterburner(self) -> None:
+        try:
+            exe = resolve_afterburner_exe(getattr(self, "afterburner_exe", ""))
+            if not exe or not Path(exe).is_file():
+                QMessageBox.warning(self, "MSI Afterburner", "Could not find the MSI Afterburner executable ThermalBench uses.")
+                return
+
+            self.afterburner_exe = exe
+            workdir = str(Path(exe).parent)
+            if not QProcess.startDetached(exe, [], workdir):
+                QMessageBox.warning(self, "MSI Afterburner", "Could not open MSI Afterburner.")
+                return
+
+            try:
+                self._afterburner_profile_signature = self._afterburner_profiles_signature()
+            except Exception:
+                pass
+        except Exception as e:
+            QMessageBox.warning(self, "MSI Afterburner", f"Could not open MSI Afterburner.\n\n{e}")
+
+    def _show_afterburner_profile_details(self, profile: int) -> None:
+        try:
+            details_map = getattr(self, "_afterburner_profile_details_map", {}) or {}
+            if not getattr(self, "_afterburner_profiles", []) and profile <= 0:
+                text = "No MSI Afterburner profiles found."
+            else:
+                text = format_afterburner_profile_details(int(profile or 0), details_map.get(int(profile or 0)))
+            self.afterburner_profile_details.setText(text)
+            self.afterburner_profile_details.setToolTip(text)
+        except Exception:
+            pass
+
+    def _prime95_torture_files_signature(self) -> tuple[tuple[str, int, int], ...]:
+        try:
+            roots: list[Path] = []
+            text = str(getattr(self, "prime_exe", "") or "").strip()
+            if text:
+                p = Path(text)
+                roots.append(p.parent if p.suffix.lower() == ".exe" else p)
+            latest = self._latest_prime95_txt_path()
+            if latest is not None:
+                roots.append(latest.parent)
+
+            dedup: dict[str, Path] = {}
+            for root in roots:
+                try:
+                    dedup[str(root.resolve())] = root
+                except Exception:
+                    dedup[str(root)] = root
+
+            rows: list[tuple[str, int, int]] = []
+            for root in dedup.values():
+                for name in ("prime.txt", "prime95_torture_settings.json"):
+                    path = root / name
+                    try:
+                        stat = path.stat()
+                        rows.append((str(path), int(stat.st_size), int(stat.st_mtime_ns)))
+                    except Exception:
+                        continue
+            return tuple(sorted(rows))
+        except Exception:
+            return ()
+
+    def _poll_prime95_torture_idle(self) -> None:
+        if self._is_benchmark_running():
+            return
+        try:
+            signature = self._prime95_torture_files_signature()
+            if signature == getattr(self, "_prime95_torture_signature", None):
+                return
+            self._prime95_torture_signature = signature
+            self._refresh_prime95_torture_display()
         except Exception:
             pass
 
@@ -3245,23 +3502,25 @@ class MainWindow(QWidget):
             preset_name = str((inferred or {}).get("preset_name") or "unknown")
             confidence = str((inferred or {}).get("confidence") or "low")
             rationale = str((inferred or {}).get("rationale") or "")
+            button_preset = preset_name if preset_name and preset_name not in {"unknown", "ambiguous"} else "unknown"
+            button_text = f"Prime95 torture settings: {button_preset}" if has_settings else "Prime95 torture settings (no data)"
 
             if has_settings:
-                self.prime95_settings_btn.setText("Prime95 torture settings")
+                self.prime95_settings_btn.setText(button_text)
                 self.prime95_settings_btn.setToolTip("Click to view the captured Prime95 torture settings.")
             else:
-                self.prime95_settings_btn.setText("Prime95 torture settings (no data)")
+                self.prime95_settings_btn.setText(button_text)
                 self.prime95_settings_btn.setToolTip(settings_summary)
 
             preset_display = preset_name if preset_name else "unknown"
             if confidence and confidence not in {"", "low"}:
                 preset_display = f"{preset_display} ({confidence})"
-            self.prime95_preset_edit.setText(preset_display)
 
             tooltip = preset_display
             if rationale:
                 tooltip = f"{preset_display}\n{rationale}"
-            self.prime95_preset_edit.setToolTip(tooltip)
+            if has_settings:
+                self.prime95_settings_btn.setToolTip(tooltip)
         except Exception:
             pass
 
@@ -5495,12 +5754,18 @@ class MainWindow(QWidget):
         fur_w, fur_h = self.res_map.get(res_display, (3840, 1600))
         furmark_exe = resolve_furmark_exe(self.furmark_exe)
         prime_exe = resolve_prime95_exe(self.prime_exe)
+        afterburner_exe = resolve_afterburner_exe(self.afterburner_exe)
+        afterburner_profile = self._selected_afterburner_profile()
 
         if furmark_exe:
             self.furmark_exe = furmark_exe
 
         if prime_exe:
             self.prime_exe = prime_exe
+
+        if afterburner_exe:
+            self.afterburner_exe = afterburner_exe
+        self.afterburner_profile = afterburner_profile
 
         return {
             "case_name": self.case_edit.text().strip(),
@@ -5515,6 +5780,8 @@ class MainWindow(QWidget):
             "fur_res_display": res_display,
             "furmark_exe": furmark_exe,
             "prime_exe": prime_exe,
+            "afterburner_exe": afterburner_exe,
+            "afterburner_profile": afterburner_profile,
             "ntfy_topic": self.ntfy_topic,
             "stress_cpu": bool(getattr(self.sensors, "stress_cpu", True)),
             "stress_gpu": bool(getattr(self.sensors, "stress_gpu", True)),
@@ -5550,10 +5817,17 @@ class MainWindow(QWidget):
 
         saved_furmark = str(data.get("furmark_exe", "")).strip()
         saved_prime = str(data.get("prime_exe", "")).strip()
+        saved_afterburner = str(data.get("afterburner_exe", "")).strip()
+        try:
+            saved_afterburner_profile = int(data.get("afterburner_profile", 0) or 0)
+        except Exception:
+            saved_afterburner_profile = 0
         saved_hwinfo = ""
 
         self.furmark_exe = resolve_furmark_exe(saved_furmark)
         self.prime_exe = resolve_prime95_exe(saved_prime)
+        self.afterburner_exe = resolve_afterburner_exe(saved_afterburner)
+        self.afterburner_profile = saved_afterburner_profile
         self.hwinfo_exe = resolve_hwinfo_exe("")
 
         self.ntfy_topic = str(data.get("ntfy_topic", self.ntfy_topic or "")).strip()
@@ -5563,8 +5837,8 @@ class MainWindow(QWidget):
         try:
             style_combobox_popup(self.fur_demo_combo, self.theme_mode)
             style_combobox_popup(self.fur_res_combo, self.theme_mode)
+            style_combobox_popup(self.afterburner_profile_combo, self.theme_mode)
             self._apply_case_name_completer_theme()
-            self._refresh_case_name_suggestions()
             self._live_monitor.set_theme_mode(self.theme_mode)
             self._live_graph.set_theme_mode(self.theme_mode)
             self.graph.set_theme_mode(self.theme_mode)
@@ -5668,7 +5942,9 @@ class MainWindow(QWidget):
             "stress_gpu": bool(self.sensors.stress_gpu),
             "furmark_exe": self.furmark_exe,
             "prime_exe": self.prime_exe,
-            "hwinfo_exe": resolve_hwinfo_exe(""),
+            "afterburner_exe": self.afterburner_exe,
+            "afterburner_profile": self._selected_afterburner_profile(),
+            "hwinfo_exe": self.hwinfo_exe,
             "ntfy_topic": self.ntfy_topic,
             "theme": self.theme_mode,
             "last_seen_version": __version__,
@@ -5679,35 +5955,86 @@ class MainWindow(QWidget):
 
     def open_settings(self) -> None:
         """Open settings dialog."""
+        old_furmark_exe = str(self.furmark_exe or "").strip()
+        old_prime_exe = str(self.prime_exe or "").strip()
+        old_ntfy_topic = str(self.ntfy_topic or "").strip()
+        old_theme_mode = str(self.theme_mode or "dark").strip().lower()
+
         dlg = SettingsDialog(
             self,
-            furmark_exe=self.furmark_exe,
-            prime_exe=self.prime_exe,
-            ntfy_topic=self.ntfy_topic,
-            theme=self.theme_mode,
+            furmark_exe=old_furmark_exe,
+            prime_exe=old_prime_exe,
+            ntfy_topic=old_ntfy_topic,
+            theme=old_theme_mode,
             update_callback=self.check_for_updates,
         )
         if dlg.exec() != QDialog.Accepted:
             return
 
-        self.furmark_exe = resolve_furmark_exe(dlg.furmark_exe())
-        self.prime_exe = resolve_prime95_exe(dlg.prime_exe())
+        new_furmark_exe = str(dlg.furmark_exe() or "").strip()
+        new_prime_exe = str(dlg.prime_exe() or "").strip()
+        new_ntfy_topic = str(dlg.ntfy_topic() or "").strip()
+        new_theme_mode = str(dlg.theme() or "dark").strip().lower()
+
+        paths_changed = new_furmark_exe != old_furmark_exe or new_prime_exe != old_prime_exe
+        ntfy_changed = new_ntfy_topic != old_ntfy_topic
+        theme_changed = new_theme_mode != old_theme_mode
+        if not paths_changed and not ntfy_changed and not theme_changed:
+            return
+
+        if new_furmark_exe != old_furmark_exe:
+            self.furmark_exe = resolve_furmark_exe(new_furmark_exe)
+        if new_prime_exe != old_prime_exe:
+            self.prime_exe = resolve_prime95_exe(new_prime_exe)
+
         try:
-            self.ntfy_topic = dlg.ntfy_topic()
+            self.ntfy_topic = new_ntfy_topic
         except Exception:
             pass
-        self.theme_mode = dlg.theme()
+
+        self.theme_mode = new_theme_mode
 
         app = QApplication.instance()
-        if app is not None:
-            apply_theme(app, self.theme_mode)
-            style_combobox_popup(self.fur_demo_combo, self.theme_mode)
-            style_combobox_popup(self.fur_res_combo, self.theme_mode)
-            self._apply_case_name_completer_theme()
-            self._refresh_case_name_suggestions()
-            self._live_monitor.set_theme_mode(self.theme_mode)
-            self._live_graph.set_theme_mode(self.theme_mode)
-            self.graph.set_theme_mode(self.theme_mode)
+        if app is not None and theme_changed:
+            self._schedule_settings_theme_apply()
+
+        if paths_changed:
+            self.hwinfo_exe = resolve_hwinfo_exe("")
+            self.hwinfo_csv = resolve_hwinfo_csv()
+            try:
+                self.hwinfo_edit.setText(self.hwinfo_csv)
+            except Exception:
+                pass
+
+        self.save_settings()
+
+    def _schedule_settings_theme_apply(self) -> None:
+        token = object()
+        self._pending_settings_theme_token = token
+        QTimer.singleShot(0, lambda token=token: self._apply_settings_theme_app(token))
+
+    def _is_current_settings_theme_token(self, token: object) -> bool:
+        return getattr(self, "_pending_settings_theme_token", None) is token
+
+    def _apply_settings_theme_app(self, token: object) -> None:
+        if not self._is_current_settings_theme_token(token):
+            return
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                apply_theme(app, self.theme_mode)
+                style_combobox_popup(self.fur_demo_combo, self.theme_mode)
+                style_combobox_popup(self.fur_res_combo, self.theme_mode)
+                style_combobox_popup(self.afterburner_profile_combo, self.theme_mode)
+                self._apply_case_name_completer_theme()
+        except Exception:
+            pass
+        QTimer.singleShot(0, lambda token=token: self._apply_settings_theme_navigation(token))
+
+    def _apply_settings_theme_navigation(self, token: object) -> None:
+        if not self._is_current_settings_theme_token(token):
+            return
+        try:
             self._apply_left_rail_theme()
             self._apply_results_tree_theme()
             self._apply_output_toggle_theme()
@@ -5716,15 +6043,42 @@ class MainWindow(QWidget):
             self._sync_furmark_gpu_controls()
             self._refresh_prime95_torture_display()
             self._refresh_compare_delegate_theme()
-
-        self.hwinfo_exe = resolve_hwinfo_exe("")
-        self.hwinfo_csv = resolve_hwinfo_csv()
-        try:
-            self.hwinfo_edit.setText(self.hwinfo_csv)
         except Exception:
             pass
+        QTimer.singleShot(0, lambda token=token: self._apply_settings_theme_live(token))
 
-        self.save_settings()
+    def _apply_settings_theme_live(self, token: object) -> None:
+        if not self._is_current_settings_theme_token(token):
+            return
+        try:
+            self._live_monitor.set_theme_mode(self.theme_mode)
+            self._live_graph.set_theme_mode(self.theme_mode)
+        except Exception:
+            pass
+        QTimer.singleShot(40, lambda token=token: self._apply_settings_theme_preview(token))
+
+    def _apply_settings_theme_preview(self, token: object) -> None:
+        if not self._is_current_settings_theme_token(token):
+            return
+        try:
+            results_visible = bool(
+                getattr(self, "_stack", None) is not None
+                and self._stack.currentIndex() == getattr(self, "_page_results_index", -1)
+            )
+            if results_visible:
+                self.graph.set_theme_mode(self.theme_mode)
+            else:
+                self.graph._theme_mode = str(self.theme_mode or "dark").strip().lower() or "dark"
+                updater = getattr(self.graph, "_update_preview_theme_palette", None)
+                if callable(updater):
+                    updater()
+        except Exception:
+            pass
+        try:
+            if self._is_current_settings_theme_token(token):
+                self._pending_settings_theme_token = None
+        except Exception:
+            pass
 
     def open_help(self) -> None:
         """Toggle the help side panel."""
@@ -6105,6 +6459,22 @@ class MainWindow(QWidget):
                     bh = obj.height() - 10
                     bw = btn.sizeHint().width()
                     btn.setGeometry(obj.width() - bw - 5, 5, bw, bh)
+        except Exception:
+            pass
+        try:
+            ab_view = self.afterburner_profile_combo.view()
+            if obj is ab_view.viewport() and event is not None:
+                if event.type() == QEvent.MouseMove:
+                    try:
+                        pos = event.position().toPoint()
+                    except Exception:
+                        pos = event.pos()
+                    idx = ab_view.indexAt(pos)
+                    if idx.isValid():
+                        profile = int(self.afterburner_profile_combo.itemData(idx.row()) or 0)
+                        self._show_afterburner_profile_details(profile)
+                elif event.type() in (QEvent.Leave, QEvent.Hide):
+                    self._show_afterburner_profile_details(self._selected_afterburner_profile())
         except Exception:
             pass
         try:

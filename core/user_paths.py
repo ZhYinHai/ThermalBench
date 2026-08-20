@@ -176,3 +176,15 @@ def thermalbench_prime95_runtime_dir() -> Path:
     path = local_data_root() / "tools" / "Prime95"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def thermalbench_afterburner_runtime_dir() -> Path:
+    """
+    Writable runtime copy of MSI Afterburner.
+
+    MSI Afterburner writes profile/config/runtime files next to its executable.
+    Program Files blocks those writes, so we run from here.
+    """
+    path = local_data_root() / "tools" / "MSI Afterburner"
+    path.mkdir(parents=True, exist_ok=True)
+    return path

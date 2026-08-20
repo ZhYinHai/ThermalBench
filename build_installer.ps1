@@ -217,7 +217,7 @@ if (-not (Test-Path $plotExeFinalCheck)) {
 }
 
 # 1d) Copy bundled third-party tool folders into the app bundle.
-# IMPORTANT: copy full folders, not only .exe files, because FurMark/Prime95/HWiNFO need local dependencies.
+# IMPORTANT: copy full folders, not only .exe files, because FurMark/Prime95/HWiNFO/MSI Afterburner need local dependencies.
 $vendorTools = Join-Path $PSScriptRoot 'vendor\tools'
 $distTools = Join-Path $PSScriptRoot 'dist\ThermalBench\tools'
 
@@ -228,7 +228,8 @@ if (-not (Test-Path -LiteralPath $vendorTools)) {
 $requiredVendorFiles = @(
     'FurMark\furmark.exe',
     'Prime95\prime95.exe',
-    'HWiNFO\HWiNFO64.exe'
+    'HWiNFO\HWiNFO64.exe',
+    'MSI Afterburner\MSIAfterburner.exe'
 )
 
 foreach ($rel in $requiredVendorFiles) {
@@ -246,7 +247,7 @@ if (Test-Path -LiteralPath $distTools) {
 
 New-Item -ItemType Directory -Force -Path $distTools | Out-Null
 
-$toolFolders = @('FurMark', 'Prime95', 'HWiNFO')
+$toolFolders = @('FurMark', 'Prime95', 'HWiNFO', 'MSI Afterburner')
 
 foreach ($folder in $toolFolders) {
     $src = Join-Path $vendorTools $folder
@@ -264,7 +265,8 @@ $requiredDistFiles = @(
     'FurMark\furmark.exe',
     'FurMark\plugins',
     'Prime95\prime95.exe',
-    'HWiNFO\HWiNFO64.exe'
+    'HWiNFO\HWiNFO64.exe',
+    'MSI Afterburner\MSIAfterburner.exe'
 )
 
 foreach ($rel in $requiredDistFiles) {

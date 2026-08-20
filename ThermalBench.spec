@@ -142,7 +142,7 @@ _dpi_manifest = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>
@@ -171,6 +171,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    uac_admin=True,
     manifest=_dpi_manifest,
 )
 coll = COLLECT(
